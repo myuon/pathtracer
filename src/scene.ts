@@ -5,6 +5,7 @@ export const MATERIAL = {
   metal: 1,
   dielectric: 2,
   emissive: 3,
+  glossy: 4,
 } as const;
 
 export type MaterialKind = (typeof MATERIAL)[keyof typeof MATERIAL];
@@ -19,6 +20,8 @@ export interface Material {
   ior?: number;
   /** emissive の放射輝度 */
   emission?: Vec3;
+  /** glossy (Phong) ローブの鋭さ。大きいほど鏡面に近い */
+  exponent?: number;
 }
 
 export const lambert = (albedo: Vec3): Material => ({
@@ -34,6 +37,12 @@ export const dielectric = (ior = 1.5): Material => ({
   kind: MATERIAL.dielectric,
   albedo: [1, 1, 1],
   ior,
+});
+/** 正規化 Phong の光沢面。exponent が大きいほど鏡面に近い */
+export const glossy = (albedo: Vec3, exponent: number): Material => ({
+  kind: MATERIAL.glossy,
+  albedo,
+  exponent,
 });
 export const emissive = (emission: Vec3): Material => ({
   kind: MATERIAL.emissive,
@@ -236,6 +245,88 @@ function buildCornellScene(): Scene {
   };
 }
 
+
+/**
+ * Veach の MIS テストシーン。
+ * 鋭さの違う 4 枚の光沢プレートと、大きさの違う 4 個の面光源を並べる。
+ * 「鋭いローブ x 大きい光源」は光源サンプリングが苦手、
+ * 「広いローブ x 小さい光源」は BSDF サンプリングが苦手なので、
+ * MIS の有無で結果が大きく変わる。
+ */
+function buildVeachScene(): Scene {
+  const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const norm = (v: Vec3): Vec3 => {
+    const l = Math.hypot(v[0], v[1], v[2]) || 1;
+    return [v[0] / l, v[1] / l, v[2] / l];
+  };
+
+  const eye: Vec3 = [0, 3.5, -13];
+  const lightRow: Vec3 = [0, 6.4, 2.6];
+
+  /** center を中心に、eye と lightRow を鏡面反射で結ぶ向きへ傾けた板 */
+  const plate = (center: Vec3, width: number, depth: number, material: Material): Quad => {
+    const a = norm(sub(eye, center));
+    const b = norm(sub(lightRow, center));
+    const n = norm([a[0] + b[0], a[1] + b[1], a[2] + b[2]]);
+    const u: Vec3 = [width, 0, 0];
+    const vd = norm([0, n[2], -n[1]]);
+    const v: Vec3 = [vd[0] * depth, vd[1] * depth, vd[2] * depth];
+    return {
+      q: [
+        center[0] - u[0] / 2 - v[0] / 2,
+        center[1] - u[1] / 2 - v[1] / 2,
+        center[2] - u[2] / 2 - v[2] / 2,
+      ],
+      u,
+      v,
+      material,
+    };
+  };
+
+  /** 下向きの正方形光源。放射輝度は面積で割って総パワーを揃える */
+  const lamp = (x: number, size: number, power: number): Quad => ({
+    q: [x - size / 2, lightRow[1], lightRow[2] - size / 2],
+    u: [size, 0, 0],
+    v: [0, 0, size],
+    material: emissive([
+      power / (size * size),
+      power / (size * size),
+      power / (size * size),
+    ]),
+  });
+
+  const plateSpec: { center: Vec3; exponent: number }[] = [
+    { center: [0, 0.4, -3.2], exponent: 50 },
+    { center: [0, 1.5, -0.7], exponent: 300 },
+    { center: [0, 2.6, 1.8], exponent: 1800 },
+    { center: [0, 3.7, 4.3], exponent: 9000 },
+  ];
+
+  const quads: Quad[] = [
+    // 床 (暗めの拡散面)
+    { q: [-14, -1.6, -9], u: [28, 0, 0], v: [0, 0, 26], material: lambert([0.16, 0.16, 0.18]) },
+    ...plateSpec.map((p) => plate(p.center, 11, 1.35, glossy([0.95, 0.95, 0.95], p.exponent))),
+    lamp(4.9, 0.15, 9),
+    lamp(1.7, 0.45, 9),
+    lamp(-1.7, 1.1, 9),
+    lamp(-5.0, 2.4, 9),
+  ];
+
+  return {
+    spheres: [],
+    quads,
+    env: ENV.black,
+    camera: {
+      target: [0, 2.2, 0],
+      distance: 13.06,
+      yaw: -Math.PI * 0.5,
+      pitch: 0.0997,
+      fovDeg: 46,
+      aperture: 0,
+    },
+  };
+}
+
 export interface SceneEntry {
   id: string;
   name: string;
@@ -245,6 +336,7 @@ export interface SceneEntry {
 export const SCENES: SceneEntry[] = [
   { id: "spheres", name: "spheres (RTIOW)", build: buildSpheresScene },
   { id: "cornell", name: "cornell box", build: buildCornellScene },
+  { id: "veach", name: "veach MIS test", build: buildVeachScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;
@@ -277,6 +369,7 @@ function writeMaterial(
   f32[o + 6] = e[2];
   f32[o + 7] = m.ior ?? 1.5;
   u32[o + 8] = m.kind;
+  f32[o + 9] = m.exponent ?? 1;
 }
 
 /** storage buffer にそのまま書ける形へパックする */

@@ -29,10 +29,12 @@ const MAT_LAMBERT: u32 = 0u;
 const MAT_METAL: u32 = 1u;
 const MAT_DIELECTRIC: u32 = 2u;
 const MAT_EMISSIVE: u32 = 3u;
+const MAT_GLOSSY: u32 = 4u;
 
 const ENV_SKY: u32 = 0u;
 const ENV_BLACK: u32 = 1u;
 
+const PI: f32 = 3.14159265;
 const INV_PI: f32 = 0.31830988;
 
 /// 球と quad で共有するマテリアル (48 バイト)
@@ -42,6 +44,8 @@ struct Material {
   emission: vec3f,
   ior: f32,
   kind: u32,
+  /// glossy (Phong) ローブの鋭さ。大きいほど鏡面に近い
+  exponent: f32,
 };
 
 struct Sphere {
@@ -245,6 +249,62 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
   return false;
 }
 
+// ---------------------------------------------------------------- BSDF
+/// n を z 軸とする正規直交基底 (Duff et al. の分岐なし版)
+fn onb(n: vec3f) -> mat3x3f {
+  let sg = select(-1.0, 1.0, n.z >= 0.0);
+  let a = -1.0 / (sg + n.z);
+  let b = n.x * n.y * a;
+  return mat3x3f(
+    vec3f(1.0 + sg * n.x * n.x * a, sg * b, -sg * n.x),
+    vec3f(b, sg + n.y * n.y * a, -n.y),
+    n,
+  );
+}
+
+/// 光源サンプリングできるのは pdf を評価できるマテリアルだけ。
+/// metal と dielectric はデルタ分布なので対象外
+fn isDiffuseLike(kind: u32) -> bool {
+  return kind == MAT_LAMBERT || kind == MAT_GLOSSY;
+}
+
+/// BRDF * cos(theta_i)。デルタ分布のマテリアルでは 0 を返す
+fn bsdfEval(hit: Hit, rayDir: vec3f, wi: vec3f) -> vec3f {
+  let cosI = dot(hit.normal, wi);
+  if (cosI <= 0.0) {
+    return vec3f(0.0);
+  }
+  if (hit.mat.kind == MAT_LAMBERT) {
+    return hit.mat.albedo * INV_PI * cosI;
+  }
+  if (hit.mat.kind == MAT_GLOSSY) {
+    // 正規化 Phong: (n + 2) / (2 pi) * cos^n(alpha)
+    let axis = normalize(reflect(rayDir, hit.normal));
+    let ca = max(dot(wi, axis), 0.0);
+    let e = hit.mat.exponent;
+    return hit.mat.albedo * ((e + 2.0) / (2.0 * PI)) * pow(ca, e) * cosI;
+  }
+  return vec3f(0.0);
+}
+
+/// bsdfEval と同じ方向に対する立体角 pdf
+fn bsdfPdfFor(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
+  let cosI = dot(hit.normal, wi);
+  if (cosI <= 0.0) {
+    return 0.0;
+  }
+  if (hit.mat.kind == MAT_LAMBERT) {
+    return cosI * INV_PI;
+  }
+  if (hit.mat.kind == MAT_GLOSSY) {
+    let axis = normalize(reflect(rayDir, hit.normal));
+    let ca = max(dot(wi, axis), 0.0);
+    let e = hit.mat.exponent;
+    return ((e + 1.0) / (2.0 * PI)) * pow(ca, e);
+  }
+  return 0.0;
+}
+
 // ---------------------------------------------------------------- NEE
 /// Veach の power heuristic (beta = 2)。
 /// balance heuristic (pA / (pA + pB)) より重みが優れた戦略へ鋭く寄るので、
@@ -257,19 +317,19 @@ fn misWeight(pA: f32, pB: f32) -> f32 {
 
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
 /// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
-fn sampleDirectLight(p: vec3f, n: vec3f) -> vec3f {
+fn sampleDirectLight(hit: Hit, rayDir: vec3f) -> vec3f {
   let pick = min(u32(rand() * f32(U.lightCount)), U.lightCount - 1u);
   let light = quads[lights[pick]];
 
   // 光源上の一様サンプル
   let onLight = light.q + light.u * rand() + light.v * rand();
-  let toLight = onLight - p;
+  let toLight = onLight - hit.p;
   let dist2 = dot(toLight, toLight);
   let dist = sqrt(dist2);
   let wi = toLight / dist;
 
-  let cosSurf = dot(n, wi);
-  if (cosSurf <= 0.0) {
+  let fcos = bsdfEval(hit, rayDir, wi);
+  if (all(fcos <= vec3f(0.0))) {
     return vec3f(0.0);
   }
   let ln = cross(light.u, light.v);
@@ -278,7 +338,7 @@ fn sampleDirectLight(p: vec3f, n: vec3f) -> vec3f {
   if (cosLight <= 1e-6) {
     return vec3f(0.0);
   }
-  if (occluded(p + n * 1e-4, wi, dist - 1e-3)) {
+  if (occluded(hit.p + hit.normal * 1e-4, wi, dist - 1e-3)) {
     return vec3f(0.0);
   }
 
@@ -288,9 +348,9 @@ fn sampleDirectLight(p: vec3f, n: vec3f) -> vec3f {
   // MIS。BSDF サンプリングでも作りやすい方向ほど寄与を下げる
   var weight = 1.0;
   if (U.mis != 0u) {
-    weight = misWeight(pL, cosSurf * INV_PI);
+    weight = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
   }
-  return light.mat.emission * cosSurf * weight / pL;
+  return light.mat.emission * fcos * weight / pL;
 }
 
 // ---------------------------------------------------------------- material
@@ -321,6 +381,25 @@ fn scatter(
     }
     *attenuation = m.albedo;
     *scattered = Ray(hit.p + hit.normal * 1e-4, normalize(dir));
+    return true;
+  }
+
+  if (m.kind == MAT_GLOSSY) {
+    // 鏡面方向まわりの Phong ローブからサンプルする
+    let axis = normalize(reflect(ray.dir, hit.normal));
+    let e = m.exponent;
+    let ca = pow(rand(), 1.0 / (e + 1.0));
+    let sa = sqrt(max(0.0, 1.0 - ca * ca));
+    let phi = rand() * 2.0 * PI;
+    let dir = normalize(onb(axis) * vec3f(sa * cos(phi), sa * sin(phi), ca));
+    let cosI = dot(hit.normal, dir);
+    if (cosI <= 0.0) {
+      // 面の裏に潜ったサンプルは捨てる
+      return false;
+    }
+    // f * cos / pdf = albedo * (e + 2) / (e + 1) * cos
+    *attenuation = m.albedo * ((e + 2.0) / (e + 1.0)) * cosI;
+    *scattered = Ray(hit.p + hit.normal * 1e-4, dir);
     return true;
   }
 
@@ -383,10 +462,9 @@ fn trace(primary: Ray) -> vec3f {
     }
     radiance = radiance + throughput * hit.mat.emission * weight;
 
-    // 拡散面だけ光源を直接サンプルする。スペキュラ面は BSDF サンプリングに任せる
-    if (useNee && hit.mat.kind == MAT_LAMBERT) {
-      let direct = sampleDirectLight(hit.p, hit.normal);
-      radiance = radiance + throughput * hit.mat.albedo * INV_PI * direct;
+    // pdf を評価できる面だけ光源を直接サンプルする。デルタ面は BSDF サンプリングに任せる
+    if (useNee && isDiffuseLike(hit.mat.kind)) {
+      radiance = radiance + throughput * sampleDirectLight(hit, ray.dir);
     }
 
     var attenuation: vec3f;
@@ -395,9 +473,9 @@ fn trace(primary: Ray) -> vec3f {
       break;
     }
     // 次の頂点で MIS 重みを計算するために pdf を持ち回る。
-    // lambert はコサイン分布なので cos / PI、スペキュラはデルタ分布なので負にしておく
-    if (hit.mat.kind == MAT_LAMBERT) {
-      bsdfPdf = max(dot(hit.normal, scattered.dir), 1e-5) * INV_PI;
+    // デルタ分布のマテリアルは光源サンプリングで作れない方向なので負にしておく
+    if (isDiffuseLike(hit.mat.kind)) {
+      bsdfPdf = max(bsdfPdfFor(hit, ray.dir, scattered.dir), 1e-5);
     } else {
       bsdfPdf = -1.0;
     }
