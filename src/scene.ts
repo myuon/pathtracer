@@ -49,6 +49,17 @@ export interface Sphere {
   material: Material;
 }
 
+/** 三角形。法線は頂点法線を重心座標で補間する */
+export interface Triangle {
+  v0: Vec3;
+  v1: Vec3;
+  v2: Vec3;
+  n0: Vec3;
+  n1: Vec3;
+  n2: Vec3;
+  material: Material;
+}
+
 /** 角 q と 2 辺 u, v が張る平行四辺形 */
 export interface Quad {
   q: Vec3;
@@ -80,6 +91,7 @@ export interface CameraPreset {
 export interface Scene {
   spheres: Sphere[];
   quads: Quad[];
+  triangles: Triangle[];
   env: EnvKind;
   camera: CameraPreset;
 }
@@ -178,6 +190,7 @@ function buildSpheresScene(): Scene {
   return {
     spheres,
     quads: [],
+    triangles: [],
     env: ENV.sky,
     camera: {
       target: [0, 1, 0],
@@ -226,6 +239,7 @@ function buildCornellScene(): Scene {
       { center: [2.1, 2.3, 1.45], radius: 0.65, material: dielectric(1.5) },
     ],
     quads,
+    triangles: [],
     env: ENV.black,
     camera: {
       target: [S / 2, S / 2, S / 2],
@@ -309,6 +323,7 @@ function buildVeachScene(): Scene {
   return {
     spheres: [],
     quads,
+    triangles: [],
     env: ENV.black,
     camera: {
       target: [0, 2.2, 0],
@@ -316,6 +331,116 @@ function buildVeachScene(): Scene {
       yaw: -Math.PI * 0.5,
       pitch: 0.0997,
       fovDeg: 46,
+      aperture: 0,
+    },
+  };
+}
+
+
+/** three.js の TorusKnotGeometry と同じ曲線 */
+function knotPoint(u: number, p: number, q: number, radius: number): Vec3 {
+  const cu = Math.cos(u);
+  const su = Math.sin(u);
+  const quOverP = (q / p) * u;
+  const cs = Math.cos(quOverP);
+  return [
+    radius * (2 + cs) * 0.5 * cu,
+    radius * (2 + cs) * su * 0.5,
+    radius * Math.sin(quOverP) * 0.5,
+  ];
+}
+
+/** トーラス結び目を三角形メッシュにする。頂点法線つき */
+function torusKnot(
+  segments: number,
+  sides: number,
+  radius: number,
+  tube: number,
+  center: Vec3,
+  material: Material,
+): Triangle[] {
+  const p = 2;
+  const q = 3;
+  const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const add = (a: Vec3, b: Vec3): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+  const cross = (a: Vec3, b: Vec3): Vec3 => [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+  const norm = (v: Vec3): Vec3 => {
+    const l = Math.hypot(v[0], v[1], v[2]) || 1;
+    return [v[0] / l, v[1] / l, v[2] / l];
+  };
+
+  // 曲線に沿った枠を作り、円を掃引する
+  const pos: Vec3[][] = [];
+  const nrm: Vec3[][] = [];
+  for (let i = 0; i <= segments; i++) {
+    const u = (i / segments) * p * Math.PI * 2;
+    const p1 = knotPoint(u, p, q, radius);
+    const p2 = knotPoint(u + 0.01, p, q, radius);
+    const t = sub(p2, p1);
+    let n = add(p2, p1);
+    const b = norm(cross(t, n));
+    n = norm(cross(b, t));
+
+    const ringPos: Vec3[] = [];
+    const ringNrm: Vec3[] = [];
+    for (let j = 0; j <= sides; j++) {
+      const v = (j / sides) * Math.PI * 2;
+      const cx = -tube * Math.cos(v);
+      const cy = tube * Math.sin(v);
+      const vert: Vec3 = [
+        p1[0] + cx * n[0] + cy * b[0] + center[0],
+        p1[1] + cx * n[1] + cy * b[1] + center[1],
+        p1[2] + cx * n[2] + cy * b[2] + center[2],
+      ];
+      ringPos.push(vert);
+      ringNrm.push(norm([vert[0] - p1[0] - center[0], vert[1] - p1[1] - center[1], vert[2] - p1[2] - center[2]]));
+    }
+    pos.push(ringPos);
+    nrm.push(ringNrm);
+  }
+
+  const tris: Triangle[] = [];
+  for (let i = 0; i < segments; i++) {
+    for (let j = 0; j < sides; j++) {
+      const a = { p: pos[i][j], n: nrm[i][j] };
+      const bb = { p: pos[i + 1][j], n: nrm[i + 1][j] };
+      const c = { p: pos[i + 1][j + 1], n: nrm[i + 1][j + 1] };
+      const d = { p: pos[i][j + 1], n: nrm[i][j + 1] };
+      tris.push({ v0: a.p, v1: bb.p, v2: c.p, n0: a.n, n1: bb.n, n2: c.n, material });
+      tris.push({ v0: a.p, v1: c.p, v2: d.p, n0: a.n, n1: c.n, n2: d.n, material });
+    }
+  }
+  return tris;
+}
+
+/** 三角形メッシュと BVH の動作確認用シーン */
+function buildMeshScene(): Scene {
+  const triangles = torusKnot(220, 22, 2.6, 0.62, [0, 1.9, 0], ggx([0.95, 0.78, 0.42], 0.16));
+  return {
+    spheres: [],
+    quads: [
+      // 床
+      { q: [-12, 0, -12], u: [24, 0, 0], v: [0, 0, 24], material: lambert([0.45, 0.45, 0.48]) },
+      // 天井の面光源
+      {
+        q: [-2.2, 8.5, -2.2],
+        u: [4.4, 0, 0],
+        v: [0, 0, 4.4],
+        material: emissive([9, 8.6, 8]),
+      },
+    ],
+    triangles,
+    env: ENV.sky,
+    camera: {
+      target: [0, 1.9, 0],
+      distance: 17,
+      yaw: Math.PI * 0.62,
+      pitch: 0.26,
+      fovDeg: 34,
       aperture: 0,
     },
   };
@@ -331,6 +456,7 @@ export const SCENES: SceneEntry[] = [
   { id: "spheres", name: "spheres (RTIOW)", build: buildSpheresScene },
   { id: "cornell", name: "cornell box", build: buildCornellScene },
   { id: "veach", name: "veach MIS test", build: buildVeachScene },
+  { id: "mesh", name: "torus knot (mesh)", build: buildMeshScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;
@@ -345,6 +471,7 @@ export function buildSceneById(id: string): Scene {
 export const MATERIAL_STRIDE = 48;
 export const SPHERE_STRIDE = 64;
 export const QUAD_STRIDE = 96;
+export const TRIANGLE_STRIDE = 144;
 
 /** o は float 単位のオフセット */
 function writeMaterial(
@@ -392,6 +519,24 @@ export function packLights(quads: Quad[]): { data: ArrayBuffer; count: number } 
   const data = new ArrayBuffer(Math.max(1, indices.length) * 4);
   new Uint32Array(data).set(indices);
   return { data, count: indices.length };
+}
+
+export function packTriangles(tris: Triangle[]): ArrayBuffer {
+  const buffer = new ArrayBuffer(Math.max(1, tris.length) * TRIANGLE_STRIDE);
+  const f32 = new Float32Array(buffer);
+  const u32 = new Uint32Array(buffer);
+  tris.forEach((t, i) => {
+    const o = (i * TRIANGLE_STRIDE) / 4;
+    f32.set(t.v0, o + 0);
+    // 辺は原点を v0 に取った差分で持つ (Moller-Trumbore がそのまま使える)
+    f32.set([t.v1[0] - t.v0[0], t.v1[1] - t.v0[1], t.v1[2] - t.v0[2]], o + 4);
+    f32.set([t.v2[0] - t.v0[0], t.v2[1] - t.v0[1], t.v2[2] - t.v0[2]], o + 8);
+    f32.set(t.n0, o + 12);
+    f32.set(t.n1, o + 16);
+    f32.set(t.n2, o + 20);
+    writeMaterial(f32, u32, o + 24, t.material);
+  });
+  return buffer;
 }
 
 export function packQuads(quads: Quad[]): ArrayBuffer {

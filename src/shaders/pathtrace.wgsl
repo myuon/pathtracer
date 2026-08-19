@@ -87,8 +87,27 @@ struct BvhNode {
 };
 
 @group(0) @binding(5) var<storage, read> bvh: array<BvhNode>;
-/// (type << 31) | index。type 0 = 球, 1 = quad
+/// (type << 30) | index。type 0 = 球, 1 = quad, 2 = 三角形
 @group(0) @binding(6) var<storage, read> bvhRefs: array<u32>;
+
+/// 三角形。辺は v0 を原点とする差分で持つ
+struct Triangle {
+  v0: vec3f,
+  _p0: f32,
+  e1: vec3f,
+  _p1: f32,
+  e2: vec3f,
+  _p2: f32,
+  n0: vec3f,
+  _p3: f32,
+  n1: vec3f,
+  _p4: f32,
+  n2: vec3f,
+  _p5: f32,
+  mat: Material,
+};
+
+@group(0) @binding(7) var<storage, read> triangles: array<Triangle>;
 
 // ---------------------------------------------------------------- random
 // PCG hash ベースなので状態バッファは不要。seed は毎回呼び出し側で進める。
@@ -251,9 +270,38 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
       } else {
         for (var k = 0u; k < n.count; k = k + 1u) {
           let code = bvhRefs[n.leftFirst + k];
-          let idx = code & 0x7fffffffu;
+          let idx = code & 0x3fffffffu;
+          let kind = code >> 30u;
 
-          if ((code >> 31u) == 0u) {
+          if (kind == 2u) {
+            // Moller-Trumbore
+            let tri = triangles[idx];
+            let pv = cross(ray.dir, tri.e2);
+            let det = dot(tri.e1, pv);
+            if (abs(det) < 1e-12) {
+              continue;
+            }
+            let invDet = 1.0 / det;
+            let tv = ray.origin - tri.v0;
+            let bu = dot(tv, pv) * invDet;
+            if (bu < 0.0 || bu > 1.0) {
+              continue;
+            }
+            let qv = cross(tv, tri.e1);
+            let bv = dot(ray.dir, qv) * invDet;
+            if (bv < 0.0 || bu + bv > 1.0) {
+              continue;
+            }
+            let t = dot(tri.e2, qv) * invDet;
+            if (t < tMin || t > closest) {
+              continue;
+            }
+            closest = t;
+            found = true;
+            // 頂点法線を重心座標で補間して滑らかにする
+            let sm = normalize(tri.n0 * (1.0 - bu - bv) + tri.n1 * bu + tri.n2 * bv);
+            fillHit(hit, ray, t, sm, tri.mat, 0.0);
+          } else if (kind == 0u) {
             let sph = spheres[idx];
             let oc = ray.origin - sph.center;
             let halfB = dot(oc, ray.dir);
@@ -343,9 +391,32 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
       } else {
         for (var k = 0u; k < n.count; k = k + 1u) {
           let code = bvhRefs[n.leftFirst + k];
-          let idx = code & 0x7fffffffu;
+          let idx = code & 0x3fffffffu;
+          let kind = code >> 30u;
 
-          if ((code >> 31u) == 0u) {
+          if (kind == 2u) {
+            let tri = triangles[idx];
+            let pv = cross(dir, tri.e2);
+            let det = dot(tri.e1, pv);
+            if (abs(det) < 1e-12) {
+              continue;
+            }
+            let invDet = 1.0 / det;
+            let tv = origin - tri.v0;
+            let bu = dot(tv, pv) * invDet;
+            if (bu < 0.0 || bu > 1.0) {
+              continue;
+            }
+            let qv = cross(tv, tri.e1);
+            let bv = dot(dir, qv) * invDet;
+            if (bv < 0.0 || bu + bv > 1.0) {
+              continue;
+            }
+            let t = dot(tri.e2, qv) * invDet;
+            if (t > 1e-4 && t < maxT) {
+              return true;
+            }
+          } else if (kind == 0u) {
             let sph = spheres[idx];
             let oc = origin - sph.center;
             let halfB = dot(oc, dir);

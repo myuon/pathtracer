@@ -1,4 +1,4 @@
-import type { Quad, Sphere, Vec3 } from "./scene";
+import type { Quad, Sphere, Triangle, Vec3 } from "./scene";
 
 /** WGSL 側の struct BvhNode と一致させること */
 export const BVH_NODE_STRIDE = 32;
@@ -6,12 +6,15 @@ export const BVH_NODE_STRIDE = 32;
 /** 葉に入れるプリミティブ数の上限 */
 const LEAF_SIZE = 4;
 
-/** プリミティブ参照の型タグ。WGSL 側と一致させること */
+/** プリミティブ参照の型タグ。上位 2 ビットに入れる。WGSL 側と一致させること */
 const TYPE_SPHERE = 0;
 const TYPE_QUAD = 1;
+const TYPE_TRIANGLE = 2;
+
+const encode = (type: number, index: number) => ((type << 30) | index) >>> 0;
 
 interface Ref {
-  /** (type << 31) | index */
+  /** (type << 30) | index */
   code: number;
   min: Vec3;
   max: Vec3;
@@ -60,7 +63,7 @@ function makeRef(code: number, min: Vec3, max: Vec3): Ref {
   };
 }
 
-function collectRefs(spheres: Sphere[], quads: Quad[]): Ref[] {
+function collectRefs(spheres: Sphere[], quads: Quad[], triangles: Triangle[]): Ref[] {
   const refs: Ref[] = [];
   spheres.forEach((s, i) => {
     const r = Math.abs(s.radius);
@@ -68,7 +71,7 @@ function collectRefs(spheres: Sphere[], quads: Quad[]): Ref[] {
       [s.center[0] - r, s.center[1] - r, s.center[2] - r],
       [s.center[0] + r, s.center[1] + r, s.center[2] + r],
     ]);
-    refs.push(makeRef((TYPE_SPHERE << 31) | i, min, max));
+    refs.push(makeRef(encode(TYPE_SPHERE, i), min, max));
   });
   quads.forEach((q, i) => {
     const [min, max] = boundsOf([
@@ -81,7 +84,11 @@ function collectRefs(spheres: Sphere[], quads: Quad[]): Ref[] {
         q.q[2] + q.u[2] + q.v[2],
       ],
     ]);
-    refs.push(makeRef(((TYPE_QUAD << 31) >>> 0) | i, min, max));
+    refs.push(makeRef(encode(TYPE_QUAD, i), min, max));
+  });
+  triangles.forEach((t, i) => {
+    const [min, max] = boundsOf([t.v0, t.v1, t.v2]);
+    refs.push(makeRef(encode(TYPE_TRIANGLE, i), min, max));
   });
   return refs;
 }
@@ -134,8 +141,12 @@ export interface BvhData {
   nodeCount: number;
 }
 
-export function buildBvh(spheres: Sphere[], quads: Quad[]): BvhData {
-  const refs = collectRefs(spheres, quads);
+export function buildBvh(
+  spheres: Sphere[],
+  quads: Quad[],
+  triangles: Triangle[],
+): BvhData {
+  const refs = collectRefs(spheres, quads, triangles);
   const nodes: Node[] = [];
   if (refs.length > 0) {
     build(refs, 0, refs.length, nodes);
