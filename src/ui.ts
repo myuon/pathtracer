@@ -1,0 +1,386 @@
+import type { OrbitCamera } from "./camera";
+
+/** 収束モード・操作モードの描画設定 */
+export interface RenderSettings {
+  /** 収束モードでの最大バウンス数 */
+  maxBounces: number;
+  /** 収束モードでの 1 フレームあたりのサンプル数 */
+  sppPerFrame: number;
+  /** 収束モードの解像度スケール (0..1) */
+  resolutionScale: number;
+  /** 操作中の解像度スケール (0..1) */
+  interactiveScale: number;
+  /** 操作中の最大バウンス数 */
+  interactiveBounces: number;
+}
+
+export interface UiOptions {
+  camera: OrbitCamera;
+  /** 描画設定やカメラが変わり、累積をリセットすべきとき */
+  onReset: () => void;
+}
+
+export interface UiHandle {
+  settings: RenderSettings;
+  /** 画面下部のステータス行を更新する */
+  setStatus: (text: string) => void;
+}
+
+/** 解像度スケール系スライダーで選べる離散値 */
+const RESOLUTION_SCALES = [0.25, 0.33, 0.5, 0.75, 1];
+
+/** 離散値リストの中から値に最も近いインデックスを探す */
+function closestIndex(values: number[], value: number): number {
+  let bestIndex = 0;
+  let bestDiff = Infinity;
+  for (let i = 0; i < values.length; i++) {
+    const diff = Math.abs(values[i] - value);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+
+/** スライダー行を作るための共通オプション */
+interface SliderRowOptions {
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  /** スライダーの生値からラベル表示用の文字列を作る */
+  format: (value: number) => string;
+  /** スライダーが動いたときに呼ばれる (raw value を渡す) */
+  onInput: (value: number) => void;
+}
+
+interface SliderRowHandle {
+  row: HTMLDivElement;
+  /** 値表示を更新する (外部から値を変えた場合に使う) */
+  setValue: (value: number) => void;
+}
+
+/** ラベル・現在値表示・スライダーからなる 1 行を作る */
+function createSliderRow(options: SliderRowOptions): SliderRowHandle {
+  const row = document.createElement("div");
+  row.className = "pt-row";
+
+  const labelLine = document.createElement("div");
+  labelLine.className = "pt-row-label";
+
+  const labelText = document.createElement("span");
+  labelText.textContent = options.label;
+
+  const valueText = document.createElement("span");
+  valueText.className = "pt-row-value";
+  valueText.textContent = options.format(options.value);
+
+  labelLine.appendChild(labelText);
+  labelLine.appendChild(valueText);
+
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = String(options.min);
+  slider.max = String(options.max);
+  slider.step = String(options.step);
+  slider.value = String(options.value);
+  slider.className = "pt-slider";
+
+  slider.addEventListener("input", () => {
+    const value = Number(slider.value);
+    valueText.textContent = options.format(value);
+    options.onInput(value);
+  });
+
+  row.appendChild(labelLine);
+  row.appendChild(slider);
+
+  return {
+    row,
+    setValue: (value: number) => {
+      slider.value = String(value);
+      valueText.textContent = options.format(value);
+    },
+  };
+}
+
+/** スタイルを 1 回だけ document.head に注入する */
+function injectStyles(): void {
+  const STYLE_ID = "pt-ui-style";
+  if (document.getElementById(STYLE_ID)) return;
+
+  const style = document.createElement("style");
+  style.id = STYLE_ID;
+  style.textContent = `
+.pt-panel {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  width: 220px;
+  max-width: calc(100vw - 24px);
+  background: rgba(20, 22, 26, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  padding: 8px 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: #e6e6e6;
+  user-select: none;
+  z-index: 10;
+}
+
+.pt-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: default;
+}
+
+.pt-toggle {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+.pt-toggle:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.pt-body {
+  margin-top: 6px;
+}
+
+.pt-row {
+  margin-top: 6px;
+}
+
+.pt-row-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  opacity: 0.85;
+}
+
+.pt-row-value {
+  opacity: 0.6;
+}
+
+.pt-slider {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.pt-reset {
+  margin-top: 8px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11px;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.pt-reset:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.pt-status {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  color: rgba(230, 230, 230, 0.55);
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.4;
+}
+`;
+  document.head.appendChild(style);
+}
+
+/** フローティングのコントロールパネルを作り、body に追加する */
+export function createUi(options: UiOptions): UiHandle {
+  injectStyles();
+
+  const settings: RenderSettings = {
+    maxBounces: 12,
+    sppPerFrame: 2,
+    resolutionScale: 1,
+    interactiveScale: 0.33,
+    interactiveBounces: 3,
+  };
+
+  const panel = document.createElement("div");
+  panel.className = "pt-panel";
+
+  // ヘッダー (タイトル + 折りたたみトグル)
+  const header = document.createElement("div");
+  header.className = "pt-header";
+
+  const title = document.createElement("span");
+  title.textContent = "path tracer";
+
+  const toggleButton = document.createElement("button");
+  toggleButton.type = "button";
+  toggleButton.className = "pt-toggle";
+  toggleButton.textContent = "−";
+
+  header.appendChild(title);
+  header.appendChild(toggleButton);
+
+  const body = document.createElement("div");
+  body.className = "pt-body";
+
+  let expanded = true;
+  toggleButton.addEventListener("click", () => {
+    expanded = !expanded;
+    body.style.display = expanded ? "" : "none";
+    toggleButton.textContent = expanded ? "−" : "+";
+  });
+
+  const notifyChange = () => {
+    options.onReset();
+  };
+
+  const maxBouncesRow = createSliderRow({
+    label: "max bounces",
+    min: 1,
+    max: 32,
+    step: 1,
+    value: settings.maxBounces,
+    format: (v) => String(v),
+    onInput: (v) => {
+      settings.maxBounces = v;
+      notifyChange();
+    },
+  });
+
+  const sppRow = createSliderRow({
+    label: "spp / frame",
+    min: 1,
+    max: 16,
+    step: 1,
+    value: settings.sppPerFrame,
+    format: (v) => String(v),
+    onInput: (v) => {
+      settings.sppPerFrame = v;
+      notifyChange();
+    },
+  });
+
+  const resolutionRow = createSliderRow({
+    label: "resolution",
+    min: 0,
+    max: RESOLUTION_SCALES.length - 1,
+    step: 1,
+    value: closestIndex(RESOLUTION_SCALES, settings.resolutionScale),
+    format: (index) => `${Math.round(RESOLUTION_SCALES[index] * 100)}%`,
+    onInput: (index) => {
+      settings.resolutionScale = RESOLUTION_SCALES[index];
+      notifyChange();
+    },
+  });
+
+  const fovRow = createSliderRow({
+    label: "fov",
+    min: 15,
+    max: 90,
+    step: 1,
+    value: options.camera.fovDeg,
+    format: (v) => `${Math.round(v)}°`,
+    onInput: (v) => {
+      options.camera.fovDeg = v;
+      options.camera.dirty = true;
+      notifyChange();
+    },
+  });
+
+  const apertureRow = createSliderRow({
+    label: "aperture",
+    min: 0,
+    max: 0.5,
+    step: 0.01,
+    value: options.camera.aperture,
+    format: (v) => v.toFixed(2),
+    onInput: (v) => {
+      options.camera.aperture = v;
+      options.camera.dirty = true;
+      notifyChange();
+    },
+  });
+
+  const interactiveResRow = createSliderRow({
+    label: "interactive res",
+    min: 0,
+    max: RESOLUTION_SCALES.length - 1,
+    step: 1,
+    value: closestIndex(RESOLUTION_SCALES, settings.interactiveScale),
+    format: (index) => `${Math.round(RESOLUTION_SCALES[index] * 100)}%`,
+    onInput: (index) => {
+      settings.interactiveScale = RESOLUTION_SCALES[index];
+      notifyChange();
+    },
+  });
+
+  const interactiveBouncesRow = createSliderRow({
+    label: "interactive bounces",
+    min: 1,
+    max: 8,
+    step: 1,
+    value: settings.interactiveBounces,
+    format: (v) => String(v),
+    onInput: (v) => {
+      settings.interactiveBounces = v;
+      notifyChange();
+    },
+  });
+
+  const resetButton = document.createElement("button");
+  resetButton.type = "button";
+  resetButton.className = "pt-reset";
+  resetButton.textContent = "reset";
+  resetButton.addEventListener("click", () => {
+    options.onReset();
+  });
+
+  body.appendChild(maxBouncesRow.row);
+  body.appendChild(sppRow.row);
+  body.appendChild(resolutionRow.row);
+  body.appendChild(fovRow.row);
+  body.appendChild(apertureRow.row);
+  body.appendChild(interactiveResRow.row);
+  body.appendChild(interactiveBouncesRow.row);
+  body.appendChild(resetButton);
+
+  const status = document.createElement("div");
+  status.className = "pt-status";
+
+  panel.appendChild(header);
+  panel.appendChild(body);
+  panel.appendChild(status);
+
+  document.body.appendChild(panel);
+
+  return {
+    settings,
+    setStatus: (text: string) => {
+      status.textContent = text;
+    },
+  };
+}
