@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebGPU Path Tracer</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #111; }
+      body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #ddd; }
+      #canvas { display: block; width: 100vw; height: 100vh; }
+      #unsupported {
+        position: fixed; inset: 0; display: none;
+        place-content: center; text-align: center; padding: 2rem;
+        font-size: 16px; line-height: 2;
+      }
+      #unsupported.show { display: grid; }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="unsupported">
+      <div>
+        <p>このページは <strong>WebGPU</strong> を使います。</p>
+        <p>Chrome か Safari の新しめのバージョンで開いてね。</p>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
