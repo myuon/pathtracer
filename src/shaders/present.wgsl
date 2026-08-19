@@ -17,6 +17,8 @@ struct Uniforms {
   samplesAfter: u32,
   quadCount: u32,
   env: u32,
+  lightCount: u32,
+  nee: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;

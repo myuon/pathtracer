@@ -9,6 +9,7 @@ WebGPU 対応ブラウザ (Chrome / Edge 113+, Safari 26+) が必要です。非
 - compute shader (WGSL) で 1 パス、accumulation buffer にプログレッシブ蓄積
 - プリミティブは球と quad (平行四辺形) / Lambert・Metal・Dielectric・面光源
 - シーンは UI から切り替え。RTIOW の定番シーンと Cornell box を同梱
+- NEE (next event estimation) で拡散面から面光源を直接サンプル。Cornell box では同じノイズに落ちるまでの spp が 1/30 ほどになる
 - orbit カメラ (左ドラッグ=回転 / 右ドラッグ=パン / ホイール=ドリー) + defocus blur
 - 操作中は低解像度・低バウンスで追従し、手を止めると数フレームでフル品質の蓄積に戻る
 

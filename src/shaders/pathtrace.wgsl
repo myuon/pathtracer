@@ -17,6 +17,8 @@ struct Uniforms {
   samplesAfter: u32,
   quadCount: u32,
   env: u32,
+  lightCount: u32,
+  nee: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -29,6 +31,8 @@ const MAT_EMISSIVE: u32 = 3u;
 
 const ENV_SKY: u32 = 0u;
 const ENV_BLACK: u32 = 1u;
+
+const INV_PI: f32 = 0.31830988;
 
 /// 球と quad で共有するマテリアル (48 バイト)
 struct Material {
@@ -58,6 +62,8 @@ struct Quad {
 
 @group(0) @binding(2) var<storage, read> spheres: array<Sphere>;
 @group(0) @binding(3) var<storage, read> quads: array<Quad>;
+/// NEE でサンプルする面光源。quads へのインデックス列
+@group(0) @binding(4) var<storage, read> lights: array<u32>;
 
 // ---------------------------------------------------------------- random
 // PCG hash ベースなので状態バッファは不要。seed は毎回呼び出し側で進める。
@@ -191,6 +197,80 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
   return found;
 }
 
+/// 影レイ用。最初の 1 個で打ち切るので hitScene より速い。
+/// ガラスも遮蔽物として扱うので、屈折で回り込む光は NEE では拾えない
+/// (その経路はスペキュラ連鎖として BSDF サンプリング側が拾う)
+fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
+  for (var i = 0u; i < U.sphereCount; i = i + 1u) {
+    let sp = spheres[i];
+    let oc = origin - sp.center;
+    let halfB = dot(oc, dir);
+    let c = dot(oc, oc) - sp.radius * sp.radius;
+    let disc = halfB * halfB - c;
+    if (disc < 0.0) {
+      continue;
+    }
+    let sq = sqrt(disc);
+    let t0 = -halfB - sq;
+    let t1 = -halfB + sq;
+    if ((t0 > 1e-4 && t0 < maxT) || (t1 > 1e-4 && t1 < maxT)) {
+      return true;
+    }
+  }
+  for (var i = 0u; i < U.quadCount; i = i + 1u) {
+    let quad = quads[i];
+    let n = cross(quad.u, quad.v);
+    let denom = dot(n, dir);
+    if (abs(denom) < 1e-8) {
+      continue;
+    }
+    let t = dot(n, quad.q - origin) / denom;
+    if (t <= 1e-4 || t >= maxT) {
+      continue;
+    }
+    let planar = origin + t * dir - quad.q;
+    let w = n / dot(n, n);
+    let alpha = dot(w, cross(planar, quad.v));
+    let beta = dot(w, cross(quad.u, planar));
+    if (alpha >= 0.0 && alpha <= 1.0 && beta >= 0.0 && beta <= 1.0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------- NEE
+/// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
+/// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
+fn sampleDirectLight(p: vec3f, n: vec3f) -> vec3f {
+  let pick = min(u32(rand() * f32(U.lightCount)), U.lightCount - 1u);
+  let light = quads[lights[pick]];
+
+  // 光源上の一様サンプル
+  let onLight = light.q + light.u * rand() + light.v * rand();
+  let toLight = onLight - p;
+  let dist2 = dot(toLight, toLight);
+  let dist = sqrt(dist2);
+  let wi = toLight / dist;
+
+  let cosSurf = dot(n, wi);
+  if (cosSurf <= 0.0) {
+    return vec3f(0.0);
+  }
+  let ln = cross(light.u, light.v);
+  let area = length(ln);
+  let cosLight = abs(dot(ln / area, wi));
+  if (cosLight <= 1e-6) {
+    return vec3f(0.0);
+  }
+  if (occluded(p + n * 1e-4, wi, dist - 1e-3)) {
+    return vec3f(0.0);
+  }
+
+  // 面積の pdf 1 / (lightCount * area) を立体角に変換すると dist2 / (cosLight * area * lightCount)
+  return light.mat.emission * cosSurf * cosLight * area * f32(U.lightCount) / dist2;
+}
+
 // ---------------------------------------------------------------- material
 fn schlick(cosine: f32, refIdx: f32) -> f32 {
   var r0 = (1.0 - refIdx) / (1.0 + refIdx);
@@ -253,14 +333,30 @@ fn trace(primary: Ray) -> vec3f {
   var ray = primary;
   var throughput = vec3f(1.0);
   var radiance = vec3f(0.0);
+  // 直前の頂点が NEE で直接光を拾ったなら、そこから伸ばしたレイが光源に当たっても
+  // 放射を足さない (二重計上になる)。カメラレイとスペキュラ反射の直後は足す
+  var countEmissive = true;
+  let useNee = U.nee != 0u && U.lightCount > 0u;
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
     if (!hitScene(ray, 1e-3, 1e30, &hit)) {
+      // 環境光は NEE の対象外なので常に足す
       radiance = radiance + throughput * envColor(ray.dir);
       break;
     }
-    radiance = radiance + throughput * hit.mat.emission;
+    if (countEmissive) {
+      radiance = radiance + throughput * hit.mat.emission;
+    }
+
+    // 拡散面だけ光源を直接サンプルする。スペキュラ面は BSDF サンプリングに任せる
+    if (useNee && hit.mat.kind == MAT_LAMBERT) {
+      let direct = sampleDirectLight(hit.p, hit.normal);
+      radiance = radiance + throughput * hit.mat.albedo * INV_PI * direct;
+      countEmissive = false;
+    } else {
+      countEmissive = true;
+    }
 
     var attenuation: vec3f;
     var scattered: Ray;

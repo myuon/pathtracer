@@ -13,6 +13,8 @@ export interface RenderSettings {
   interactiveScale: number;
   /** 操作中の最大バウンス数 */
   interactiveBounces: number;
+  /** 面光源を直接サンプルする (next event estimation) */
+  nee: boolean;
 }
 
 export interface UiOptions {
@@ -147,6 +149,32 @@ function createSelectRow(options: {
   return row;
 }
 
+/** ラベルとチェックボックスからなる 1 行を作る */
+function createToggleRow(options: {
+  label: string;
+  value: boolean;
+  onChange: (value: boolean) => void;
+}): HTMLDivElement {
+  const row = document.createElement("div");
+  row.className = "pt-row";
+
+  const labelLine = document.createElement("label");
+  labelLine.className = "pt-row-label pt-toggle-row";
+  const labelText = document.createElement("span");
+  labelText.textContent = options.label;
+
+  const check = document.createElement("input");
+  check.type = "checkbox";
+  check.className = "pt-check";
+  check.checked = options.value;
+  check.addEventListener("change", () => options.onChange(check.checked));
+
+  labelLine.appendChild(labelText);
+  labelLine.appendChild(check);
+  row.appendChild(labelLine);
+  return row;
+}
+
 /** スタイルを 1 回だけ document.head に注入する */
 function injectStyles(): void {
   const STYLE_ID = "pt-ui-style";
@@ -243,6 +271,15 @@ function injectStyles(): void {
   color: #e6e6e6;
 }
 
+.pt-toggle-row {
+  cursor: pointer;
+}
+
+.pt-check {
+  margin: 0;
+  cursor: pointer;
+}
+
 .pt-reset {
   margin-top: 8px;
   width: 100%;
@@ -283,6 +320,7 @@ export function createUi(options: UiOptions): UiHandle {
     resolutionScale: 1,
     interactiveScale: 0.33,
     interactiveBounces: 3,
+    nee: true,
   };
 
   const panel = document.createElement("div");
@@ -419,6 +457,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const neeRow = createToggleRow({
+    label: "next event estimation",
+    value: settings.nee,
+    onChange: (v) => {
+      settings.nee = v;
+      notifyChange();
+    },
+  });
+
   const resetButton = document.createElement("button");
   resetButton.type = "button";
   resetButton.className = "pt-reset";
@@ -435,6 +482,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(apertureRow.row);
   body.appendChild(interactiveResRow.row);
   body.appendChild(interactiveBouncesRow.row);
+  body.appendChild(neeRow);
   body.appendChild(resetButton);
 
   const status = document.createElement("div");

@@ -1,6 +1,6 @@
 import pathtraceWgsl from "./shaders/pathtrace.wgsl?raw";
 import presentWgsl from "./shaders/present.wgsl?raw";
-import { packQuads, packSpheres, type Scene } from "./scene";
+import { packLights, packQuads, packSpheres, type Scene } from "./scene";
 
 export interface GpuContext {
   device: GPUDevice;
@@ -55,6 +55,8 @@ export interface FrameParams {
   maxBounces: number;
   /** このフレームより前に積んだサンプル数。0 なら accum を上書きする */
   samplesBefore: number;
+  /** 面光源を直接サンプルする (next event estimation) */
+  nee: boolean;
 }
 
 export class Renderer {
@@ -74,8 +76,10 @@ export class Renderer {
 
   private sphereBuffer: GPUBuffer | null = null;
   private quadBuffer: GPUBuffer | null = null;
+  private lightBuffer: GPUBuffer | null = null;
   private sphereCount = 0;
   private quadCount = 0;
+  private lightCount = 0;
   private env = 0;
 
   constructor(gpu: GpuContext, scene: Scene) {
@@ -125,6 +129,11 @@ export class Renderer {
     this.quadBuffer?.destroy();
     this.quadBuffer = this.uploadGeometry(packQuads(scene.quads), "quads");
 
+    const lights = packLights(scene.quads);
+    this.lightCount = lights.count;
+    this.lightBuffer?.destroy();
+    this.lightBuffer = this.uploadGeometry(lights.data, "lights");
+
     this.rebuildBindGroups();
   }
 
@@ -148,6 +157,7 @@ export class Renderer {
         { binding: 1, resource: { buffer: this.accumBuffer } },
         { binding: 2, resource: { buffer: this.sphereBuffer! } },
         { binding: 3, resource: { buffer: this.quadBuffer! } },
+        { binding: 4, resource: { buffer: this.lightBuffer! } },
       ],
     });
     this.presentBindGroup = this.device.createBindGroup({
@@ -197,6 +207,8 @@ export class Renderer {
     u[23] = p.samplesBefore + p.sppPerFrame;
     u[24] = this.quadCount;
     u[25] = this.env;
+    u[26] = this.lightCount;
+    u[27] = p.nee ? 1 : 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 

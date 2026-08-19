@@ -118,6 +118,7 @@ async function main() {
       sppPerFrame: spp,
       maxBounces,
       samplesBefore: samples,
+      nee: ui.settings.nee,
     });
 
     samples += spp;

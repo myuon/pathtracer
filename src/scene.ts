@@ -295,6 +295,19 @@ export function packSpheres(spheres: Sphere[]): ArrayBuffer {
   return buffer;
 }
 
+/**
+ * NEE で直接サンプルする面光源 (emissive な quad) のインデックス列。
+ * 球の面光源には対応していない。
+ */
+export function packLights(quads: Quad[]): { data: ArrayBuffer; count: number } {
+  const indices = quads.flatMap((q, i) =>
+    q.material.kind === MATERIAL.emissive ? [i] : [],
+  );
+  const data = new ArrayBuffer(Math.max(1, indices.length) * 4);
+  new Uint32Array(data).set(indices);
+  return { data, count: indices.length };
+}
+
 export function packQuads(quads: Quad[]): ArrayBuffer {
   const buffer = new ArrayBuffer(Math.max(1, quads.length) * QUAD_STRIDE);
   const f32 = new Float32Array(buffer);
