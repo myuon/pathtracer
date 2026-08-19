@@ -2,6 +2,10 @@
 
 ブラウザで動く WebGPU パストレーサーのおもちゃ。
 
+**デモ: https://myuon.github.io/pathtracer/**
+
+WebGPU 対応ブラウザ (Chrome / Edge 113+, Safari 26+) が必要です。非対応の環境では画面にエラーが出ます。
+
 - compute shader (WGSL) で 1 パス、accumulation buffer にプログレッシブ蓄積
 - 球のみ / Lambert・Metal・Dielectric / 環境光は空のグラデーション
 - orbit カメラ (左ドラッグ=回転 / 右ドラッグ=パン / ホイール=ドリー) + defocus blur
@@ -13,8 +17,6 @@
 pnpm install
 pnpm dev
 ```
-
-WebGPU 対応ブラウザ (Chrome / Safari の新しめのバージョン) が必要です。
 
 ## 構成
 
