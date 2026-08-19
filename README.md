@@ -7,7 +7,7 @@
 WebGPU 対応ブラウザ (Chrome / Edge 113+, Safari 26+) が必要です。非対応の環境では画面にエラーが出ます。
 
 - compute shader (WGSL) で 1 パス、accumulation buffer にプログレッシブ蓄積
-- プリミティブは球と quad (平行四辺形) / Lambert・Metal・Dielectric・正規化 Phong の光沢面・面光源
+- プリミティブは球と quad (平行四辺形) / Lambert・GGX マイクロファセット (導体)・Dielectric・面光源
 - シーンは UI から切り替え。RTIOW の定番シーン、Cornell box、Veach の MIS テストシーンを同梱
 - NEE (next event estimation) で拡散面から面光源を直接サンプル。Cornell box では同じノイズに落ちるまでの spp が 1/30 ほどになる
 - MIS (power heuristic) で光源サンプリングと BSDF サンプリングを合成。光源と受光面が近接平行な箇所のスパイクが消える

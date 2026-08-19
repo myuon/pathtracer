@@ -2,47 +2,40 @@ export type Vec3 = [number, number, number];
 
 export const MATERIAL = {
   lambert: 0,
-  metal: 1,
+  /** GGX マイクロファセット (導体) */
+  ggx: 1,
   dielectric: 2,
   emissive: 3,
-  glossy: 4,
 } as const;
 
 export type MaterialKind = (typeof MATERIAL)[keyof typeof MATERIAL];
 
 export interface Material {
   kind: MaterialKind;
-  /** lambert / metal のアルベド。dielectric では減衰色として使う */
+  /** lambert の反射率 / ggx の垂直入射反射率 F0 / dielectric の減衰色 */
   albedo: Vec3;
-  /** metal のざらつき (0 で鏡面) */
-  fuzz?: number;
+  /** ggx の粗さ (知覚的)。0 に近いほど鏡面 */
+  roughness?: number;
   /** dielectric の屈折率 */
   ior?: number;
   /** emissive の放射輝度 */
   emission?: Vec3;
-  /** glossy (Phong) ローブの鋭さ。大きいほど鏡面に近い */
-  exponent?: number;
 }
 
 export const lambert = (albedo: Vec3): Material => ({
   kind: MATERIAL.lambert,
   albedo,
 });
-export const metal = (albedo: Vec3, fuzz = 0): Material => ({
-  kind: MATERIAL.metal,
+/** GGX 導体。roughness が小さいほど鏡面に近い */
+export const ggx = (albedo: Vec3, roughness: number): Material => ({
+  kind: MATERIAL.ggx,
   albedo,
-  fuzz,
+  roughness,
 });
 export const dielectric = (ior = 1.5): Material => ({
   kind: MATERIAL.dielectric,
   albedo: [1, 1, 1],
   ior,
-});
-/** 正規化 Phong の光沢面。exponent が大きいほど鏡面に近い */
-export const glossy = (albedo: Vec3, exponent: number): Material => ({
-  kind: MATERIAL.glossy,
-  albedo,
-  exponent,
 });
 export const emissive = (emission: Vec3): Material => ({
   kind: MATERIAL.emissive,
@@ -142,7 +135,7 @@ function buildSpheresScene(): Scene {
     { center: [0, -1000, 0], radius: 1000, material: lambert([0.5, 0.5, 0.5]) },
     { center: [-2.6, 1, 0], radius: 1, material: dielectric(1.5) },
     { center: [0, 1, 0], radius: 1, material: lambert([0.55, 0.25, 0.18]) },
-    { center: [2.6, 1, 0], radius: 1, material: metal([0.7, 0.6, 0.5], 0.02) },
+    { center: [2.6, 1, 0], radius: 1, material: ggx([0.7, 0.6, 0.5], 0.06) },
   ];
 
   // 周りに小球を散らす
@@ -171,9 +164,9 @@ function buildSpheresScene(): Scene {
         spheres.push({
           center,
           radius: 0.2,
-          material: metal(
+          material: ggx(
             [0.5 + 0.5 * rand(), 0.5 + 0.5 * rand(), 0.5 + 0.5 * rand()],
-            0.3 * rand(),
+            0.1 + 0.4 * rand(),
           ),
         });
       } else {
@@ -295,17 +288,18 @@ function buildVeachScene(): Scene {
     ]),
   });
 
-  const plateSpec: { center: Vec3; exponent: number }[] = [
-    { center: [0, 0.4, -3.2], exponent: 50 },
-    { center: [0, 1.5, -0.7], exponent: 300 },
-    { center: [0, 2.6, 1.8], exponent: 1800 },
-    { center: [0, 3.7, 4.3], exponent: 9000 },
+  // GGX は Phong より裾が長いので、見た目が揃うよう粗さは低めに取る
+  const plateSpec: { center: Vec3; roughness: number }[] = [
+    { center: [0, 0.4, -3.2], roughness: 0.34 },
+    { center: [0, 1.5, -0.7], roughness: 0.2 },
+    { center: [0, 2.6, 1.8], roughness: 0.11 },
+    { center: [0, 3.7, 4.3], roughness: 0.055 },
   ];
 
   const quads: Quad[] = [
     // 床 (暗めの拡散面)
     { q: [-14, -1.6, -9], u: [28, 0, 0], v: [0, 0, 26], material: lambert([0.16, 0.16, 0.18]) },
-    ...plateSpec.map((p) => plate(p.center, 11, 1.35, glossy([0.95, 0.95, 0.95], p.exponent))),
+    ...plateSpec.map((p) => plate(p.center, 11, 1.35, ggx([0.95, 0.95, 0.95], p.roughness))),
     lamp(4.9, 0.15, 9),
     lamp(1.7, 0.45, 9),
     lamp(-1.7, 1.1, 9),
@@ -362,14 +356,13 @@ function writeMaterial(
   f32[o + 0] = m.albedo[0];
   f32[o + 1] = m.albedo[1];
   f32[o + 2] = m.albedo[2];
-  f32[o + 3] = m.fuzz ?? 0;
+  f32[o + 3] = m.roughness ?? 0;
   const e = m.emission ?? [0, 0, 0];
   f32[o + 4] = e[0];
   f32[o + 5] = e[1];
   f32[o + 6] = e[2];
   f32[o + 7] = m.ior ?? 1.5;
   u32[o + 8] = m.kind;
-  f32[o + 9] = m.exponent ?? 1;
 }
 
 /** storage buffer にそのまま書ける形へパックする */

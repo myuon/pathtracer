@@ -26,10 +26,10 @@ struct Uniforms {
 @group(0) @binding(1) var<storage, read_write> accum: array<vec4f>;
 
 const MAT_LAMBERT: u32 = 0u;
-const MAT_METAL: u32 = 1u;
+/// GGX マイクロファセット (導体)。旧 metal と旧 glossy を統合したもの
+const MAT_GGX: u32 = 1u;
 const MAT_DIELECTRIC: u32 = 2u;
 const MAT_EMISSIVE: u32 = 3u;
-const MAT_GLOSSY: u32 = 4u;
 
 const ENV_SKY: u32 = 0u;
 const ENV_BLACK: u32 = 1u;
@@ -39,13 +39,13 @@ const INV_PI: f32 = 0.31830988;
 
 /// 球と quad で共有するマテリアル (48 バイト)
 struct Material {
+  /// lambert の反射率 / GGX の垂直入射反射率 F0 / dielectric の減衰色
   albedo: vec3f,
-  fuzz: f32,
+  /// GGX の粗さ (知覚的)。alpha = roughness^2
+  roughness: f32,
   emission: vec3f,
   ior: f32,
   kind: u32,
-  /// glossy (Phong) ローブの鋭さ。大きいほど鏡面に近い
-  exponent: f32,
 };
 
 struct Sphere {
@@ -262,10 +262,54 @@ fn onb(n: vec3f) -> mat3x3f {
   );
 }
 
+/// 知覚的な roughness から GGX の alpha へ。完全な鏡面は数値的に扱えないので下限を切る
+fn ggxAlpha(roughness: f32) -> f32 {
+  return clamp(roughness * roughness, 1e-4, 1.0);
+}
+
+/// GGX の法線分布関数
+fn ggxD(nDotH: f32, a: f32) -> f32 {
+  let a2 = a * a;
+  let d = nDotH * nDotH * (a2 - 1.0) + 1.0;
+  return a2 / max(PI * d * d, 1e-9);
+}
+
+/// Smith の遮蔽・陰影項 (片側)
+fn ggxG1(nDotX: f32, a: f32) -> f32 {
+  if (nDotX <= 0.0) {
+    return 0.0;
+  }
+  let a2 = a * a;
+  return 2.0 * nDotX / (nDotX + sqrt(a2 + (1.0 - a2) * nDotX * nDotX));
+}
+
+fn fresnelSchlick(cosTheta: f32, f0: vec3f) -> vec3f {
+  return f0 + (vec3f(1.0) - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+/// Heitz 2018 の可視法線 (VNDF) サンプリング。ve は法線を +z とするローカル座標系
+fn sampleGgxVndf(ve: vec3f, a: f32, u1: f32, u2: f32) -> vec3f {
+  let vh = normalize(vec3f(a * ve.x, a * ve.y, ve.z));
+  let lensq = vh.x * vh.x + vh.y * vh.y;
+  var t1 = vec3f(1.0, 0.0, 0.0);
+  if (lensq > 0.0) {
+    t1 = vec3f(-vh.y, vh.x, 0.0) * inverseSqrt(lensq);
+  }
+  let t2 = cross(vh, t1);
+  let r = sqrt(u1);
+  let phi = 2.0 * PI * u2;
+  let px = r * cos(phi);
+  let pyRaw = r * sin(phi);
+  let sc = 0.5 * (1.0 + vh.z);
+  let py = (1.0 - sc) * sqrt(max(0.0, 1.0 - px * px)) + sc * pyRaw;
+  let nh = px * t1 + py * t2 + sqrt(max(0.0, 1.0 - px * px - py * py)) * vh;
+  return normalize(vec3f(a * nh.x, a * nh.y, max(1e-6, nh.z)));
+}
+
 /// 光源サンプリングできるのは pdf を評価できるマテリアルだけ。
-/// metal と dielectric はデルタ分布なので対象外
+/// dielectric はデルタ分布なので対象外
 fn isDiffuseLike(kind: u32) -> bool {
-  return kind == MAT_LAMBERT || kind == MAT_GLOSSY;
+  return kind == MAT_LAMBERT || kind == MAT_GGX;
 }
 
 /// BRDF * cos(theta_i)。デルタ分布のマテリアルでは 0 を返す
@@ -277,12 +321,18 @@ fn bsdfEval(hit: Hit, rayDir: vec3f, wi: vec3f) -> vec3f {
   if (hit.mat.kind == MAT_LAMBERT) {
     return hit.mat.albedo * INV_PI * cosI;
   }
-  if (hit.mat.kind == MAT_GLOSSY) {
-    // 正規化 Phong: (n + 2) / (2 pi) * cos^n(alpha)
-    let axis = normalize(reflect(rayDir, hit.normal));
-    let ca = max(dot(wi, axis), 0.0);
-    let e = hit.mat.exponent;
-    return hit.mat.albedo * ((e + 2.0) / (2.0 * PI)) * pow(ca, e) * cosI;
+  if (hit.mat.kind == MAT_GGX) {
+    let v = -rayDir;
+    let nDotV = dot(hit.normal, v);
+    if (nDotV <= 0.0) {
+      return vec3f(0.0);
+    }
+    let h = normalize(v + wi);
+    let a = ggxAlpha(hit.mat.roughness);
+    let g2 = ggxG1(nDotV, a) * ggxG1(cosI, a);
+    let f = fresnelSchlick(max(dot(v, h), 0.0), hit.mat.albedo);
+    // BRDF * cos(theta_i) = D * G2 * F / (4 * nDotV) (cos は約分されている)
+    return f * (ggxD(dot(hit.normal, h), a) * g2 / (4.0 * nDotV));
   }
   return vec3f(0.0);
 }
@@ -296,11 +346,16 @@ fn bsdfPdfFor(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
   if (hit.mat.kind == MAT_LAMBERT) {
     return cosI * INV_PI;
   }
-  if (hit.mat.kind == MAT_GLOSSY) {
-    let axis = normalize(reflect(rayDir, hit.normal));
-    let ca = max(dot(wi, axis), 0.0);
-    let e = hit.mat.exponent;
-    return ((e + 1.0) / (2.0 * PI)) * pow(ca, e);
+  if (hit.mat.kind == MAT_GGX) {
+    let v = -rayDir;
+    let nDotV = dot(hit.normal, v);
+    if (nDotV <= 0.0) {
+      return 0.0;
+    }
+    let h = normalize(v + wi);
+    let a = ggxAlpha(hit.mat.roughness);
+    // VNDF サンプリングの pdf。D_v / (4 (v.h)) を整理すると G1(v) * D / (4 nDotV)
+    return ggxG1(nDotV, a) * ggxD(dot(hit.normal, h), a) / (4.0 * nDotV);
   }
   return 0.0;
 }
@@ -384,32 +439,24 @@ fn scatter(
     return true;
   }
 
-  if (m.kind == MAT_GLOSSY) {
-    // 鏡面方向まわりの Phong ローブからサンプルする
-    let axis = normalize(reflect(ray.dir, hit.normal));
-    let e = m.exponent;
-    let ca = pow(rand(), 1.0 / (e + 1.0));
-    let sa = sqrt(max(0.0, 1.0 - ca * ca));
-    let phi = rand() * 2.0 * PI;
-    let dir = normalize(onb(axis) * vec3f(sa * cos(phi), sa * sin(phi), ca));
+  if (m.kind == MAT_GGX) {
+    let a = ggxAlpha(m.roughness);
+    let basis = onb(hit.normal);
+    let v = -ray.dir;
+    // 法線を +z とするローカル座標へ移してから可視法線をサンプルする
+    let vl = vec3f(dot(v, basis[0]), dot(v, basis[1]), dot(v, basis[2]));
+    if (vl.z <= 0.0) {
+      return false;
+    }
+    let h = basis * sampleGgxVndf(vl, a, rand(), rand());
+    let dir = reflect(ray.dir, h);
     let cosI = dot(hit.normal, dir);
     if (cosI <= 0.0) {
       // 面の裏に潜ったサンプルは捨てる
       return false;
     }
-    // f * cos / pdf = albedo * (e + 2) / (e + 1) * cos
-    *attenuation = m.albedo * ((e + 2.0) / (e + 1.0)) * cosI;
-    *scattered = Ray(hit.p + hit.normal * 1e-4, dir);
-    return true;
-  }
-
-  if (m.kind == MAT_METAL) {
-    let reflected = reflect(ray.dir, hit.normal);
-    let dir = normalize(reflected + m.fuzz * randUnitVec3());
-    if (dot(dir, hit.normal) <= 0.0) {
-      return false;
-    }
-    *attenuation = m.albedo;
+    // f * cos / pdf を整理すると F * G2 / G1(v) = F * G1(l)
+    *attenuation = fresnelSchlick(max(dot(v, h), 0.0), m.albedo) * ggxG1(cosI, a);
     *scattered = Ray(hit.p + hit.normal * 1e-4, dir);
     return true;
   }
