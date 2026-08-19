@@ -1,3 +1,5 @@
+import type { CameraPreset } from "./scene";
+
 export type Vec3 = [number, number, number];
 
 const EPS = 1e-4;
@@ -73,6 +75,17 @@ export class OrbitCamera {
       focusDist: this.autoFocus ? this.distance : this.manualFocusDist,
       lensRadius: this.aperture * 0.5,
     };
+  }
+
+  /** シーンごとの初期カメラを適用する */
+  applyPreset(preset: CameraPreset) {
+    this.target = [...preset.target];
+    this.distance = preset.distance;
+    this.yaw = preset.yaw;
+    this.pitch = preset.pitch;
+    this.fovDeg = preset.fovDeg;
+    this.aperture = preset.aperture;
+    this.dirty = true;
   }
 
   orbit(dx: number, dy: number) {

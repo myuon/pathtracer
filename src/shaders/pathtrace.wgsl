@@ -15,6 +15,8 @@ struct Uniforms {
   sphereCount: u32,
   samplesBefore: u32,
   samplesAfter: u32,
+  quadCount: u32,
+  env: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -23,18 +25,39 @@ struct Uniforms {
 const MAT_LAMBERT: u32 = 0u;
 const MAT_METAL: u32 = 1u;
 const MAT_DIELECTRIC: u32 = 2u;
+const MAT_EMISSIVE: u32 = 3u;
+
+const ENV_SKY: u32 = 0u;
+const ENV_BLACK: u32 = 1u;
+
+/// 球と quad で共有するマテリアル (48 バイト)
+struct Material {
+  albedo: vec3f,
+  fuzz: f32,
+  emission: vec3f,
+  ior: f32,
+  kind: u32,
+};
 
 struct Sphere {
   center: vec3f,
   radius: f32,
-  albedo: vec3f,
-  fuzz: f32,
-  material: u32,
-  ior: f32,
-  _pad: vec2f,
+  mat: Material,
+};
+
+/// 角 q と 2 辺 u, v が張る平行四辺形
+struct Quad {
+  q: vec3f,
+  _p0: f32,
+  u: vec3f,
+  _p1: f32,
+  v: vec3f,
+  _p2: f32,
+  mat: Material,
 };
 
 @group(0) @binding(2) var<storage, read> spheres: array<Sphere>;
+@group(0) @binding(3) var<storage, read> quads: array<Quad>;
 
 // ---------------------------------------------------------------- random
 // PCG hash ベースなので状態バッファは不要。seed は毎回呼び出し側で進める。
@@ -56,7 +79,10 @@ fn rand() -> f32 {
 }
 
 // ---------------------------------------------------------------- sky
-fn skyColor(dir: vec3f) -> vec3f {
+fn envColor(dir: vec3f) -> vec3f {
+  if (U.env == ENV_BLACK) {
+    return vec3f(0.0);
+  }
   let t = 0.5 * (normalize(dir).y + 1.0);
   return mix(vec3f(1.0, 1.0, 1.0), vec3f(0.5, 0.7, 1.0), t);
 }
@@ -98,12 +124,23 @@ struct Hit {
   p: vec3f,
   normal: vec3f,
   frontFace: bool,
-  index: u32,
+  mat: Material,
 };
+
+/// outward は正規化済みの外向き法線
+fn fillHit(hit: ptr<function, Hit>, ray: Ray, t: f32, outward: vec3f, mat: Material) {
+  let front = dot(ray.dir, outward) < 0.0;
+  (*hit).t = t;
+  (*hit).p = ray.origin + t * ray.dir;
+  (*hit).normal = select(-outward, outward, front);
+  (*hit).frontFace = front;
+  (*hit).mat = mat;
+}
 
 fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
   var closest = tMax;
   var found = false;
+
   for (var i = 0u; i < U.sphereCount; i = i + 1u) {
     let s = spheres[i];
     let oc = ray.origin - s.center;
@@ -124,14 +161,33 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
     closest = t;
     found = true;
     let p = ray.origin + t * ray.dir;
-    let outward = (p - s.center) / s.radius;
-    let front = dot(ray.dir, outward) < 0.0;
-    (*hit).t = t;
-    (*hit).p = p;
-    (*hit).normal = select(-outward, outward, front);
-    (*hit).frontFace = front;
-    (*hit).index = i;
+    fillHit(hit, ray, t, (p - s.center) / s.radius, s.mat);
   }
+
+  for (var i = 0u; i < U.quadCount; i = i + 1u) {
+    let quad = quads[i];
+    let n = cross(quad.u, quad.v);
+    let denom = dot(n, ray.dir);
+    if (abs(denom) < 1e-8) {
+      continue;
+    }
+    let t = dot(n, quad.q - ray.origin) / denom;
+    if (t < tMin || t > closest) {
+      continue;
+    }
+    // 平面上の点を u, v 基底で表したときの係数が両方 [0, 1] なら内側
+    let planar = ray.origin + t * ray.dir - quad.q;
+    let w = n / dot(n, n);
+    let alpha = dot(w, cross(planar, quad.v));
+    let beta = dot(w, cross(quad.u, planar));
+    if (alpha < 0.0 || alpha > 1.0 || beta < 0.0 || beta > 1.0) {
+      continue;
+    }
+    closest = t;
+    found = true;
+    fillHit(hit, ray, t, normalize(n), quad.mat);
+  }
+
   return found;
 }
 
@@ -149,31 +205,36 @@ fn scatter(
   attenuation: ptr<function, vec3f>,
   scattered: ptr<function, Ray>,
 ) -> bool {
-  let s = spheres[hit.index];
+  let m = hit.mat;
 
-  if (s.material == MAT_LAMBERT) {
+  if (m.kind == MAT_EMISSIVE) {
+    // 放射は trace 側で足しているので、ここでは打ち切るだけ
+    return false;
+  }
+
+  if (m.kind == MAT_LAMBERT) {
     var dir = hit.normal + randUnitVec3();
     if (dot(dir, dir) < 1e-8) {
       dir = hit.normal;
     }
-    *attenuation = s.albedo;
+    *attenuation = m.albedo;
     *scattered = Ray(hit.p + hit.normal * 1e-4, normalize(dir));
     return true;
   }
 
-  if (s.material == MAT_METAL) {
+  if (m.kind == MAT_METAL) {
     let reflected = reflect(ray.dir, hit.normal);
-    let dir = normalize(reflected + s.fuzz * randUnitVec3());
+    let dir = normalize(reflected + m.fuzz * randUnitVec3());
     if (dot(dir, hit.normal) <= 0.0) {
       return false;
     }
-    *attenuation = s.albedo;
+    *attenuation = m.albedo;
     *scattered = Ray(hit.p + hit.normal * 1e-4, dir);
     return true;
   }
 
   // MAT_DIELECTRIC
-  let ratio = select(s.ior, 1.0 / s.ior, hit.frontFace);
+  let ratio = select(m.ior, 1.0 / m.ior, hit.frontFace);
   let cosTheta = min(dot(-ray.dir, hit.normal), 1.0);
   let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
   var dir: vec3f;
@@ -182,7 +243,7 @@ fn scatter(
   } else {
     dir = refract(ray.dir, hit.normal, ratio);
   }
-  *attenuation = s.albedo;
+  *attenuation = m.albedo;
   *scattered = Ray(hit.p + sign(dot(dir, hit.normal)) * hit.normal * 1e-4, normalize(dir));
   return true;
 }
@@ -196,9 +257,11 @@ fn trace(primary: Ray) -> vec3f {
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
     if (!hitScene(ray, 1e-3, 1e30, &hit)) {
-      radiance = radiance + throughput * skyColor(ray.dir);
+      radiance = radiance + throughput * envColor(ray.dir);
       break;
     }
+    radiance = radiance + throughput * hit.mat.emission;
+
     var attenuation: vec3f;
     var scattered: Ray;
     if (!scatter(ray, hit, &attenuation, &scattered)) {

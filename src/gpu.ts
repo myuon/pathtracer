@@ -1,6 +1,6 @@
 import pathtraceWgsl from "./shaders/pathtrace.wgsl?raw";
 import presentWgsl from "./shaders/present.wgsl?raw";
-import { packSpheres, type Sphere } from "./scene";
+import { packQuads, packSpheres, type Scene } from "./scene";
 
 export interface GpuContext {
   device: GPUDevice;
@@ -37,7 +37,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 96;
+const UNIFORM_SIZE = 112;
 const WORKGROUP = 8;
 
 export interface FrameParams {
@@ -64,8 +64,6 @@ export class Renderer {
   private readonly uniformData = new ArrayBuffer(UNIFORM_SIZE);
   private readonly uniformF32 = new Float32Array(this.uniformData);
   private readonly uniformU32 = new Uint32Array(this.uniformData);
-  private readonly sphereBuffer: GPUBuffer;
-  private readonly sphereCount: number;
   private readonly computePipeline: GPUComputePipeline;
   private readonly presentPipeline: GPURenderPipeline;
 
@@ -74,7 +72,13 @@ export class Renderer {
   private computeBindGroup: GPUBindGroup | null = null;
   private presentBindGroup: GPUBindGroup | null = null;
 
-  constructor(gpu: GpuContext, spheres: Sphere[]) {
+  private sphereBuffer: GPUBuffer | null = null;
+  private quadBuffer: GPUBuffer | null = null;
+  private sphereCount = 0;
+  private quadCount = 0;
+  private env = 0;
+
+  constructor(gpu: GpuContext, scene: Scene) {
     this.device = gpu.device;
     this.context = gpu.context;
 
@@ -82,14 +86,6 @@ export class Renderer {
       size: UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-
-    const packed = packSpheres(spheres);
-    this.sphereCount = spheres.length;
-    this.sphereBuffer = this.device.createBuffer({
-      size: packed.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(this.sphereBuffer, 0, packed);
 
     const traceModule = this.device.createShaderModule({
       code: pathtraceWgsl,
@@ -114,6 +110,53 @@ export class Renderer {
       },
       primitive: { topology: "triangle-list" },
     });
+
+    this.setScene(scene);
+  }
+
+  /** ジオメトリを丸ごと差し替える。バッファのサイズが変わるので作り直す */
+  setScene(scene: Scene) {
+    this.sphereCount = scene.spheres.length;
+    this.quadCount = scene.quads.length;
+    this.env = scene.env;
+
+    this.sphereBuffer?.destroy();
+    this.sphereBuffer = this.uploadGeometry(packSpheres(scene.spheres), "spheres");
+    this.quadBuffer?.destroy();
+    this.quadBuffer = this.uploadGeometry(packQuads(scene.quads), "quads");
+
+    this.rebuildBindGroups();
+  }
+
+  /** pack 済みのジオメトリを storage buffer に載せる (空のシーンでも 1 要素分は確保される) */
+  private uploadGeometry(packed: ArrayBuffer, label: string): GPUBuffer {
+    const buffer = this.device.createBuffer({
+      size: packed.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      label,
+    });
+    this.device.queue.writeBuffer(buffer, 0, packed);
+    return buffer;
+  }
+
+  private rebuildBindGroups() {
+    if (!this.accumBuffer) return;
+    this.computeBindGroup = this.device.createBindGroup({
+      layout: this.computePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: this.accumBuffer } },
+        { binding: 2, resource: { buffer: this.sphereBuffer! } },
+        { binding: 3, resource: { buffer: this.quadBuffer! } },
+      ],
+    });
+    this.presentBindGroup = this.device.createBindGroup({
+      layout: this.presentPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: this.accumBuffer } },
+      ],
+    });
   }
 
   /** 1 storage buffer に収まる最大ピクセル数 */
@@ -130,21 +173,7 @@ export class Renderer {
       usage: GPUBufferUsage.STORAGE,
       label: "accum",
     });
-    this.computeBindGroup = this.device.createBindGroup({
-      layout: this.computePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: { buffer: this.accumBuffer } },
-        { binding: 2, resource: { buffer: this.sphereBuffer } },
-      ],
-    });
-    this.presentBindGroup = this.device.createBindGroup({
-      layout: this.presentPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: { buffer: this.accumBuffer } },
-      ],
-    });
+    this.rebuildBindGroups();
   }
 
   private writeUniforms(p: FrameParams) {
@@ -166,6 +195,8 @@ export class Renderer {
     u[21] = this.sphereCount;
     u[22] = p.samplesBefore;
     u[23] = p.samplesBefore + p.sppPerFrame;
+    u[24] = this.quadCount;
+    u[25] = this.env;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 

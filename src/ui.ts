@@ -1,4 +1,5 @@
 import type { OrbitCamera } from "./camera";
+import type { SceneEntry } from "./scene";
 
 /** 収束モード・操作モードの描画設定 */
 export interface RenderSettings {
@@ -16,6 +17,12 @@ export interface RenderSettings {
 
 export interface UiOptions {
   camera: OrbitCamera;
+  /** セレクタに並べるシーン */
+  scenes: SceneEntry[];
+  /** 最初に選択されているシーンの id */
+  initialSceneId: string;
+  /** シーンが選び直されたとき */
+  onSceneChange: (id: string) => void;
   /** 描画設定やカメラが変わり、累積をリセットすべきとき */
   onReset: () => void;
 }
@@ -24,6 +31,8 @@ export interface UiHandle {
   settings: RenderSettings;
   /** 画面下部のステータス行を更新する */
   setStatus: (text: string) => void;
+  /** カメラ側を書き換えたあと、スライダーの表示を追従させる */
+  syncCamera: () => void;
 }
 
 /** 解像度スケール系スライダーで選べる離散値 */
@@ -106,6 +115,38 @@ function createSliderRow(options: SliderRowOptions): SliderRowHandle {
   };
 }
 
+/** ラベルとドロップダウンからなる 1 行を作る */
+function createSelectRow(options: {
+  label: string;
+  items: { id: string; name: string }[];
+  value: string;
+  onChange: (id: string) => void;
+}): HTMLDivElement {
+  const row = document.createElement("div");
+  row.className = "pt-row";
+
+  const labelLine = document.createElement("div");
+  labelLine.className = "pt-row-label";
+  const labelText = document.createElement("span");
+  labelText.textContent = options.label;
+  labelLine.appendChild(labelText);
+
+  const select = document.createElement("select");
+  select.className = "pt-select";
+  for (const item of options.items) {
+    const opt = document.createElement("option");
+    opt.value = item.id;
+    opt.textContent = item.name;
+    select.appendChild(opt);
+  }
+  select.value = options.value;
+  select.addEventListener("change", () => options.onChange(select.value));
+
+  row.appendChild(labelLine);
+  row.appendChild(select);
+  return row;
+}
+
 /** スタイルを 1 回だけ document.head に注入する */
 function injectStyles(): void {
   const STYLE_ID = "pt-ui-style";
@@ -184,6 +225,24 @@ function injectStyles(): void {
   margin-top: 2px;
 }
 
+.pt-select {
+  width: 100%;
+  margin-top: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11px;
+  padding: 3px 4px;
+  cursor: pointer;
+}
+
+.pt-select option {
+  background: #14161a;
+  color: #e6e6e6;
+}
+
 .pt-reset {
   margin-top: 8px;
   width: 100%;
@@ -257,6 +316,15 @@ export function createUi(options: UiOptions): UiHandle {
   const notifyChange = () => {
     options.onReset();
   };
+
+  const sceneRow = createSelectRow({
+    label: "scene",
+    items: options.scenes,
+    value: options.initialSceneId,
+    onChange: (id) => {
+      options.onSceneChange(id);
+    },
+  });
 
   const maxBouncesRow = createSliderRow({
     label: "max bounces",
@@ -359,6 +427,7 @@ export function createUi(options: UiOptions): UiHandle {
     options.onReset();
   });
 
+  body.appendChild(sceneRow);
   body.appendChild(maxBouncesRow.row);
   body.appendChild(sppRow.row);
   body.appendChild(resolutionRow.row);
@@ -381,6 +450,10 @@ export function createUi(options: UiOptions): UiHandle {
     settings,
     setStatus: (text: string) => {
       status.textContent = text;
+    },
+    syncCamera: () => {
+      fovRow.setValue(options.camera.fovDeg);
+      apertureRow.setValue(options.camera.aperture);
     },
   };
 }

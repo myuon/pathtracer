@@ -15,6 +15,8 @@ struct Uniforms {
   sphereCount: u32,
   samplesBefore: u32,
   samplesAfter: u32,
+  quadCount: u32,
+  env: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;

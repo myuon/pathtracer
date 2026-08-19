@@ -1,6 +1,6 @@
 import { attachCameraControls, OrbitCamera } from "./camera";
 import { initGpu, Renderer, WebGpuUnsupportedError } from "./gpu";
-import { buildScene } from "./scene";
+import { buildSceneById, DEFAULT_SCENE_ID, SCENES } from "./scene";
 import { createUi } from "./ui";
 
 /** 操作をやめてから収束モードに戻るまでの待ち時間 (ms) */
@@ -9,9 +9,12 @@ const SETTLE_MS = 150;
 async function main() {
   const canvas = document.getElementById("canvas") as HTMLCanvasElement;
   const gpu = await initGpu(canvas);
-  const renderer = new Renderer(gpu, buildScene());
+
+  const initialScene = buildSceneById(DEFAULT_SCENE_ID);
+  const renderer = new Renderer(gpu, initialScene);
 
   const camera = new OrbitCamera();
+  camera.applyPreset(initialScene.camera);
 
   let samples = 0;
   let frameIndex = 0;
@@ -19,7 +22,19 @@ async function main() {
     samples = 0;
   };
 
-  const ui = createUi({ camera, onReset: reset });
+  const ui = createUi({
+    camera,
+    scenes: SCENES,
+    initialSceneId: DEFAULT_SCENE_ID,
+    onSceneChange: (id) => {
+      const scene = buildSceneById(id);
+      renderer.setScene(scene);
+      camera.applyPreset(scene.camera);
+      ui.syncCamera();
+      reset();
+    },
+    onReset: reset,
+  });
 
   let interacting = false;
   let settleAt = 0;
