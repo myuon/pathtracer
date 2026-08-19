@@ -1,5 +1,6 @@
 import pathtraceWgsl from "./shaders/pathtrace.wgsl?raw";
 import presentWgsl from "./shaders/present.wgsl?raw";
+import { buildBvh } from "./bvh";
 import { packLights, packQuads, packSpheres, type Scene } from "./scene";
 
 export interface GpuContext {
@@ -81,6 +82,9 @@ export class Renderer {
   private sphereBuffer: GPUBuffer | null = null;
   private quadBuffer: GPUBuffer | null = null;
   private lightBuffer: GPUBuffer | null = null;
+  private bvhBuffer: GPUBuffer | null = null;
+  private bvhRefBuffer: GPUBuffer | null = null;
+  private bvhNodeCount = 0;
   private sphereCount = 0;
   private quadCount = 0;
   private lightCount = 0;
@@ -138,6 +142,13 @@ export class Renderer {
     this.lightBuffer?.destroy();
     this.lightBuffer = this.uploadGeometry(lights.data, "lights");
 
+    const bvh = buildBvh(scene.spheres, scene.quads);
+    this.bvhNodeCount = bvh.nodeCount;
+    this.bvhBuffer?.destroy();
+    this.bvhBuffer = this.uploadGeometry(bvh.nodes, "bvh");
+    this.bvhRefBuffer?.destroy();
+    this.bvhRefBuffer = this.uploadGeometry(bvh.refs, "bvhRefs");
+
     this.rebuildBindGroups();
   }
 
@@ -162,6 +173,8 @@ export class Renderer {
         { binding: 2, resource: { buffer: this.sphereBuffer! } },
         { binding: 3, resource: { buffer: this.quadBuffer! } },
         { binding: 4, resource: { buffer: this.lightBuffer! } },
+        { binding: 5, resource: { buffer: this.bvhBuffer! } },
+        { binding: 6, resource: { buffer: this.bvhRefBuffer! } },
       ],
     });
     this.presentBindGroup = this.device.createBindGroup({
@@ -215,6 +228,7 @@ export class Renderer {
     u[27] = p.nee ? 1 : 0;
     u[28] = p.mis ? 1 : 0;
     u[29] = p.qmc ? 1 : 0;
+    u[30] = this.bvhNodeCount;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 

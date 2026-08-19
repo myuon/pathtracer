@@ -22,6 +22,7 @@ struct Uniforms {
   mis: u32,
   /// スクランブル済み Sobol (0,2) 列を使うか
   qmc: u32,
+  bvhNodeCount: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -74,6 +75,20 @@ struct Quad {
 @group(0) @binding(3) var<storage, read> quads: array<Quad>;
 /// NEE でサンプルする面光源。quads へのインデックス列
 @group(0) @binding(4) var<storage, read> lights: array<u32>;
+
+/// 中央値分割の BVH。左の子は常に自分の直後、右の子は leftFirst にある
+struct BvhNode {
+  bmin: vec3f,
+  /// 葉なら bvhRefs の開始位置、内部ノードなら右の子のノード番号
+  leftFirst: u32,
+  bmax: vec3f,
+  /// 0 なら内部ノード
+  count: u32,
+};
+
+@group(0) @binding(5) var<storage, read> bvh: array<BvhNode>;
+/// (type << 31) | index。type 0 = 球, 1 = quad
+@group(0) @binding(6) var<storage, read> bvhRefs: array<u32>;
 
 // ---------------------------------------------------------------- random
 // PCG hash ベースなので状態バッファは不要。seed は毎回呼び出し側で進める。
@@ -205,57 +220,102 @@ fn fillHit(hit: ptr<function, Hit>, ray: Ray, t: f32, outward: vec3f, mat: Mater
   (*hit).lightArea = lightArea;
 }
 
+fn aabbHit(bmin: vec3f, bmax: vec3f, o: vec3f, invD: vec3f, tMin: f32, tMax: f32) -> bool {
+  let t0 = (bmin - o) * invD;
+  let t1 = (bmax - o) * invD;
+  let lo = min(t0, t1);
+  let hi = max(t0, t1);
+  let tn = max(max(lo.x, lo.y), max(lo.z, tMin));
+  let tf = min(min(hi.x, hi.y), min(hi.z, tMax));
+  return tn <= tf;
+}
+
 fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
   var closest = tMax;
   var found = false;
+  if (U.bvhNodeCount == 0u) {
+    return false;
+  }
+  let invD = vec3f(1.0) / ray.dir;
 
-  for (var i = 0u; i < U.sphereCount; i = i + 1u) {
-    let s = spheres[i];
-    let oc = ray.origin - s.center;
-    let halfB = dot(oc, ray.dir);
-    let c = dot(oc, oc) - s.radius * s.radius;
-    let disc = halfB * halfB - c;
-    if (disc < 0.0) {
-      continue;
-    }
-    let sq = sqrt(disc);
-    var t = -halfB - sq;
-    if (t < tMin || t > closest) {
-      t = -halfB + sq;
-      if (t < tMin || t > closest) {
-        continue;
+  var stack: array<u32, 32>;
+  var sp = 0u;
+  var node = 0u;
+  loop {
+    let n = bvh[node];
+    var descend = false;
+
+    if (aabbHit(n.bmin, n.bmax, ray.origin, invD, tMin, closest)) {
+      if (n.count == 0u) {
+        descend = true;
+      } else {
+        for (var k = 0u; k < n.count; k = k + 1u) {
+          let code = bvhRefs[n.leftFirst + k];
+          let idx = code & 0x7fffffffu;
+
+          if ((code >> 31u) == 0u) {
+            let sph = spheres[idx];
+            let oc = ray.origin - sph.center;
+            let halfB = dot(oc, ray.dir);
+            let c = dot(oc, oc) - sph.radius * sph.radius;
+            let disc = halfB * halfB - c;
+            if (disc < 0.0) {
+              continue;
+            }
+            let sq = sqrt(disc);
+            var t = -halfB - sq;
+            if (t < tMin || t > closest) {
+              t = -halfB + sq;
+              if (t < tMin || t > closest) {
+                continue;
+              }
+            }
+            closest = t;
+            found = true;
+            let p = ray.origin + t * ray.dir;
+            fillHit(hit, ray, t, (p - sph.center) / sph.radius, sph.mat, 0.0);
+          } else {
+            let quad = quads[idx];
+            let nrm = cross(quad.u, quad.v);
+            let denom = dot(nrm, ray.dir);
+            if (abs(denom) < 1e-8) {
+              continue;
+            }
+            let t = dot(nrm, quad.q - ray.origin) / denom;
+            if (t < tMin || t > closest) {
+              continue;
+            }
+            // 平面上の点を u, v 基底で表したときの係数が両方 [0, 1] なら内側
+            let planar = ray.origin + t * ray.dir - quad.q;
+            let w = nrm / dot(nrm, nrm);
+            let alpha = dot(w, cross(planar, quad.v));
+            let beta = dot(w, cross(quad.u, planar));
+            if (alpha < 0.0 || alpha > 1.0 || beta < 0.0 || beta > 1.0) {
+              continue;
+            }
+            closest = t;
+            found = true;
+            // cross(u, v) の長さがそのまま quad の面積になる
+            let ln = length(nrm);
+            fillHit(hit, ray, t, nrm / ln, quad.mat, ln);
+          }
+        }
       }
     }
-    closest = t;
-    found = true;
-    let p = ray.origin + t * ray.dir;
-    fillHit(hit, ray, t, (p - s.center) / s.radius, s.mat, 0.0);
-  }
 
-  for (var i = 0u; i < U.quadCount; i = i + 1u) {
-    let quad = quads[i];
-    let n = cross(quad.u, quad.v);
-    let denom = dot(n, ray.dir);
-    if (abs(denom) < 1e-8) {
-      continue;
+    if (descend) {
+      if (sp < 32u) {
+        stack[sp] = n.leftFirst;
+        sp = sp + 1u;
+      }
+      node = node + 1u;
+    } else {
+      if (sp == 0u) {
+        break;
+      }
+      sp = sp - 1u;
+      node = stack[sp];
     }
-    let t = dot(n, quad.q - ray.origin) / denom;
-    if (t < tMin || t > closest) {
-      continue;
-    }
-    // 平面上の点を u, v 基底で表したときの係数が両方 [0, 1] なら内側
-    let planar = ray.origin + t * ray.dir - quad.q;
-    let w = n / dot(n, n);
-    let alpha = dot(w, cross(planar, quad.v));
-    let beta = dot(w, cross(quad.u, planar));
-    if (alpha < 0.0 || alpha > 1.0 || beta < 0.0 || beta > 1.0) {
-      continue;
-    }
-    closest = t;
-    found = true;
-    // cross(u, v) の長さがそのまま quad の面積になる
-    let ln = length(n);
-    fillHit(hit, ray, t, n / ln, quad.mat, ln);
   }
 
   return found;
@@ -265,39 +325,76 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
 /// ガラスも遮蔽物として扱うので、屈折で回り込む光は NEE では拾えない
 /// (その経路はスペキュラ連鎖として BSDF サンプリング側が拾う)
 fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
-  for (var i = 0u; i < U.sphereCount; i = i + 1u) {
-    let sp = spheres[i];
-    let oc = origin - sp.center;
-    let halfB = dot(oc, dir);
-    let c = dot(oc, oc) - sp.radius * sp.radius;
-    let disc = halfB * halfB - c;
-    if (disc < 0.0) {
-      continue;
-    }
-    let sq = sqrt(disc);
-    let t0 = -halfB - sq;
-    let t1 = -halfB + sq;
-    if ((t0 > 1e-4 && t0 < maxT) || (t1 > 1e-4 && t1 < maxT)) {
-      return true;
-    }
+  if (U.bvhNodeCount == 0u) {
+    return false;
   }
-  for (var i = 0u; i < U.quadCount; i = i + 1u) {
-    let quad = quads[i];
-    let n = cross(quad.u, quad.v);
-    let denom = dot(n, dir);
-    if (abs(denom) < 1e-8) {
-      continue;
+  let invD = vec3f(1.0) / dir;
+
+  var stack: array<u32, 32>;
+  var sp = 0u;
+  var node = 0u;
+  loop {
+    let n = bvh[node];
+    var descend = false;
+
+    if (aabbHit(n.bmin, n.bmax, origin, invD, 1e-4, maxT)) {
+      if (n.count == 0u) {
+        descend = true;
+      } else {
+        for (var k = 0u; k < n.count; k = k + 1u) {
+          let code = bvhRefs[n.leftFirst + k];
+          let idx = code & 0x7fffffffu;
+
+          if ((code >> 31u) == 0u) {
+            let sph = spheres[idx];
+            let oc = origin - sph.center;
+            let halfB = dot(oc, dir);
+            let c = dot(oc, oc) - sph.radius * sph.radius;
+            let disc = halfB * halfB - c;
+            if (disc < 0.0) {
+              continue;
+            }
+            let sq = sqrt(disc);
+            let t0 = -halfB - sq;
+            let t1 = -halfB + sq;
+            if ((t0 > 1e-4 && t0 < maxT) || (t1 > 1e-4 && t1 < maxT)) {
+              return true;
+            }
+          } else {
+            let quad = quads[idx];
+            let nrm = cross(quad.u, quad.v);
+            let denom = dot(nrm, dir);
+            if (abs(denom) < 1e-8) {
+              continue;
+            }
+            let t = dot(nrm, quad.q - origin) / denom;
+            if (t <= 1e-4 || t >= maxT) {
+              continue;
+            }
+            let planar = origin + t * dir - quad.q;
+            let w = nrm / dot(nrm, nrm);
+            let alpha = dot(w, cross(planar, quad.v));
+            let beta = dot(w, cross(quad.u, planar));
+            if (alpha >= 0.0 && alpha <= 1.0 && beta >= 0.0 && beta <= 1.0) {
+              return true;
+            }
+          }
+        }
+      }
     }
-    let t = dot(n, quad.q - origin) / denom;
-    if (t <= 1e-4 || t >= maxT) {
-      continue;
-    }
-    let planar = origin + t * dir - quad.q;
-    let w = n / dot(n, n);
-    let alpha = dot(w, cross(planar, quad.v));
-    let beta = dot(w, cross(quad.u, planar));
-    if (alpha >= 0.0 && alpha <= 1.0 && beta >= 0.0 && beta <= 1.0) {
-      return true;
+
+    if (descend) {
+      if (sp < 32u) {
+        stack[sp] = n.leftFirst;
+        sp = sp + 1u;
+      }
+      node = node + 1u;
+    } else {
+      if (sp == 0u) {
+        break;
+      }
+      sp = sp - 1u;
+      node = stack[sp];
     }
   }
   return false;
