@@ -37,7 +37,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 112;
+const UNIFORM_SIZE = 128;
 const WORKGROUP = 8;
 
 export interface FrameParams {
@@ -57,6 +57,8 @@ export interface FrameParams {
   samplesBefore: number;
   /** 面光源を直接サンプルする (next event estimation) */
   nee: boolean;
+  /** 光源サンプリングと BSDF サンプリングを power heuristic で合成する */
+  mis: boolean;
 }
 
 export class Renderer {
@@ -209,6 +211,7 @@ export class Renderer {
     u[25] = this.env;
     u[26] = this.lightCount;
     u[27] = p.nee ? 1 : 0;
+    u[28] = p.mis ? 1 : 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 

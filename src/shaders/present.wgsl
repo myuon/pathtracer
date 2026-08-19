@@ -19,6 +19,7 @@ struct Uniforms {
   env: u32,
   lightCount: u32,
   nee: u32,
+  mis: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;

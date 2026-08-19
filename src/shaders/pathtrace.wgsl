@@ -19,6 +19,7 @@ struct Uniforms {
   env: u32,
   lightCount: u32,
   nee: u32,
+  mis: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -131,16 +132,19 @@ struct Hit {
   normal: vec3f,
   frontFace: bool,
   mat: Material,
+  /// NEE でサンプルできる面光源ならその面積、できないなら 0。MIS 重みの計算に使う
+  lightArea: f32,
 };
 
 /// outward は正規化済みの外向き法線
-fn fillHit(hit: ptr<function, Hit>, ray: Ray, t: f32, outward: vec3f, mat: Material) {
+fn fillHit(hit: ptr<function, Hit>, ray: Ray, t: f32, outward: vec3f, mat: Material, lightArea: f32) {
   let front = dot(ray.dir, outward) < 0.0;
   (*hit).t = t;
   (*hit).p = ray.origin + t * ray.dir;
   (*hit).normal = select(-outward, outward, front);
   (*hit).frontFace = front;
   (*hit).mat = mat;
+  (*hit).lightArea = lightArea;
 }
 
 fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
@@ -167,7 +171,7 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
     closest = t;
     found = true;
     let p = ray.origin + t * ray.dir;
-    fillHit(hit, ray, t, (p - s.center) / s.radius, s.mat);
+    fillHit(hit, ray, t, (p - s.center) / s.radius, s.mat, 0.0);
   }
 
   for (var i = 0u; i < U.quadCount; i = i + 1u) {
@@ -191,7 +195,9 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
     }
     closest = t;
     found = true;
-    fillHit(hit, ray, t, normalize(n), quad.mat);
+    // cross(u, v) の長さがそのまま quad の面積になる
+    let ln = length(n);
+    fillHit(hit, ray, t, n / ln, quad.mat, ln);
   }
 
   return found;
@@ -240,6 +246,15 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
 }
 
 // ---------------------------------------------------------------- NEE
+/// Veach の power heuristic (beta = 2)。
+/// balance heuristic (pA / (pA + pB)) より重みが優れた戦略へ鋭く寄るので、
+/// 片方の戦略が明らかに良い領域で「劣る側に重みを配ってしまう」損が小さい
+fn misWeight(pA: f32, pB: f32) -> f32 {
+  let a = pA * pA;
+  let b = pB * pB;
+  return a / (a + b);
+}
+
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
 /// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
 fn sampleDirectLight(p: vec3f, n: vec3f) -> vec3f {
@@ -267,8 +282,15 @@ fn sampleDirectLight(p: vec3f, n: vec3f) -> vec3f {
     return vec3f(0.0);
   }
 
-  // 面積の pdf 1 / (lightCount * area) を立体角に変換すると dist2 / (cosLight * area * lightCount)
-  return light.mat.emission * cosSurf * cosLight * area * f32(U.lightCount) / dist2;
+  // 面積についての pdf 1 / (lightCount * area) を立体角に変換したもの
+  let pL = dist2 / (cosLight * area * f32(U.lightCount));
+
+  // MIS。BSDF サンプリングでも作りやすい方向ほど寄与を下げる
+  var weight = 1.0;
+  if (U.mis != 0u) {
+    weight = misWeight(pL, cosSurf * INV_PI);
+  }
+  return light.mat.emission * cosSurf * weight / pL;
 }
 
 // ---------------------------------------------------------------- material
@@ -333,9 +355,9 @@ fn trace(primary: Ray) -> vec3f {
   var ray = primary;
   var throughput = vec3f(1.0);
   var radiance = vec3f(0.0);
-  // 直前の頂点が NEE で直接光を拾ったなら、そこから伸ばしたレイが光源に当たっても
-  // 放射を足さない (二重計上になる)。カメラレイとスペキュラ反射の直後は足す
-  var countEmissive = true;
+  // 直前の頂点で BSDF サンプリングした方向の立体角 pdf。
+  // 負ならカメラレイかスペキュラ反射で、光源サンプリングでは作れない方向なので重みは 1
+  var bsdfPdf = -1.0;
   let useNee = U.nee != 0u && U.lightCount > 0u;
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
@@ -345,23 +367,39 @@ fn trace(primary: Ray) -> vec3f {
       radiance = radiance + throughput * envColor(ray.dir);
       break;
     }
-    if (countEmissive) {
-      radiance = radiance + throughput * hit.mat.emission;
+
+    // 光源に当たったときの放射。NEE と重複するぶんを MIS 重みで削る
+    var weight = 1.0;
+    if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
+      if (U.mis != 0u) {
+        // この方向を光源サンプリングで作る場合の pdf。sampleDirectLight と同じ式
+        let cosLight = max(abs(dot(hit.normal, ray.dir)), 1e-6);
+        let pL = hit.t * hit.t / (cosLight * hit.lightArea * f32(U.lightCount));
+        weight = misWeight(bsdfPdf, pL);
+      } else {
+        // MIS なしなら NEE 側に完全に任せる (二重計上の防止)
+        weight = 0.0;
+      }
     }
+    radiance = radiance + throughput * hit.mat.emission * weight;
 
     // 拡散面だけ光源を直接サンプルする。スペキュラ面は BSDF サンプリングに任せる
     if (useNee && hit.mat.kind == MAT_LAMBERT) {
       let direct = sampleDirectLight(hit.p, hit.normal);
       radiance = radiance + throughput * hit.mat.albedo * INV_PI * direct;
-      countEmissive = false;
-    } else {
-      countEmissive = true;
     }
 
     var attenuation: vec3f;
     var scattered: Ray;
     if (!scatter(ray, hit, &attenuation, &scattered)) {
       break;
+    }
+    // 次の頂点で MIS 重みを計算するために pdf を持ち回る。
+    // lambert はコサイン分布なので cos / PI、スペキュラはデルタ分布なので負にしておく
+    if (hit.mat.kind == MAT_LAMBERT) {
+      bsdfPdf = max(dot(hit.normal, scattered.dir), 1e-5) * INV_PI;
+    } else {
+      bsdfPdf = -1.0;
     }
     throughput = throughput * attenuation;
     ray = scattered;

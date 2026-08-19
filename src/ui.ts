@@ -15,6 +15,8 @@ export interface RenderSettings {
   interactiveBounces: number;
   /** 面光源を直接サンプルする (next event estimation) */
   nee: boolean;
+  /** 光源サンプリングと BSDF サンプリングを power heuristic で合成する */
+  mis: boolean;
 }
 
 export interface UiOptions {
@@ -321,6 +323,7 @@ export function createUi(options: UiOptions): UiHandle {
     interactiveScale: 0.33,
     interactiveBounces: 3,
     nee: true,
+    mis: true,
   };
 
   const panel = document.createElement("div");
@@ -466,6 +469,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const misRow = createToggleRow({
+    label: "MIS (power heuristic)",
+    value: settings.mis,
+    onChange: (v) => {
+      settings.mis = v;
+      notifyChange();
+    },
+  });
+
   const resetButton = document.createElement("button");
   resetButton.type = "button";
   resetButton.className = "pt-reset";
@@ -483,6 +495,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(interactiveResRow.row);
   body.appendChild(interactiveBouncesRow.row);
   body.appendChild(neeRow);
+  body.appendChild(misRow);
   body.appendChild(resetButton);
 
   const status = document.createElement("div");

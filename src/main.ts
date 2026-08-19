@@ -119,6 +119,7 @@ async function main() {
       maxBounces,
       samplesBefore: samples,
       nee: ui.settings.nee,
+      mis: ui.settings.mis,
     });
 
     samples += spp;
