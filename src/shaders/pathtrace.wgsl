@@ -20,6 +20,8 @@ struct Uniforms {
   lightCount: u32,
   nee: u32,
   mis: u32,
+  /// スクランブル済み Sobol (0,2) 列を使うか
+  qmc: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -35,6 +37,9 @@ const ENV_SKY: u32 = 0u;
 const ENV_BLACK: u32 = 1u;
 
 const PI: f32 = 3.14159265;
+/// このバウンス数までは低食い違い列に次元を割り当てる。
+/// 深いバウンスまで広げると経路ごとの次元のずれで逆に悪化するため 1 に留める
+const QMC_DEPTH: u32 = 1u;
 const INV_PI: f32 = 0.31830988;
 
 /// 球と quad で共有するマテリアル (48 バイト)
@@ -89,6 +94,64 @@ fn rand() -> f32 {
   return f32(randU32()) * (1.0 / 4294967296.0);
 }
 
+// -------------------------------------------------------- 低食い違い列
+// 画素ごとに独立にスクランブルした Sobol (0,2) 列。
+// 累積サンプル番号で引くので、プログレッシブ描画とそのまま噛み合う。
+var<private> sampleIdx: u32;
+var<private> pixelSeed: u32;
+
+/// 基数 2 の van der Corput 列 (ビット反転)
+fn vanDerCorput(nIn: u32, scramble: u32) -> f32 {
+  var n = nIn;
+  n = (n << 16u) | (n >> 16u);
+  n = ((n & 0x00ff00ffu) << 8u) | ((n & 0xff00ff00u) >> 8u);
+  n = ((n & 0x0f0f0f0fu) << 4u) | ((n & 0xf0f0f0f0u) >> 4u);
+  n = ((n & 0x33333333u) << 2u) | ((n & 0xccccccccu) >> 2u);
+  n = ((n & 0x55555555u) << 1u) | ((n & 0xaaaaaaaau) >> 1u);
+  n = n ^ scramble;
+  return f32(n) * 2.3283064365386963e-10;
+}
+
+/// Sobol 列の第 2 次元
+fn sobol2(nIn: u32, scramble: u32) -> f32 {
+  var n = nIn;
+  var s = scramble;
+  var v = 1u << 31u;
+  for (var i = 0u; i < 32u; i = i + 1u) {
+    if (n == 0u) {
+      break;
+    }
+    if ((n & 1u) != 0u) {
+      s = s ^ v;
+    }
+    v = v ^ (v >> 1u);
+    n = n >> 1u;
+  }
+  return f32(s) * 2.3283064365386963e-10;
+}
+
+/// 次元 d に割り当てた 2 次元サンプル。次元ごとに画素依存のスクランブルをかける
+fn stratified2d(d: u32) -> vec2f {
+  let sc1 = pcg(pixelSeed ^ (d * 0x9e3779b9u));
+  let sc2 = pcg(sc1 ^ 0x85ebca6bu);
+  return vec2f(vanDerCorput(sampleIdx, sc1), sobol2(sampleIdx, sc2));
+}
+
+/// 低食い違い列を割り当てるのは浅いバウンスだけ。深いところは白色雑音に落とす
+fn sample2d(d: u32, useQmc: bool) -> vec2f {
+  if (useQmc && U.qmc != 0u) {
+    return stratified2d(d);
+  }
+  return vec2f(rand(), rand());
+}
+
+/// コサイン重み付き半球サンプリング (pdf = cos / PI)
+fn cosineHemisphere(u: vec2f) -> vec3f {
+  let r = sqrt(u.x);
+  let phi = 2.0 * PI * u.y;
+  return vec3f(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u.x)));
+}
+
 // ---------------------------------------------------------------- sky
 fn envColor(dir: vec3f) -> vec3f {
   if (U.env == ENV_BLACK) {
@@ -104,7 +167,7 @@ struct Ray {
   dir: vec3f,
 };
 
-fn makeRay(px: f32, py: f32) -> Ray {
+fn makeRay(px: f32, py: f32, lensU: vec2f) -> Ray {
   // px, py は [-1, 1] のスクリーン座標 (py は上が +1)
   let d = U.camU * (px * U.tanHalfFov * U.aspect)
         + U.camV * (py * U.tanHalfFov)
@@ -113,20 +176,11 @@ fn makeRay(px: f32, py: f32) -> Ray {
   var origin = U.camPos;
   if (U.lensRadius > 0.0) {
     // 単位円内の一様サンプル
-    let r = U.lensRadius * sqrt(rand());
-    let theta = rand() * 6.2831853;
+    let r = U.lensRadius * sqrt(lensU.x);
+    let theta = lensU.y * 6.2831853;
     origin = origin + U.camU * (r * cos(theta)) + U.camV * (r * sin(theta));
   }
   return Ray(origin, normalize(focusPoint - origin));
-}
-
-// ---------------------------------------------------------------- sampling
-fn randUnitVec3() -> vec3f {
-  // 球面上の一様サンプル
-  let z = rand() * 2.0 - 1.0;
-  let a = rand() * 6.2831853;
-  let r = sqrt(max(0.0, 1.0 - z * z));
-  return vec3f(r * cos(a), r * sin(a), z);
 }
 
 // ---------------------------------------------------------------- intersect
@@ -372,12 +426,12 @@ fn misWeight(pA: f32, pB: f32) -> f32 {
 
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
 /// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
-fn sampleDirectLight(hit: Hit, rayDir: vec3f) -> vec3f {
+fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f) -> vec3f {
   let pick = min(u32(rand() * f32(U.lightCount)), U.lightCount - 1u);
   let light = quads[lights[pick]];
 
   // 光源上の一様サンプル
-  let onLight = light.q + light.u * rand() + light.v * rand();
+  let onLight = light.q + light.u * u.x + light.v * u.y;
   let toLight = onLight - hit.p;
   let dist2 = dot(toLight, toLight);
   let dist = sqrt(dist2);
@@ -419,6 +473,7 @@ fn schlick(cosine: f32, refIdx: f32) -> f32 {
 fn scatter(
   ray: Ray,
   hit: Hit,
+  u: vec2f,
   attenuation: ptr<function, vec3f>,
   scattered: ptr<function, Ray>,
 ) -> bool {
@@ -430,12 +485,10 @@ fn scatter(
   }
 
   if (m.kind == MAT_LAMBERT) {
-    var dir = hit.normal + randUnitVec3();
-    if (dot(dir, dir) < 1e-8) {
-      dir = hit.normal;
-    }
+    // pdf = cos / PI ちょうどなので f * cos / pdf = albedo
+    let dir = normalize(onb(hit.normal) * cosineHemisphere(u));
     *attenuation = m.albedo;
-    *scattered = Ray(hit.p + hit.normal * 1e-4, normalize(dir));
+    *scattered = Ray(hit.p + hit.normal * 1e-4, dir);
     return true;
   }
 
@@ -448,7 +501,7 @@ fn scatter(
     if (vl.z <= 0.0) {
       return false;
     }
-    let h = basis * sampleGgxVndf(vl, a, rand(), rand());
+    let h = basis * sampleGgxVndf(vl, a, u.x, u.y);
     let dir = reflect(ray.dir, h);
     let cosI = dot(hit.normal, dir);
     if (cosI <= 0.0) {
@@ -511,12 +564,12 @@ fn trace(primary: Ray) -> vec3f {
 
     // pdf を評価できる面だけ光源を直接サンプルする。デルタ面は BSDF サンプリングに任せる
     if (useNee && isDiffuseLike(hit.mat.kind)) {
-      radiance = radiance + throughput * sampleDirectLight(hit, ray.dir);
+      radiance = radiance + throughput * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH));
     }
 
     var attenuation: vec3f;
     var scattered: Ray;
-    if (!scatter(ray, hit, &attenuation, &scattered)) {
+    if (!scatter(ray, hit, sample2d(3u + depth * 2u, depth < QMC_DEPTH), &attenuation, &scattered)) {
       break;
     }
     // 次の頂点で MIS 重みを計算するために pdf を持ち回る。
@@ -548,14 +601,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   }
   let pixel = gid.y * U.width + gid.x;
   rngState = pcg(pixel * 9781u + U.frameIndex * 6271u + 1u);
+  pixelSeed = pcg(pixel * 26699u + 1u);
 
   var sum = vec3f(0.0);
   for (var s = 0u; s < U.sppPerFrame; s = s + 1u) {
-    let jx = rand();
-    let jy = rand();
-    let px = (f32(gid.x) + jx) / f32(U.width) * 2.0 - 1.0;
-    let py = 1.0 - (f32(gid.y) + jy) / f32(U.height) * 2.0;
-    sum = sum + trace(makeRay(px, py));
+    // 累積サンプル番号で低食い違い列を引く
+    sampleIdx = U.samplesBefore + s;
+    let jitter = sample2d(0u, true);
+    let px = (f32(gid.x) + jitter.x) / f32(U.width) * 2.0 - 1.0;
+    let py = 1.0 - (f32(gid.y) + jitter.y) / f32(U.height) * 2.0;
+    sum = sum + trace(makeRay(px, py, sample2d(1u, true)));
   }
 
   if (U.samplesBefore == 0u) {

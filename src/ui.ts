@@ -17,6 +17,8 @@ export interface RenderSettings {
   nee: boolean;
   /** 光源サンプリングと BSDF サンプリングを power heuristic で合成する */
   mis: boolean;
+  /** スクランブル済み Sobol (0,2) 列を使う */
+  qmc: boolean;
 }
 
 export interface UiOptions {
@@ -324,6 +326,7 @@ export function createUi(options: UiOptions): UiHandle {
     interactiveBounces: 3,
     nee: true,
     mis: true,
+    qmc: true,
   };
 
   const panel = document.createElement("div");
@@ -478,6 +481,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const qmcRow = createToggleRow({
+    label: "low-discrepancy sampling",
+    value: settings.qmc,
+    onChange: (v) => {
+      settings.qmc = v;
+      notifyChange();
+    },
+  });
+
   const resetButton = document.createElement("button");
   resetButton.type = "button";
   resetButton.className = "pt-reset";
@@ -496,6 +508,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(interactiveBouncesRow.row);
   body.appendChild(neeRow);
   body.appendChild(misRow);
+  body.appendChild(qmcRow);
   body.appendChild(resetButton);
 
   const status = document.createElement("div");

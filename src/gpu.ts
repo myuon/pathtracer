@@ -59,6 +59,8 @@ export interface FrameParams {
   nee: boolean;
   /** 光源サンプリングと BSDF サンプリングを power heuristic で合成する */
   mis: boolean;
+  /** スクランブル済み Sobol (0,2) 列を使う */
+  qmc: boolean;
 }
 
 export class Renderer {
@@ -212,6 +214,7 @@ export class Renderer {
     u[26] = this.lightCount;
     u[27] = p.nee ? 1 : 0;
     u[28] = p.mis ? 1 : 0;
+    u[29] = p.qmc ? 1 : 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 

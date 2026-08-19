@@ -120,6 +120,7 @@ async function main() {
       samplesBefore: samples,
       nee: ui.settings.nee,
       mis: ui.settings.mis,
+      qmc: ui.settings.qmc,
     });
 
     samples += spp;
