@@ -67,13 +67,16 @@ const HIST_BYTES_PER_PIXEL = 64;
 const WORKGROUP = 8;
 
 /** 1 反復あたりに撒く光子の数 */
-const PHOTON_COUNT = 1 << 17;
+// 1 フレームに撒く光子数。SPPM は累積なので、ここを半分にしても
+// 同じ総光子数に達するフレーム数が倍になるだけ。1 セルあたりの詰まり具合が
+// 半分になる方が効くので、容量を上げる代わりにこちらを下げている
+const PHOTON_COUNT = 1 << 16;
 /** ハッシュグリッドのセル数 */
 const GRID_CELLS = 1 << 18;
 /** 1 セルに入る光子の上限。WGSL 側の GRID_CAP と一致させること */
-const GRID_CAP = 48;
+const GRID_CAP = 96;
 /** 光子 1 本が堆積できる回数。WGSL 側の MAX_DEPOSITS と一致させること */
-const MAX_DEPOSITS = 6;
+const MAX_DEPOSITS = 10;
 
 export interface FrameParams {
   camPos: [number, number, number];
