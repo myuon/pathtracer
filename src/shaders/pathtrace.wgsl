@@ -747,13 +747,110 @@ fn sampleGgxVndf(ve: vec3f, a: f32, u1: f32, u2: f32) -> vec3f {
 }
 
 /// 光源サンプリングできるのは pdf を評価できるマテリアルだけ。
-/// dielectric はデルタ分布なので対象外
-fn isDiffuseLike(kind: u32) -> bool {
-  return kind == MAT_LAMBERT || kind == MAT_GGX || kind == MAT_PHASE;
+/// 誘電体は粗さがある場合のみ対象にする (ほぼ鏡面だと pdf が極端に大きく、
+/// 影レイを飛ばしても寄与がほぼ 0 で無駄になるため)
+fn isDiffuseLike(m: Material) -> bool {
+  return m.kind == MAT_LAMBERT || m.kind == MAT_GGX || m.kind == MAT_PHASE
+    || (m.kind == MAT_DIELECTRIC && m.roughness > 0.02);
+}
+
+/// 誘電体の相対屈折率 nt / ni。hit.normal は視線側を向いている
+fn dielectricEtaRel(hit: Hit) -> f32 {
+  return select(1.0 / hit.mat.ior, hit.mat.ior, hit.frontFace);
+}
+
+/// 誘電体のマイクロファセット半ベクトルとフレネル、屈折のヤコビアン分母
+struct DiTerms {
+  valid: bool,
+  isReflect: bool,
+  h: vec3f,
+  denom: f32,
+  fr: f32,
+};
+
+fn dielectricTerms(hit: Hit, rayDir: vec3f, wi: vec3f) -> DiTerms {
+  var t: DiTerms;
+  t.valid = false;
+  t.isReflect = false;
+  t.h = hit.normal;
+  t.denom = 1.0;
+  t.fr = 1.0;
+
+  let v = -rayDir;
+  let cosO = dot(hit.normal, v);
+  let cosI = dot(hit.normal, wi);
+  if (cosO <= 1e-6 || abs(cosI) < 1e-6) {
+    return t;
+  }
+  t.isReflect = cosI > 0.0;
+  let etaRel = dielectricEtaRel(hit);
+
+  // 屈折側は Walter の一般化半ベクトル
+  var h = select(normalize(wi * etaRel + v), normalize(v + wi), t.isReflect);
+  if (dot(h, hit.normal) < 0.0) {
+    h = -h;
+  }
+  let dotVH = dot(v, h);
+  if (dotVH <= 1e-6) {
+    return t;
+  }
+  let dotIH = dot(wi, h);
+
+  // 全反射の領域では透過が起きない
+  let eta = 1.0 / etaRel;
+  let sin2 = eta * eta * max(0.0, 1.0 - dotVH * dotVH);
+  t.fr = select(schlick(min(dotVH, 1.0), eta), 1.0, sin2 > 1.0);
+
+  let dn = dotIH + dotVH / etaRel;
+  t.denom = max(dn * dn, 1e-12);
+  t.h = h;
+  t.valid = true;
+  return t;
+}
+
+/// 誘電体の BSDF * |cos(theta_i)|
+fn dielectricEvalCos(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
+  let t = dielectricTerms(hit, rayDir, wi);
+  if (!t.valid) {
+    return 0.0;
+  }
+  let a = ggxAlpha(hit.mat.roughness);
+  let v = -rayDir;
+  let cosO = dot(hit.normal, v);
+  let cosI = dot(hit.normal, wi);
+  let d = ggxD(dot(hit.normal, t.h), a);
+  let g2 = ggxG1(cosO, a) * ggxG1(abs(cosI), a);
+  if (!t.isReflect) {
+    // 透過方向は直線の影レイが必ずガラス自身に遮られるので、光源サンプリングの
+    // 担当外にする。BSDF サンプリング側が重み 1 で受け持つ
+    return 0.0;
+  }
+  return d * g2 * t.fr / (4.0 * cosO);
+}
+
+/// dielectricEvalCos と同じ方向に対する立体角 pdf
+fn dielectricPdf(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
+  let t = dielectricTerms(hit, rayDir, wi);
+  if (!t.valid) {
+    return 0.0;
+  }
+  let a = ggxAlpha(hit.mat.roughness);
+  let v = -rayDir;
+  let cosO = dot(hit.normal, v);
+  let dotVH = dot(v, t.h);
+  // 可視法線分布の密度
+  let dv = ggxG1(cosO, a) * dotVH * ggxD(dot(hit.normal, t.h), a) / cosO;
+  if (!t.isReflect) {
+    return 0.0;
+  }
+  return t.fr * dv / (4.0 * dotVH);
 }
 
 /// BRDF * cos(theta_i)。デルタ分布のマテリアルでは 0 を返す
 fn bsdfEval(hit: Hit, rayDir: vec3f, wi: vec3f) -> vec3f {
+  if (hit.mat.kind == MAT_DIELECTRIC) {
+    return vec3f(dielectricEvalCos(hit, rayDir, wi));
+  }
   if (hit.mat.kind == MAT_PHASE) {
     // 媒質にはコサイン項がないので位相関数そのもの
     return vec3f(hgPhase(dot(rayDir, wi), U.fogG));
@@ -783,6 +880,9 @@ fn bsdfEval(hit: Hit, rayDir: vec3f, wi: vec3f) -> vec3f {
 
 /// bsdfEval と同じ方向に対する立体角 pdf
 fn bsdfPdfFor(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
+  if (hit.mat.kind == MAT_DIELECTRIC) {
+    return dielectricPdf(hit, rayDir, wi);
+  }
   if (hit.mat.kind == MAT_PHASE) {
     return hgPhase(dot(rayDir, wi), U.fogG);
   }
@@ -1126,7 +1226,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     radiance = radiance + throughput * hit.mat.emission * weight;
 
     // pdf を評価できる面だけ光源を直接サンプルする。デルタ面は BSDF サンプリングに任せる
-    if (useNee && isDiffuseLike(hit.mat.kind)) {
+    if (useNee && isDiffuseLike(hit.mat)) {
       var mw = 1.0;
       radiance = radiance + throughput
         * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
@@ -1142,8 +1242,11 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     }
     // 次の頂点で MIS 重みを計算するために pdf を持ち回る。
     // デルタ分布のマテリアルは光源サンプリングで作れない方向なので負にしておく
-    if (isDiffuseLike(hit.mat.kind)) {
-      bsdfPdf = max(bsdfPdfFor(hit, ray.dir, scattered.dir), 1e-5);
+    if (isDiffuseLike(hit.mat)) {
+      let pv = bsdfPdfFor(hit, ray.dir, scattered.dir);
+      // pdf が 0 の方向 (誘電体の透過ローブ) は光源サンプリングで作れないので
+      // 負にしておき、MIS 重み 1 で扱う
+      bsdfPdf = select(-1.0, max(pv, 1e-8), pv > 0.0);
     } else {
       bsdfPdf = -1.0;
     }
