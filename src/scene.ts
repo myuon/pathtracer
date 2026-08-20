@@ -774,13 +774,28 @@ function buildMazeScene(): Scene {
 }
 
 
-/** 水面の高さ。低い周波数を数本重ねただけの簡単な波 */
-function waveHeight(x: number, z: number, amp: number): number {
+/**
+ * 水面の高さ。
+ * dynamic を立てると低周波のうねりと高周波のさざ波を足して荒くする。
+ * 傾きの変化が大きくなるぶん、集光のコントラストが上がる。
+ */
+function waveHeight(x: number, z: number, amp: number, dynamic = false): number {
+  const base =
+    Math.sin(6.1 * x + 1.3) * Math.cos(5.3 * z) +
+    0.6 * Math.sin(9.7 * z + 2.1) * Math.cos(8.3 * x) +
+    0.35 * Math.sin(15.1 * (x * 0.7 + z * 0.7) + 0.7);
+  if (!dynamic) {
+    return amp * base;
+  }
+  // 大きなうねりを主役にする。高周波を足しすぎると集光が細かい格子に
+  // 割れてしまい、力強い筋にならない
   return (
     amp *
-    (Math.sin(6.1 * x + 1.3) * Math.cos(5.3 * z) +
-      0.6 * Math.sin(9.7 * z + 2.1) * Math.cos(8.3 * x) +
-      0.35 * Math.sin(15.1 * (x * 0.7 + z * 0.7) + 0.7))
+    (1.55 * Math.sin(2.6 * x - 1.8 * z + 0.4) +
+      1.25 * Math.sin(3.6 * z + 1.9) * Math.cos(3.1 * x) +
+      0.8 * Math.sin(6.1 * x + 1.3) * Math.cos(5.3 * z) +
+      0.42 * Math.sin(9.7 * z + 2.1) * Math.cos(8.3 * x) +
+      0.16 * Math.sin(15.1 * (x * 0.7 + z * 0.7) + 0.7))
   );
 }
 
@@ -793,6 +808,7 @@ function waterSurface(
   amp: number,
   n: number,
   material: Material,
+  dynamic = false,
 ): Triangle[] {
   const norm = (v: Vec3): Vec3 => {
     const l = Math.hypot(v[0], v[1], v[2]) || 1;
@@ -807,10 +823,12 @@ function waterSurface(
     for (let j = 0; j <= n; j++) {
       const x = x0 + (i / n) * size;
       const z = z0 + (j / n) * size;
-      px.push([x, level + waveHeight(x, z, amp), z]);
+      px.push([x, level + waveHeight(x, z, amp, dynamic), z]);
       // 上向きの法線 (-dh/dx, 1, -dh/dz)
-      const hx = (waveHeight(x + E, z, amp) - waveHeight(x - E, z, amp)) / (2 * E);
-      const hz = (waveHeight(x, z + E, amp) - waveHeight(x, z - E, amp)) / (2 * E);
+      const hx =
+        (waveHeight(x + E, z, amp, dynamic) - waveHeight(x - E, z, amp, dynamic)) / (2 * E);
+      const hz =
+        (waveHeight(x, z + E, amp, dynamic) - waveHeight(x, z - E, amp, dynamic)) / (2 * E);
       nx.push(norm([-hx, 1, -hz]));
     }
     pos.push(px);
@@ -897,17 +915,17 @@ function buildSubmergedScene(): Scene {
       { q: [0, 0, S], u: [S, 0, 0], v: [0, S, 0], material: white },
       // 水面より上にある光源。小さめにして集光を鋭くする
       {
-        q: [2.95, S - 0.01, 2.95],
-        u: [-0.36, 0, 0],
-        v: [0, 0, -0.3],
-        material: emissive([760, 720, 620]),
+        q: [2.87, S - 0.01, 2.87],
+        u: [-0.19, 0, 0],
+        v: [0, 0, -0.16],
+        material: emissive([2700, 2560, 2200]),
       },
       // 沈んでいる 2 つの箱
       ...place(box([0, 0, 0], [1.65, 3.3, 1.65], white), 15, [2.65, 0, 2.95]),
       ...place(box([0, 0, 0], [1.65, 1.65, 1.65], white), -18, [1.3, 0, 0.65]),
     ],
     // 水面は天井のすぐ下。壁の外まで伸ばして縁を隠す
-    triangles: waterSurface(-0.25, -0.25, S + 0.5, 4.35, 0.072, 220, water),
+    triangles: waterSurface(-0.25, -0.25, S + 0.5, 4.3, 0.085, 260, water, true),
     env: ENV.black,
     camera: {
       target: [S / 2, 2.4, S / 2],
