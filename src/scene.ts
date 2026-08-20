@@ -563,6 +563,66 @@ function buildShaftScene(): Scene {
   };
 }
 
+
+/**
+ * 間接照明が支配的なシーン。単方向パストレーシングの弱点を見るためのもの。
+ *
+ * 部屋を隔壁で 2 つに分け、細い隙間だけでつないである。光源は奥側で上を
+ * 向いているので、手前側を照らす光は「天井で跳ね返り、隙間を通ってくる」
+ * 経路しかない。手前の面から光源への影レイはほぼ必ず遮られるので、NEE が
+ * ほとんど効かない。
+ */
+function buildIndirectScene(): Scene {
+  const X = 11;
+  const Y = 5;
+  const Z = 8;
+  const warm = lambert([0.62, 0.57, 0.5]);
+  const cool = lambert([0.46, 0.5, 0.58]);
+  const floor = lambert([0.5, 0.48, 0.45]);
+
+  // 隔壁。z 方向に細い隙間 (扉) を残す
+  // 隙間を狭めるほど NEE が効かなくなり、単方向パストレーシングには厳しくなる。
+  // 幅 1.0 / 0.4 / 0.15 で必要な spp は cornell 比 2.4 / 7.1 / 17.4 倍だった
+  const gap0 = 3.8;
+  const gap1 = 4.2;
+  const bx = 6.0;
+
+  return {
+    spheres: [
+      { center: [2.6, 0.85, 3.2], radius: 0.85, material: lambert([0.72, 0.7, 0.66]) },
+      { center: [4.3, 0.6, 5.4], radius: 0.6, material: ggx([0.95, 0.9, 0.8], 0.2) },
+    ],
+    quads: [
+      { q: [0, 0, 0], u: [X, 0, 0], v: [0, 0, Z], material: floor },
+      { q: [0, Y, 0], u: [X, 0, 0], v: [0, 0, Z], material: warm },
+      { q: [0, 0, 0], u: [0, Y, 0], v: [0, 0, Z], material: cool },
+      { q: [X, 0, 0], u: [0, Y, 0], v: [0, 0, Z], material: warm },
+      { q: [0, 0, 0], u: [X, 0, 0], v: [0, Y, 0], material: cool },
+      { q: [0, 0, Z], u: [X, 0, 0], v: [0, Y, 0], material: cool },
+      // 隔壁 (隙間の手前と奥)
+      { q: [bx, 0, 0], u: [0, Y, 0], v: [0, 0, gap0], material: warm },
+      { q: [bx, 0, gap1], u: [0, Y, 0], v: [0, 0, Z - gap1], material: warm },
+      // 奥側の光源。上を向いているので直接は手前を照らさない
+      {
+        q: [8.6, 0.35, 2.6],
+        u: [0, 0, 2.4],
+        v: [1.9, 0, 0],
+        material: emissive([175, 162, 136]),
+      },
+    ],
+    triangles: [],
+    env: ENV.black,
+    camera: {
+      target: [4.0, 1.7, 3.0],
+      distance: 3.6,
+      yaw: Math.PI * 0.85,
+      pitch: 0.12,
+      fovDeg: 70,
+      aperture: 0,
+    },
+  };
+}
+
 export interface SceneEntry {
   id: string;
   name: string;
@@ -576,6 +636,7 @@ export const SCENES: SceneEntry[] = [
   { id: "mesh", name: "torus knot (mesh)", build: buildMeshScene },
   { id: "glass", name: "rough / colored glass", build: buildGlassScene },
   { id: "shaft", name: "light shafts (fog)", build: buildShaftScene },
+  { id: "indirect", name: "indirect only (hard)", build: buildIndirectScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;
