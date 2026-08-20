@@ -191,6 +191,10 @@ const GRID_CAP: u32 = 48u;
 /// 食うので、余裕を見つつ小さくしておく
 const BVH_STACK: u32 = 24u;
 
+/// 光子 1 本が堆積できる回数の上限。白い部屋では光子が 3〜5 回跳ねるので、
+/// 2 回で打ち切ると間接光がごっそり欠ける
+const MAX_DEPOSITS: u32 = 6u;
+
 fn gridHash(ix: i32, iy: i32, iz: i32) -> u32 {
   let h = (u32(ix) * 73856093u) ^ (u32(iy) * 19349663u) ^ (u32(iz) * 83492791u);
   return h % U.gridCells;
@@ -979,15 +983,11 @@ fn misWeight(pA: f32, pB: f32) -> f32 {
 
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
 /// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
-/// allowMis を false にすると MIS 重みを掛けない。SPPM のカメラ側は
-/// ギャザー面で経路を打ち切るため BSDF サンプリング側の相方が存在せず、
-/// 重みを掛けると w_B のぶんだけエネルギーが失われる
 fn sampleDirectLight(
   hit: Hit,
   rayDir: vec3f,
   u: vec2f,
   misOut: ptr<function, f32>,
-  allowMis: bool,
 ) -> vec3f {
   let n = lightSelectCount();
   if (n == 0u) {
@@ -1012,7 +1012,7 @@ fn sampleDirectLight(
     }
     let tr = fogTransmittance(hit.p, wi, 1e30);
     var w = 1.0;
-    if (allowMis && U.mis != 0u) {
+    if (U.mis != 0u) {
       w = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
     }
     *misOut = w;
@@ -1048,7 +1048,7 @@ fn sampleDirectLight(
 
   // MIS。BSDF サンプリングでも作りやすい方向ほど寄与を下げる
   var weight = 1.0;
-  if (allowMis && U.mis != 0u) {
+  if (U.mis != 0u) {
     weight = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
   }
   *misOut = weight;
@@ -1233,7 +1233,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
           if (useNee) {
             var mw = 1.0;
             radiance = radiance + throughput
-              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw, true);
+              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
             if (depth == 0u) {
               (*aov).misWeight = mw;
             }
@@ -1298,7 +1298,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     if (useNee && isDiffuseLike(hit.mat)) {
       var mw = 1.0;
       radiance = radiance + throughput
-        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw, true);
+        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
       if (depth == 0u) {
         (*aov).misWeight = mw;
       }
@@ -1459,7 +1459,33 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
       if (useNee) {
         var mw = 1.0;
         radiance = radiance + throughput
-          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw, false);
+          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw);
+
+        // MIS のもう一方の戦略。ここで経路を打ち切ってしまうと BSDF
+        // サンプリング側の寄与が丸ごと消えるので、直接光のぶんだけ
+        // 1 本伸ばして拾う。間接光は光子が受け持つので、光源に当たった
+        // 場合だけ加算する
+        var att: vec3f;
+        var sc: Ray;
+        if (scatter(ray, hit, vec2f(rand(), rand()), &att, &sc)) {
+          let pv = bsdfPdfFor(hit, ray.dir, sc.dir);
+          if (pv > 0.0) {
+            var h2: Hit;
+            if (hitScene(sc, 1e-3, 1e30, &h2)) {
+              if (h2.lightArea > 0.0) {
+                let cosL = max(abs(dot(h2.normal, sc.dir)), 1e-6);
+                let pL = h2.t * h2.t / (cosL * h2.lightArea * f32(lightSelectCount()));
+                radiance = radiance + throughput * att * h2.mat.emission
+                  * select(0.0, misWeight(pv, pL), U.mis != 0u);
+              }
+            } else if (useEnvNee) {
+              radiance = radiance + throughput * att * envColor(sc.dir)
+                * select(0.0, misWeight(pv, envPdf(sc.dir) / f32(lightSelectCount())), U.mis != 0u);
+            } else {
+              radiance = radiance + throughput * att * envColor(sc.dir);
+            }
+          }
+        }
       }
       *flux = throughput * gatherPhotons(hit, ray.dir, radius, found);
       return radiance;
@@ -1549,7 +1575,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     ray = Ray(origin + nrm * 1e-4, dir);
   }
 
-  // 格納先はスレッドごとに固定で 2 枠取る。単一アドレスへの atomicAdd で
+  // 格納先はスレッドごとに固定枠を取る。単一アドレスへの atomicAdd で
   // 割り当てると 26 万回が直列化してしまう
   var localSlot = 0u;
   var bounces = 0u;
@@ -1562,8 +1588,8 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     let gatherable = kind == MAT_LAMBERT || kind == MAT_GGX;
 
     // 直接光はカメラ側の NEE が担当しているので、1 回以上散乱した後だけ堆積させる
-    if (gatherable && bounces >= 1u && localSlot < 2u) {
-      let slot = gid.x * 2u + localSlot;
+    if (gatherable && bounces >= 1u && localSlot < MAX_DEPOSITS) {
+      let slot = gid.x * MAX_DEPOSITS + localSlot;
       localSlot = localSlot + 1u;
       photons[slot * 3u + 0u] = vec4f(hit.p, 1.0);
       photons[slot * 3u + 1u] = vec4f(ray.dir, 0.0);

@@ -357,7 +357,7 @@ export function createUi(options: UiOptions): UiHandle {
     debugMode: 0,
     fixedSeed: false,
     fog: true,
-    sppm: false,
+    sppm: true,
     adaptive: true,
   };
 

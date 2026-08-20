@@ -72,6 +72,8 @@ const PHOTON_COUNT = 1 << 17;
 const GRID_CELLS = 1 << 18;
 /** 1 セルに入る光子の上限。WGSL 側の GRID_CAP と一致させること */
 const GRID_CAP = 48;
+/** 光子 1 本が堆積できる回数。WGSL 側の MAX_DEPOSITS と一致させること */
+const MAX_DEPOSITS = 6;
 
 export interface FrameParams {
   camPos: [number, number, number];
@@ -167,8 +169,8 @@ export class Renderer {
     });
     // 光子 1 個あたり vec4f 3 個
     this.photonBuffer = this.device.createBuffer({
-      // 1 本の光子が複数回堆積するので枠は 2 倍取る
-      size: PHOTON_COUNT * 2 * 3 * 16,
+      // 1 本の光子が複数回堆積するので、その回数ぶんの枠を取る
+      size: PHOTON_COUNT * MAX_DEPOSITS * 3 * 16,
       usage: GPUBufferUsage.STORAGE,
       label: "photons",
     });

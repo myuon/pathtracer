@@ -198,7 +198,10 @@ async function main() {
       debugMode: ui.settings.debugMode,
       fixedSeed: ui.settings.fixedSeed,
       fog: ui.settings.fog,
-      sppm: ui.settings.sppm,
+      // 操作中は SPPM を切る。光子パスは解像度に依存しない固定費なので
+      // 低解像度プレビューには重すぎるうえ、カメラが動いている間は
+      // 画素ごとの統計 (半径や累積光子数) が意味を持たない
+      sppm: ui.settings.sppm && !fast,
       photonScale,
     });
 
