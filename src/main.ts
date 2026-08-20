@@ -40,6 +40,8 @@ async function main() {
   let settleAt = 0;
   attachCameraControls(canvas, camera, {
     onInteractingChange: (next) => {
+      // 操作を始めたら自動で再開する。止まったまま動かないと分かりにくい
+      if (next) ui.setPaused(false);
       interacting = next;
       if (!next) settleAt = performance.now() + SETTLE_MS;
     },
@@ -203,6 +205,7 @@ async function main() {
       // 画素ごとの統計 (半径や累積光子数) が意味を持たない
       sppm: ui.settings.sppm && !fast,
       photonScale,
+      paused: ui.settings.paused,
     });
 
     // GPU が終わるまで次を投入しない。ついでに 1 spp あたりの時間を測る
@@ -218,11 +221,14 @@ async function main() {
       gpuBusy = false;
     });
 
-    samples += spp;
-    frameIndex++;
+    if (!ui.settings.paused) {
+      samples += spp;
+      frameIndex++;
+    }
 
     ui.setStatus(
-      `${width}x${height} / ${samples} spp / ${fpsEma.toFixed(0)} fps` +
+      (ui.settings.paused ? "[停止中] " : "") +
+        `${width}x${height} / ${samples} spp / ${fpsEma.toFixed(0)} fps` +
         (fast ? " / interactive" : ` / ${spp} spp per frame`) +
         ` / ${(fast ? gpuMsFast : gpuMsSlow).toFixed(0)} ms` +
         (photonScale < 1 ? ` / photons 1/${Math.round(1 / photonScale)}` : ""),

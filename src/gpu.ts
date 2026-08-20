@@ -110,6 +110,8 @@ export interface FrameParams {
   sppm: boolean;
   /** 1 反復あたりに撒く光子数の倍率 (1 以下) */
   photonScale: number;
+  /** 計算を止める。表示は保つ */
+  paused: boolean;
 }
 
 export class Renderer {
@@ -447,8 +449,11 @@ export class Renderer {
     this.writeUniforms(q);
 
     const encoder = this.device.createCommandEncoder();
-    const compute = encoder.beginComputePass();
-    compute.setBindGroup(0, this.computeBindGroups[write]);
+    // 止めている間も表示パスだけは通す。累積バッファはそのままなので
+    // 再開すれば続きから積める
+    if (!p.paused) {
+      const compute = encoder.beginComputePass();
+      compute.setBindGroup(0, this.computeBindGroups[write]);
 
     if (sppm) {
       // グリッドを空にする -> 光子を撒く -> カメラ側で集める
@@ -464,7 +469,8 @@ export class Renderer {
       Math.ceil(p.width / WORKGROUP),
       Math.ceil(p.height / WORKGROUP),
     );
-    compute.end();
+      compute.end();
+    }
 
     const pass = encoder.beginRenderPass({
       colorAttachments: [
@@ -482,8 +488,10 @@ export class Renderer {
     pass.end();
 
     this.device.queue.submit([encoder.finish()]);
-    if (sppm) this.photonsEmitted += this.photonsThisFrame;
-    this.prevCam = p;
-    this.parity = sppm ? 0 : 1 - write;
+    if (sppm && !p.paused) this.photonsEmitted += this.photonsThisFrame;
+    if (!p.paused) {
+      this.prevCam = p;
+      this.parity = sppm ? 0 : 1 - write;
+    }
   }
 }

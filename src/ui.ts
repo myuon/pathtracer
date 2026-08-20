@@ -33,6 +33,8 @@ export interface RenderSettings {
   sppm: boolean;
   /** 1 フレームの GPU 時間が目標に収まるよう spp を自動調整する */
   adaptive: boolean;
+  /** 計算を止める。表示は保つ */
+  paused: boolean;
 }
 
 export interface UiOptions {
@@ -48,6 +50,8 @@ export interface UiOptions {
 }
 
 export interface UiHandle {
+  /** 一時停止を外から切り替える (操作を始めたら自動で再開するため) */
+  setPaused: (paused: boolean) => void;
   settings: RenderSettings;
   /** 画面下部のステータス行を更新する */
   setStatus: (text: string) => void;
@@ -359,6 +363,7 @@ export function createUi(options: UiOptions): UiHandle {
     fog: true,
     sppm: true,
     adaptive: true,
+    paused: false,
   };
 
   const panel = document.createElement("div");
@@ -568,6 +573,14 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const pauseRow = createToggleRow({
+    label: "pause (space)",
+    value: settings.paused,
+    onChange: (v) => {
+      settings.paused = v;
+    },
+  });
+
   const adaptiveRow = createToggleRow({
     label: "adaptive spp",
     value: settings.adaptive,
@@ -609,6 +622,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(reprojectRow);
   body.appendChild(fogRow);
   body.appendChild(sppmRow);
+  body.appendChild(pauseRow);
   body.appendChild(adaptiveRow);
   body.appendChild(fixedSeedRow);
   body.appendChild(debugRow);
@@ -623,8 +637,22 @@ export function createUi(options: UiOptions): UiHandle {
 
   document.body.appendChild(panel);
 
+  // 空白キーでも切り替えられるようにする
+  const pauseCheck = pauseRow.querySelector("input") as HTMLInputElement;
+  const setPaused = (v: boolean) => {
+    if (settings.paused === v) return;
+    settings.paused = v;
+    pauseCheck.checked = v;
+  };
+  window.addEventListener("keydown", (e) => {
+    if (e.code !== "Space" || e.repeat) return;
+    e.preventDefault();
+    setPaused(!settings.paused);
+  });
+
   return {
     settings,
+    setPaused,
     setStatus: (text: string) => {
       status.textContent = text;
     },
