@@ -39,7 +39,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 144;
+const UNIFORM_SIZE = 208;
 const WORKGROUP = 8;
 
 export interface FrameParams {
@@ -65,6 +65,8 @@ export interface FrameParams {
   qmc: boolean;
   /** 環境マップを光源としてサンプルする */
   envIs: boolean;
+  /** 累積を前フレームから再投影して引き継ぐ */
+  reproject: boolean;
 }
 
 export class Renderer {
@@ -77,16 +79,19 @@ export class Renderer {
   private readonly computePipeline: GPUComputePipeline;
   private readonly presentPipeline: GPURenderPipeline;
 
-  private accumBuffer: GPUBuffer | null = null;
+  /** ping-pong する履歴バッファ。1 画素あたり vec4f 2 個 */
+  private histBuffers: [GPUBuffer, GPUBuffer] | null = null;
   private accumPixels = 0;
-  private computeBindGroup: GPUBindGroup | null = null;
-  private presentBindGroup: GPUBindGroup | null = null;
+  private computeBindGroups: GPUBindGroup[] = [];
+  private presentBindGroups: GPUBindGroup[] = [];
+  private parity = 0;
+  /** 再投影に使う 1 フレーム前のカメラ */
+  private prevCam: FrameParams | null = null;
 
   private sphereBuffer: GPUBuffer | null = null;
   private quadBuffer: GPUBuffer | null = null;
-  private lightBuffer: GPUBuffer | null = null;
+  private indexBuffer: GPUBuffer | null = null;
   private bvhBuffer: GPUBuffer | null = null;
-  private bvhRefBuffer: GPUBuffer | null = null;
   private triBuffer: GPUBuffer | null = null;
   private envBuffer: GPUBuffer | null = null;
   private envWidth = 1;
@@ -147,8 +152,6 @@ export class Renderer {
 
     const lights = packLights(scene.quads);
     this.lightCount = lights.count;
-    this.lightBuffer?.destroy();
-    this.lightBuffer = this.uploadGeometry(lights.data, "lights");
 
     this.triBuffer?.destroy();
     this.triBuffer = this.uploadGeometry(packTriangles(scene.triangles), "triangles");
@@ -172,8 +175,15 @@ export class Renderer {
     this.bvhNodeCount = bvh.nodeCount;
     this.bvhBuffer?.destroy();
     this.bvhBuffer = this.uploadGeometry(bvh.nodes, "bvh");
-    this.bvhRefBuffer?.destroy();
-    this.bvhRefBuffer = this.uploadGeometry(bvh.refs, "bvhRefs");
+
+    // storage buffer の本数を節約するため、面光源の索引と BVH の参照を 1 本にまとめる
+    const lightIdx = new Uint32Array(lights.data);
+    const refIdx = new Uint32Array(bvh.refs);
+    const merged = new Uint32Array(this.lightCount + refIdx.length);
+    merged.set(lightIdx.subarray(0, this.lightCount), 0);
+    merged.set(refIdx, this.lightCount);
+    this.indexBuffer?.destroy();
+    this.indexBuffer = this.uploadGeometry(merged.buffer as ArrayBuffer, "indices");
 
     this.rebuildBindGroups();
   }
@@ -190,28 +200,33 @@ export class Renderer {
   }
 
   private rebuildBindGroups() {
-    if (!this.accumBuffer) return;
-    this.computeBindGroup = this.device.createBindGroup({
-      layout: this.computePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: { buffer: this.accumBuffer } },
-        { binding: 2, resource: { buffer: this.sphereBuffer! } },
-        { binding: 3, resource: { buffer: this.quadBuffer! } },
-        { binding: 4, resource: { buffer: this.lightBuffer! } },
-        { binding: 5, resource: { buffer: this.bvhBuffer! } },
-        { binding: 6, resource: { buffer: this.bvhRefBuffer! } },
-        { binding: 7, resource: { buffer: this.triBuffer! } },
-        { binding: 8, resource: { buffer: this.envBuffer! } },
-      ],
-    });
-    this.presentBindGroup = this.device.createBindGroup({
-      layout: this.presentPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: { buffer: this.accumBuffer } },
-      ],
-    });
+    if (!this.histBuffers) return;
+    // ping-pong の 2 通りぶん作っておき、フレームごとに入れ替える
+    this.computeBindGroups = [0, 1].map((i) =>
+      this.device.createBindGroup({
+        layout: this.computePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.uniformBuffer } },
+          { binding: 1, resource: { buffer: this.histBuffers![i] } },
+          { binding: 2, resource: { buffer: this.sphereBuffer! } },
+          { binding: 3, resource: { buffer: this.quadBuffer! } },
+          { binding: 4, resource: { buffer: this.indexBuffer! } },
+          { binding: 5, resource: { buffer: this.bvhBuffer! } },
+          { binding: 6, resource: { buffer: this.histBuffers![1 - i] } },
+          { binding: 7, resource: { buffer: this.triBuffer! } },
+          { binding: 8, resource: { buffer: this.envBuffer! } },
+        ],
+      }),
+    );
+    this.presentBindGroups = [0, 1].map((i) =>
+      this.device.createBindGroup({
+        layout: this.presentPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.uniformBuffer } },
+          { binding: 1, resource: { buffer: this.histBuffers![i] } },
+        ],
+      }),
+    );
   }
 
   /** 1 storage buffer に収まる最大ピクセル数 */
@@ -220,14 +235,17 @@ export class Renderer {
   }
 
   private ensureAccum(pixels: number) {
-    if (this.accumBuffer && this.accumPixels >= pixels) return;
-    this.accumBuffer?.destroy();
+    if (this.histBuffers && this.accumPixels >= pixels) return;
+    this.histBuffers?.forEach((b) => b.destroy());
     this.accumPixels = pixels;
-    this.accumBuffer = this.device.createBuffer({
-      size: pixels * 16,
-      usage: GPUBufferUsage.STORAGE,
-      label: "accum",
-    });
+    const make = (label: string) =>
+      this.device.createBuffer({
+        // 1 画素あたり vec4f 2 個 (色と和のサンプル数、1 次交差の世界座標)
+        size: pixels * 32,
+        usage: GPUBufferUsage.STORAGE,
+        label,
+      });
+    this.histBuffers = [make("hist0"), make("hist1")];
     this.rebuildBindGroups();
   }
 
@@ -261,18 +279,29 @@ export class Renderer {
     u[32] = this.envWidth;
     u[33] = this.envHeight;
     f[34] = this.envPdfScale;
+
+    // 再投影用の 1 フレーム前のカメラ。初回は自分自身を入れておく
+    const q = this.prevCam ?? p;
+    f.set(q.camPos, 36);
+    f[39] = q.tanHalfFov;
+    f.set(q.camU, 40);
+    f[43] = q.width / q.height;
+    f.set(q.camV, 44);
+    u[47] = p.reproject && this.prevCam ? 1 : 0;
+    f.set(q.camW, 48);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
   render(p: FrameParams) {
     this.ensureAccum(p.width * p.height);
     this.writeUniforms(p);
+    const write = this.parity;
 
     const encoder = this.device.createCommandEncoder();
 
     const compute = encoder.beginComputePass();
     compute.setPipeline(this.computePipeline);
-    compute.setBindGroup(0, this.computeBindGroup!);
+    compute.setBindGroup(0, this.computeBindGroups[write]);
     compute.dispatchWorkgroups(
       Math.ceil(p.width / WORKGROUP),
       Math.ceil(p.height / WORKGROUP),
@@ -290,10 +319,12 @@ export class Renderer {
       ],
     });
     pass.setPipeline(this.presentPipeline);
-    pass.setBindGroup(0, this.presentBindGroup!);
+    pass.setBindGroup(0, this.presentBindGroups[write]);
     pass.draw(3);
     pass.end();
 
     this.device.queue.submit([encoder.finish()]);
+    this.prevCam = p;
+    this.parity = 1 - write;
   }
 }

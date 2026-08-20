@@ -29,10 +29,25 @@ struct Uniforms {
   envHeight: u32,
   /// pdf_omega = max(luminance, 1e-6) * envPdfScale
   envPdfScale: f32,
+  /// 1 フレーム前のカメラ。累積を新しい視点へ投影し直すのに使う
+  prevCamPos: vec3f,
+  prevTanHalfFov: f32,
+  prevCamU: vec3f,
+  prevAspect: f32,
+  prevCamV: vec3f,
+  reproject: u32,
+  prevCamW: vec3f,
+  _pad: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
-@group(0) @binding(1) var<storage, read_write> accum: array<vec4f>;
+/// 1 画素あたり 2 要素。[0] = 放射輝度の和と画素ごとのサンプル数、[1] = 1 次交差の世界座標
+@group(0) @binding(1) var<storage, read_write> histWrite: array<vec4f>;
+/// 前フレームの同じもの (ping-pong)
+@group(0) @binding(6) var<storage, read> histRead: array<vec4f>;
+
+/// 再投影で引き継ぐサンプル数の上限。古い情報が居座らないように抑える
+const MAX_HISTORY: f32 = 48.0;
 
 const MAT_LAMBERT: u32 = 0u;
 /// GGX マイクロファセット (導体)。旧 metal と旧 glossy を統合したもの
@@ -84,8 +99,9 @@ struct Quad {
 
 @group(0) @binding(2) var<storage, read> spheres: array<Sphere>;
 @group(0) @binding(3) var<storage, read> quads: array<Quad>;
-/// NEE でサンプルする面光源。quads へのインデックス列
-@group(0) @binding(4) var<storage, read> lights: array<u32>;
+/// [面光源の quad インデックス][BVH のプリミティブ参照] を連結した配列。
+/// storage buffer の本数に上限があるので 1 本にまとめている
+@group(0) @binding(4) var<storage, read> indices: array<u32>;
 
 /// 中央値分割の BVH。左の子は常に自分の直後、右の子は leftFirst にある
 struct BvhNode {
@@ -98,9 +114,6 @@ struct BvhNode {
 };
 
 @group(0) @binding(5) var<storage, read> bvh: array<BvhNode>;
-/// (type << 30) | index。type 0 = 球, 1 = quad, 2 = 三角形
-@group(0) @binding(6) var<storage, read> bvhRefs: array<u32>;
-
 /// 三角形。辺は v0 を原点とする差分で持つ
 struct Triangle {
   v0: vec3f,
@@ -403,7 +416,7 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
         descend = true;
       } else {
         for (var k = 0u; k < n.count; k = k + 1u) {
-          let code = bvhRefs[n.leftFirst + k];
+          let code = indices[U.lightCount + n.leftFirst + k];
           let idx = code & 0x3fffffffu;
           let kind = code >> 30u;
 
@@ -524,7 +537,7 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
         descend = true;
       } else {
         for (var k = 0u; k < n.count; k = k + 1u) {
-          let code = bvhRefs[n.leftFirst + k];
+          let code = indices[U.lightCount + n.leftFirst + k];
           let idx = code & 0x3fffffffu;
           let kind = code >> 30u;
 
@@ -757,7 +770,7 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f) -> vec3f {
     return envColor(wi) * fcos * w / pL;
   }
 
-  let light = quads[lights[pick]];
+  let light = quads[indices[pick]];
 
   // 光源上の一様サンプル
   let onLight = light.q + light.u * u.x + light.v * u.y;
@@ -859,7 +872,7 @@ fn scatter(
 }
 
 // ---------------------------------------------------------------- trace
-fn trace(primary: Ray) -> vec3f {
+fn trace(primary: Ray, firstHit: ptr<function, vec4f>) -> vec3f {
   var ray = primary;
   var throughput = vec3f(1.0);
   var radiance = vec3f(0.0);
@@ -883,6 +896,9 @@ fn trace(primary: Ray) -> vec3f {
       }
       radiance = radiance + throughput * envColor(ray.dir) * w;
       break;
+    }
+    if (depth == 0u) {
+      *firstHit = vec4f(hit.p, 1.0);
     }
 
     // 光源に当たったときの放射。NEE と重複するぶんを MIS 重みで削る
@@ -942,18 +958,52 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   pixelSeed = pcg(pixel * 26699u + 1u);
 
   var sum = vec3f(0.0);
+  var firstHit = vec4f(0.0);
   for (var s = 0u; s < U.sppPerFrame; s = s + 1u) {
     // 累積サンプル番号で低食い違い列を引く
     sampleIdx = U.samplesBefore + s;
     let jitter = sample2d(0u, true);
     let px = (f32(gid.x) + jitter.x) / f32(U.width) * 2.0 - 1.0;
     let py = 1.0 - (f32(gid.y) + jitter.y) / f32(U.height) * 2.0;
-    sum = sum + trace(makeRay(px, py, sample2d(1u, true)));
+    var fh = vec4f(0.0);
+    sum = sum + trace(makeRay(px, py, sample2d(1u, true)), &fh);
+    if (s == 0u) {
+      firstHit = fh;
+    }
   }
 
-  if (U.samplesBefore == 0u) {
-    accum[pixel] = vec4f(sum, 1.0);
-  } else {
-    accum[pixel] = accum[pixel] + vec4f(sum, 1.0);
+  let o = pixel * 2u;
+  var prevSum = vec3f(0.0);
+  var prevCount = 0.0;
+
+  if (U.reproject != 0u && firstHit.w > 0.5) {
+    // 1 次交差の世界座標を前フレームのカメラで投影し直す
+    let d = firstHit.xyz - U.prevCamPos;
+    let z = dot(d, U.prevCamW);
+    if (z > 1e-4) {
+      let sx = (dot(d, U.prevCamU) / (z * U.prevTanHalfFov * U.prevAspect) * 0.5 + 0.5) * f32(U.width);
+      let sy = (0.5 - dot(d, U.prevCamV) / (z * U.prevTanHalfFov) * 0.5) * f32(U.height);
+      if (sx >= 0.0 && sy >= 0.0 && sx < f32(U.width) && sy < f32(U.height)) {
+        let pp = (u32(sy) * U.width + u32(sx)) * 2u;
+        let hp = histRead[pp + 1u];
+        // 同じ面を見ているかを世界座標で確かめる (遮蔽が外れた画素を弾く)
+        if (hp.w > 0.5 && distance(hp.xyz, firstHit.xyz) < 0.01 * z) {
+          let hc = histRead[pp];
+          if (hc.w > 0.0) {
+            let capped = min(hc.w, MAX_HISTORY);
+            prevSum = hc.rgb * (capped / hc.w);
+            prevCount = capped;
+          }
+        }
+      }
+    }
+  } else if (U.samplesBefore > 0u) {
+    // カメラが動いていないので同じ画素からそのまま引き継ぐ
+    let hc = histRead[o];
+    prevSum = hc.rgb;
+    prevCount = hc.w;
   }
+
+  histWrite[o] = vec4f(prevSum + sum, prevCount + f32(U.sppPerFrame));
+  histWrite[o + 1u] = firstHit;
 }

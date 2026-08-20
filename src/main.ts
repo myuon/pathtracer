@@ -91,14 +91,24 @@ async function main() {
       height = Math.max(1, Math.floor(height * k));
     }
 
-    // カメラ・解像度・品質モードが変わったら累積をやり直す
-    if (camera.dirty || width !== lastWidth || height !== lastHeight || fast !== lastFast) {
-      camera.dirty = false;
+    // 解像度や品質モードが変わるとバッファの意味が変わるので、素直に捨てる
+    const layoutChanged = width !== lastWidth || height !== lastHeight || fast !== lastFast;
+    let reproject = false;
+    if (layoutChanged) {
       lastWidth = width;
       lastHeight = height;
       lastFast = fast;
       samples = 0;
+    } else if (camera.dirty) {
+      // 操作中だけ累積を新しい視点へ投影して引き継ぐ。
+      // 収束モードは毎回きれいにやり直すので、最終的な絵に再投影は混ざらない
+      if (fast && ui.settings.reproject) {
+        reproject = true;
+      } else {
+        samples = 0;
+      }
     }
+    camera.dirty = false;
 
     const spp = fast ? 1 : ui.settings.sppPerFrame;
     const maxBounces = fast ? ui.settings.interactiveBounces : ui.settings.maxBounces;
@@ -122,6 +132,7 @@ async function main() {
       mis: ui.settings.mis,
       qmc: ui.settings.qmc,
       envIs: ui.settings.envIs,
+      reproject,
     });
 
     samples += spp;

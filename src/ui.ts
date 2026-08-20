@@ -21,6 +21,8 @@ export interface RenderSettings {
   qmc: boolean;
   /** 環境マップを光源としてサンプルする */
   envIs: boolean;
+  /** 操作中に累積を再投影して引き継ぐ */
+  reproject: boolean;
 }
 
 export interface UiOptions {
@@ -330,6 +332,7 @@ export function createUi(options: UiOptions): UiHandle {
     mis: true,
     qmc: true,
     envIs: true,
+    reproject: true,
   };
 
   const panel = document.createElement("div");
@@ -502,6 +505,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const reprojectRow = createToggleRow({
+    label: "temporal reprojection",
+    value: settings.reproject,
+    onChange: (v) => {
+      settings.reproject = v;
+      notifyChange();
+    },
+  });
+
   const resetButton = document.createElement("button");
   resetButton.type = "button";
   resetButton.className = "pt-reset";
@@ -522,6 +534,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(misRow);
   body.appendChild(qmcRow);
   body.appendChild(envIsRow);
+  body.appendChild(reprojectRow);
   body.appendChild(resetButton);
 
   const status = document.createElement("div");

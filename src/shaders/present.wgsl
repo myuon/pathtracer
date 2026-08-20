@@ -26,10 +26,19 @@ struct Uniforms {
   envWidth: u32,
   envHeight: u32,
   envPdfScale: f32,
+  prevCamPos: vec3f,
+  prevTanHalfFov: f32,
+  prevCamU: vec3f,
+  prevAspect: f32,
+  prevCamV: vec3f,
+  reproject: u32,
+  prevCamW: vec3f,
+  _pad: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
-@group(0) @binding(1) var<storage, read> accum: array<vec4f>;
+/// 1 画素あたり 2 要素。[0] が放射輝度の和と画素ごとのサンプル数
+@group(0) @binding(1) var<storage, read> hist: array<vec4f>;
 
 struct VsOut {
   @builtin(position) pos: vec4f,
@@ -61,8 +70,8 @@ fn acesFilm(x: vec3f) -> vec3f {
 fn fsMain(in: VsOut) -> @location(0) vec4f {
   let x = min(u32(in.uv.x * f32(U.width)), U.width - 1u);
   let y = min(u32(in.uv.y * f32(U.height)), U.height - 1u);
-  let raw = accum[y * U.width + x].rgb;
-  let n = max(f32(U.samplesAfter), 1.0);
-  let color = acesFilm(raw / n);
+  let c = hist[(y * U.width + x) * 2u];
+  // 再投影で画素ごとにサンプル数が変わるので、一律の除算ではなく画素の値を使う
+  let color = acesFilm(c.rgb / max(c.w, 1.0));
   return vec4f(pow(color, vec3f(1.0 / 2.2)), 1.0);
 }
