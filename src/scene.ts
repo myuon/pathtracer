@@ -697,29 +697,38 @@ function buildEnclosedScene(): Scene {
 }
 
 
-/** 蛇腹の板の枚数。増やすほど光が余分なバウンスを強いられる */
-const MAZE_BAFFLES = 3;
+/**
+ * 蛇腹の板の枚数。
+ * 光源強度を固定して測ると、届く光は 1 枚 -> 2 枚で約 1/13、
+ * 2 枚 -> 3 枚で約 1/925 に落ちる。相対ノイズは 1.2% / 47.3% / 420.7%。
+ * 3 枚では cornell と同品質にするのに約 1600 倍の spp が要り、実質描けない。
+ * 同梱するのは 2 枚。厳しいが絵は見える。
+ */
+const MAZE_BAFFLES = 2;
 
 /**
- * 光源を蛇腹の板の奥に置いたシーン。板を 1 枚足すごとに、光は追加で
- * 1 回跳ねないと部屋へ出られない。難易度が枚数に対してどう伸びるかを
- * 測るためのもの。
+ * 光源を蛇腹の板の奥に置いたシーン。
+ *
+ * 板は左右交互に、隣どうしが必ず重なるように置いてある。そのため光源から
+ * 部屋まで一直線に通る経路が存在せず、板 1 枚につき最低 1 回の反射が
+ * 強制される。難易度が枚数に対してどう伸びるかを測るためのもの。
  */
 function buildMazeScene(): Scene {
   const X = 10;
   const Y = 5;
-  const Z = 11;
+  const Z = 14;
   const wall = lambert([0.62, 0.6, 0.56]);
-  const panel = lambert([0.75, 0.74, 0.7]);
+  const panel = lambert([0.72, 0.71, 0.68]);
 
-  // 奥の右半分を塞ぐ壁から始め、左右交互に隙間を残して蛇腹にする
-  const z0 = 5.6;
-  const step = 1.05;
+  // 偶数枚目は左端から x=7 まで、奇数枚目は x=3 から右端まで。
+  // x = 3..7 が必ず重なるので、直線では抜けられない
+  const z0 = 6.0;
+  const step = 1.3;
   const baffles: Quad[] = [];
   for (let i = 0; i < MAZE_BAFFLES; i++) {
     const even = i % 2 === 0;
-    const xa = even ? 4.6 : 6.2;
-    const xb = even ? 8.4 : X;
+    const xa = even ? 0 : 3;
+    const xb = even ? 7 : X;
     baffles.push({
       q: [xa, 0, z0 + i * step],
       u: [xb - xa, 0, 0],
@@ -728,12 +737,12 @@ function buildMazeScene(): Scene {
     });
   }
 
-  const lightZ = z0 + MAZE_BAFFLES * step + 0.7;
+  const lightZ = z0 + MAZE_BAFFLES * step + 1.6;
 
   return {
     spheres: [
-      { center: [2.4, 0.9, 3.4], radius: 0.9, material: lambert([0.72, 0.7, 0.66]) },
-      { center: [4.6, 0.55, 1.9], radius: 0.55, material: ggx([0.95, 0.9, 0.82], 0.2) },
+      { center: [2.6, 0.9, 2.6], radius: 0.9, material: lambert([0.72, 0.7, 0.66]) },
+      { center: [6.6, 0.55, 1.8], radius: 0.55, material: ggx([0.95, 0.9, 0.82], 0.2) },
     ],
     quads: [
       { q: [0, 0, 0], u: [X, 0, 0], v: [0, 0, Z], material: lambert([0.5, 0.48, 0.45]) },
@@ -743,22 +752,22 @@ function buildMazeScene(): Scene {
       { q: [0, 0, 0], u: [X, 0, 0], v: [0, Y, 0], material: wall },
       { q: [0, 0, Z], u: [X, 0, 0], v: [0, Y, 0], material: wall },
       ...baffles,
-      // 蛇腹の一番奥に置いた小さな光源
+      // 一番奥の光源
       {
-        q: [6.4, 1.6, lightZ],
+        q: [4.2, 1.5, lightZ],
         u: [1.6, 0, 0],
         v: [0, 1.4, 0],
-        material: emissive([300, 282, 243]),
+        material: emissive([7000, 6580, 5740]),
       },
     ],
     triangles: [],
     env: ENV.black,
     camera: {
-      target: [7.0, 1.5, 7.0],
-      distance: 8.4,
-      yaw: Math.PI * 1.264,
-      pitch: 0.24,
-      fovDeg: 62,
+      target: [5.0, 2.0, 4.2],
+      distance: 3.7,
+      yaw: Math.PI * 1.5,
+      pitch: 0.13,
+      fovDeg: 72,
       aperture: 0,
     },
   };
