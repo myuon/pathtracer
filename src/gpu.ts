@@ -23,7 +23,19 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
   if (!adapter) {
     throw new WebGpuUnsupportedError("GPUAdapter を取得できませんでした");
   }
-  const device = await adapter.requestDevice();
+  // 既定の上限 (128MB) では高解像度ディスプレイで履歴バッファが収まらない。
+  // アダプタが許す範囲で引き上げておき、駄目なら既定のまま続行する
+  const cap = 1024 * 1024 * 1024;
+  const requiredLimits = {
+    maxStorageBufferBindingSize: Math.min(
+      adapter.limits.maxStorageBufferBindingSize,
+      cap,
+    ),
+    maxBufferSize: Math.min(adapter.limits.maxBufferSize, cap),
+  };
+  const device = await adapter
+    .requestDevice({ requiredLimits })
+    .catch(() => adapter.requestDevice());
   device.lost.then((info) => {
     console.error("WebGPU device lost:", info.reason, info.message);
   });
@@ -40,6 +52,13 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 
 /** WGSL 側の struct Uniforms と一致させること */
 const UNIFORM_SIZE = 208;
+
+/**
+ * 履歴バッファの 1 画素あたりのバイト数。
+ * WGSL 側の vec4f 2 個 (色とサンプル数 / 1 次交差の世界座標) と一致させること。
+ * ここと maxPixels() がずれると、上限判定をすり抜けて bind group の作成が落ちる。
+ */
+const HIST_BYTES_PER_PIXEL = 32;
 const WORKGROUP = 8;
 
 export interface FrameParams {
@@ -231,7 +250,9 @@ export class Renderer {
 
   /** 1 storage buffer に収まる最大ピクセル数 */
   maxPixels(): number {
-    return Math.floor(this.device.limits.maxStorageBufferBindingSize / 16);
+    return Math.floor(
+      this.device.limits.maxStorageBufferBindingSize / HIST_BYTES_PER_PIXEL,
+    );
   }
 
   private ensureAccum(pixels: number) {
@@ -240,8 +261,7 @@ export class Renderer {
     this.accumPixels = pixels;
     const make = (label: string) =>
       this.device.createBuffer({
-        // 1 画素あたり vec4f 2 個 (色と和のサンプル数、1 次交差の世界座標)
-        size: pixels * 32,
+        size: pixels * HIST_BYTES_PER_PIXEL,
         usage: GPUBufferUsage.STORAGE,
         label,
       });
