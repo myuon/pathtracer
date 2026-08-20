@@ -696,6 +696,74 @@ function buildEnclosedScene(): Scene {
   };
 }
 
+
+/** 蛇腹の板の枚数。増やすほど光が余分なバウンスを強いられる */
+const MAZE_BAFFLES = 3;
+
+/**
+ * 光源を蛇腹の板の奥に置いたシーン。板を 1 枚足すごとに、光は追加で
+ * 1 回跳ねないと部屋へ出られない。難易度が枚数に対してどう伸びるかを
+ * 測るためのもの。
+ */
+function buildMazeScene(): Scene {
+  const X = 10;
+  const Y = 5;
+  const Z = 11;
+  const wall = lambert([0.62, 0.6, 0.56]);
+  const panel = lambert([0.75, 0.74, 0.7]);
+
+  // 奥の右半分を塞ぐ壁から始め、左右交互に隙間を残して蛇腹にする
+  const z0 = 5.6;
+  const step = 1.05;
+  const baffles: Quad[] = [];
+  for (let i = 0; i < MAZE_BAFFLES; i++) {
+    const even = i % 2 === 0;
+    const xa = even ? 4.6 : 6.2;
+    const xb = even ? 8.4 : X;
+    baffles.push({
+      q: [xa, 0, z0 + i * step],
+      u: [xb - xa, 0, 0],
+      v: [0, Y, 0],
+      material: panel,
+    });
+  }
+
+  const lightZ = z0 + MAZE_BAFFLES * step + 0.7;
+
+  return {
+    spheres: [
+      { center: [2.4, 0.9, 3.4], radius: 0.9, material: lambert([0.72, 0.7, 0.66]) },
+      { center: [4.6, 0.55, 1.9], radius: 0.55, material: ggx([0.95, 0.9, 0.82], 0.2) },
+    ],
+    quads: [
+      { q: [0, 0, 0], u: [X, 0, 0], v: [0, 0, Z], material: lambert([0.5, 0.48, 0.45]) },
+      { q: [0, Y, 0], u: [X, 0, 0], v: [0, 0, Z], material: wall },
+      { q: [0, 0, 0], u: [0, Y, 0], v: [0, 0, Z], material: lambert([0.45, 0.5, 0.55]) },
+      { q: [X, 0, 0], u: [0, Y, 0], v: [0, 0, Z], material: lambert([0.58, 0.45, 0.4]) },
+      { q: [0, 0, 0], u: [X, 0, 0], v: [0, Y, 0], material: wall },
+      { q: [0, 0, Z], u: [X, 0, 0], v: [0, Y, 0], material: wall },
+      ...baffles,
+      // 蛇腹の一番奥に置いた小さな光源
+      {
+        q: [6.4, 1.6, lightZ],
+        u: [1.6, 0, 0],
+        v: [0, 1.4, 0],
+        material: emissive([300, 282, 243]),
+      },
+    ],
+    triangles: [],
+    env: ENV.black,
+    camera: {
+      target: [7.0, 1.5, 7.0],
+      distance: 8.4,
+      yaw: Math.PI * 1.264,
+      pitch: 0.24,
+      fovDeg: 62,
+      aperture: 0,
+    },
+  };
+}
+
 export interface SceneEntry {
   id: string;
   name: string;
@@ -711,6 +779,7 @@ export const SCENES: SceneEntry[] = [
   { id: "shaft", name: "light shafts (fog)", build: buildShaftScene },
   { id: "indirect", name: "indirect only (hard)", build: buildIndirectScene },
   { id: "enclosed", name: "enclosed light (brutal)", build: buildEnclosedScene },
+  { id: "maze", name: "baffle maze (BDPT test)", build: buildMazeScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;
