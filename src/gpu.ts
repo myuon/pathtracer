@@ -56,7 +56,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 288;
+const UNIFORM_SIZE = 304;
 
 /**
  * 履歴バッファの 1 画素あたりのバイト数。
@@ -123,6 +123,9 @@ export class Renderer {
   private readonly photonBuffer: GPUBuffer;
   private readonly gridBuffer: GPUBuffer;
   private radius0 = 0.05;
+  private sceneCenter: [number, number, number] = [0, 0, 0];
+  private sceneRadius = 1;
+  private camDistance = 1;
   private photonsEmitted = 0;
   private readonly presentPipeline: GPURenderPipeline;
 
@@ -263,6 +266,14 @@ export class Renderer {
     // シーンの対角長の 1% を光子ギャザーの初期半径にする
     const d = bvh.bounds.max.map((v, i) => v - bvh.bounds.min[i]);
     this.radius0 = Math.max(1e-3, Math.hypot(d[0], d[1], d[2]) * 0.012);
+    // 環境マップから光子を撒くときの外接球
+    this.sceneCenter = bvh.bounds.min.map((v, i) => (v + bvh.bounds.max[i]) / 2) as [
+      number,
+      number,
+      number,
+    ];
+    this.sceneRadius = Math.max(1e-3, Math.hypot(d[0], d[1], d[2]) / 2);
+    this.camDistance = scene.camera.distance;
     this.bvhBuffer?.destroy();
     this.bvhBuffer = this.uploadGeometry(bvh.nodes, "bvh");
 
@@ -401,14 +412,24 @@ export class Renderer {
     f[69] = this.radius0;
     f[70] = this.radius0;
     f[71] = this.photonsEmitted;
+    f.set(this.sceneCenter, 72);
+    f[75] = this.sceneRadius;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
   render(p: FrameParams) {
     this.ensureAccum(p.width * p.height);
-    // 光子は面光源からしか撒いていないので、環境光だけのシーンでは
-    // 間接光が丸ごと欠ける。その場合は素直にパストレースに落とす
-    const sppm = p.sppm && this.lightCount > 0;
+    // 光子は面光源と環境マップから撒く。環境マップは NEE が直接光を
+    // 受け持っている前提なので、env importance sampling が要る。
+    //
+    // 環境マップの光子はシーンの外接球の外から撒くので、巨大なプリミティブが
+    // あると円板が広がりすぎて、見えている範囲にほとんど届かなくなる
+    // (spheres シーンは半径 1000 の地面球のせいで外接球が 1732 になり、
+    //  有効なのは 7.5e-5 しかない)。そういうシーンは黙って暗く出るより
+    // パストレースに落とすほうがましなので、見込みで切り分ける
+    const envPhotons =
+      this.envWidth > 1 && p.envIs && this.sceneRadius < this.camDistance * 20;
+    const sppm = p.sppm && (this.lightCount > 0 || envPhotons);
     const q: FrameParams = sppm === p.sppm ? p : { ...p, sppm };
     // SPPM は画素ごとの状態を持ち越す必要があるので ping-pong を止める
     const write = sppm ? 0 : this.parity;

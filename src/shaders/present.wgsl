@@ -48,6 +48,8 @@ struct Uniforms {
   cellSize: f32,
   radius0: f32,
   photonsEmitted: f32,
+  sceneCenter: vec3f,
+  sceneRadius: f32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;

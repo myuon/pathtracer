@@ -63,6 +63,9 @@ struct Uniforms {
   radius0: f32,
   /// これまでに撒いた光子の総数
   photonsEmitted: f32,
+  /// シーンの外接球。環境マップから光子を撒くときの始点に使う
+  sceneCenter: vec3f,
+  sceneRadius: f32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -949,7 +952,16 @@ fn misWeight(pA: f32, pB: f32) -> f32 {
 
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
 /// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
-fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f, misOut: ptr<function, f32>) -> vec3f {
+/// allowMis を false にすると MIS 重みを掛けない。SPPM のカメラ側は
+/// ギャザー面で経路を打ち切るため BSDF サンプリング側の相方が存在せず、
+/// 重みを掛けると w_B のぶんだけエネルギーが失われる
+fn sampleDirectLight(
+  hit: Hit,
+  rayDir: vec3f,
+  u: vec2f,
+  misOut: ptr<function, f32>,
+  allowMis: bool,
+) -> vec3f {
   let n = lightSelectCount();
   if (n == 0u) {
     return vec3f(0.0);
@@ -973,7 +985,7 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f, misOut: ptr<function, f3
     }
     let tr = fogTransmittance(hit.p, wi, 1e30);
     var w = 1.0;
-    if (U.mis != 0u) {
+    if (allowMis && U.mis != 0u) {
       w = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
     }
     *misOut = w;
@@ -1009,7 +1021,7 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f, misOut: ptr<function, f3
 
   // MIS。BSDF サンプリングでも作りやすい方向ほど寄与を下げる
   var weight = 1.0;
-  if (U.mis != 0u) {
+  if (allowMis && U.mis != 0u) {
     weight = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
   }
   *misOut = weight;
@@ -1194,7 +1206,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
           if (useNee) {
             var mw = 1.0;
             radiance = radiance + throughput
-              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
+              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw, true);
             if (depth == 0u) {
               (*aov).misWeight = mw;
             }
@@ -1259,7 +1271,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     if (useNee && isDiffuseLike(hit.mat)) {
       var mw = 1.0;
       radiance = radiance + throughput
-        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
+        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw, true);
       if (depth == 0u) {
         (*aov).misWeight = mw;
       }
@@ -1420,20 +1432,21 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
       if (useNee) {
         var mw = 1.0;
         radiance = radiance + throughput
-          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw);
+          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw, false);
       }
       *flux = throughput * gatherPhotons(hit, ray.dir, radius, found);
       return radiance;
     }
 
-    // スペキュラ面は通り抜けて、次のギャザーできる面を探す
+    // ギャザーできない面 (誘電体) は通り抜けて、次を探す。
+    // ここでは NEE を行わないので、次の頂点の放射は MIS で削ってはいけない。
+    // bsdfPdf は負のまま = 重み 1 で BSDF サンプリング側が受け持つ
     var attenuation: vec3f;
     var scattered: Ray;
     if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered)) {
       return radiance;
     }
-    let pv = bsdfPdfFor(hit, ray.dir, scattered.dir);
-    bsdfPdf = select(-1.0, max(pv, 1e-8), pv > 0.0 && isDiffuseLike(hit.mat));
+    bsdfPdf = -1.0;
     throughput = throughput * attenuation;
     ray = scattered;
   }
@@ -1466,30 +1479,52 @@ fn depositPhoton(index: u32, p: vec3f) {
 
 @compute @workgroup_size(64, 1, 1)
 fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= U.photonCount || U.lightCount == 0u) {
+  if (gid.x >= U.photonCount || lightSelectCount() == 0u) {
     return;
   }
   rngState = pcg(gid.x * 15487469u + U.frameIndex * 2654435761u + 7u);
   pixelSeed = rngState;
   sampleIdx = U.frameIndex;
 
-  // 光源を 1 つ選び、面上の点と余弦分布の方向をサンプルする
-  let li = min(u32(rand() * f32(U.lightCount)), U.lightCount - 1u);
-  let light = quads[indices[li]];
-  let n = cross(light.u, light.v);
-  let area = length(n);
-  var nrm = n / area;
-  // 発光面は両面なので、どちら側に出すかを選んで重みを倍にする
-  if (rand() < 0.5) {
-    nrm = -nrm;
-  }
-  let origin = light.q + light.u * rand() + light.v * rand();
-  let dir = normalize(onb(nrm) * cosineHemisphere(vec2f(rand(), rand())));
+  // 面光源と環境マップから 1 つ選ぶ。NEE 側の選び方と揃えてある
+  let ln = lightSelectCount();
+  let pick = min(u32(rand() * f32(ln)), ln - 1u);
+  var power: vec3f;
+  var ray: Ray;
 
-  // 出力 = 放射輝度 * 面積 * PI * (光源の選択確率の逆数) * (表裏の選択で 2 倍)。
-  // 撒いた総数で割るのは present 側なので、ここでは割らない
-  var power = light.mat.emission * area * PI * f32(U.lightCount) * 2.0;
-  var ray = Ray(origin + nrm * 1e-4, dir);
+  if (pick >= U.lightCount) {
+    // 環境マップ。CDF から方向を引き、外接球の外から中へ向けて撒く
+    let smp = sampleEnvDir(vec2f(rand(), rand()));
+    if (smp.w <= 0.0) {
+      return;
+    }
+    let dir = -smp.xyz;
+    // 進行方向に垂直な、半径 sceneRadius の円板上の一様点
+    let basis = onb(dir);
+    let rr = U.sceneRadius * sqrt(rand());
+    let aa = rand() * 2.0 * PI;
+    let origin = U.sceneCenter - dir * U.sceneRadius
+      + basis[0] * (rr * cos(aa)) + basis[1] * (rr * sin(aa));
+    // 円板の面積 pi r^2 が方向あたりの投影面積になる
+    power = envColor(smp.xyz) * PI * U.sceneRadius * U.sceneRadius * f32(ln) / smp.w;
+    ray = Ray(origin, dir);
+  } else {
+    // 面光源。面上の点と余弦分布の方向をサンプルする
+    let light = quads[indices[pick]];
+    let n = cross(light.u, light.v);
+    let area = length(n);
+    var nrm = n / area;
+    // 発光面は両面なので、どちら側に出すかを選んで重みを倍にする
+    if (rand() < 0.5) {
+      nrm = -nrm;
+    }
+    let origin = light.q + light.u * rand() + light.v * rand();
+    let dir = normalize(onb(nrm) * cosineHemisphere(vec2f(rand(), rand())));
+    // 出力 = 放射輝度 * 面積 * PI * (選択確率の逆数) * (表裏の選択で 2 倍)。
+    // 撒いた総数で割るのは present 側なので、ここでは割らない
+    power = light.mat.emission * area * PI * f32(ln) * 2.0;
+    ray = Ray(origin + nrm * 1e-4, dir);
+  }
 
   var bounces = 0u;
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
