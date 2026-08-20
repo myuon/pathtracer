@@ -623,6 +623,79 @@ function buildIndirectScene(): Scene {
   };
 }
 
+
+/**
+ * BDPT の必要性を見るための、意図的に過酷なシーン。
+ *
+ * 光源を箱で囲い、細い隙間だけ残してある。部屋のどの面から光源へ影レイを
+ * 飛ばしても、隙間を通る細い立体角に入らない限り遮られる。つまり NEE が
+ * ほぼ全域で無効になり、カメラ側の経路が偶然その隙間に入るのを待つしかない。
+ */
+function buildEnclosedScene(): Scene {
+  const R = 8;
+  const H = 5;
+  const wall = lambert([0.6, 0.58, 0.55]);
+  // 箱の内側は明るくしておく。中で何度も跳ねてから隙間を抜ける
+  const inner = lambert([0.86, 0.85, 0.82]);
+
+  // 光源を囲う箱
+  const x0 = 3.0;
+  const x1 = 5.0;
+  const y0 = 2.0;
+  const y1 = 3.6;
+  const z0 = 3.0;
+  const z1 = 5.0;
+  // -x 面に残す隙間 (幅 0.3)
+  const s0 = 3.85;
+  const s1 = 4.15;
+
+  return {
+    spheres: [
+      { center: [1.9, 0.75, 2.4], radius: 0.75, material: lambert([0.7, 0.68, 0.64]) },
+      { center: [6.3, 0.7, 6.0], radius: 0.7, material: ggx([0.95, 0.9, 0.82], 0.22) },
+    ],
+    quads: [
+      { q: [0, 0, 0], u: [R, 0, 0], v: [0, 0, R], material: lambert([0.52, 0.5, 0.47]) },
+      { q: [0, H, 0], u: [R, 0, 0], v: [0, 0, R], material: wall },
+      { q: [0, 0, 0], u: [0, H, 0], v: [0, 0, R], material: wall },
+      { q: [R, 0, 0], u: [0, H, 0], v: [0, 0, R], material: wall },
+      { q: [0, 0, 0], u: [R, 0, 0], v: [0, H, 0], material: wall },
+      { q: [0, 0, R], u: [R, 0, 0], v: [0, H, 0], material: wall },
+
+      // 囲いの箱。-x 面だけ隙間を空ける
+      { q: [x1, y0, z0], u: [0, y1 - y0, 0], v: [0, 0, z1 - z0], material: inner },
+      { q: [x0, y0, z0], u: [0, y1 - y0, 0], v: [0, 0, s0 - z0], material: inner },
+      { q: [x0, y0, s1], u: [0, y1 - y0, 0], v: [0, 0, z1 - s1], material: inner },
+      { q: [x0, y1, z0], u: [x1 - x0, 0, 0], v: [0, 0, z1 - z0], material: inner },
+      { q: [x0, y0, z0], u: [x1 - x0, 0, 0], v: [0, 0, z1 - z0], material: inner },
+      { q: [x0, y0, z1], u: [x1 - x0, 0, 0], v: [0, y1 - y0, 0], material: inner },
+      { q: [x0, y0, z0], u: [x1 - x0, 0, 0], v: [0, y1 - y0, 0], material: inner },
+
+      // 隙間の正面に目隠しを置き、部屋から光源への直線をほぼ塞ぐ。
+      // 光は隙間 -> 目隠しの裏 -> 縁を回り込む、という経路でしか部屋に出られない
+      { q: [2.55, 1.6, 3.35], u: [0, 2.4, 0], v: [0, 0, 1.3], material: inner },
+
+      // 囲いの中の光源。閉じている +x 面を向いている
+      {
+        q: [3.35, 2.3, 3.4],
+        u: [0, 1.0, 0],
+        v: [0, 0, 1.2],
+        material: emissive([260, 245, 210]),
+      },
+    ],
+    triangles: [],
+    env: ENV.black,
+    camera: {
+      target: [4.5, 2.0, 4.2],
+      distance: 3.4,
+      yaw: Math.PI * 0.8,
+      pitch: 0.1,
+      fovDeg: 66,
+      aperture: 0,
+    },
+  };
+}
+
 export interface SceneEntry {
   id: string;
   name: string;
@@ -637,6 +710,7 @@ export const SCENES: SceneEntry[] = [
   { id: "glass", name: "rough / colored glass", build: buildGlassScene },
   { id: "shaft", name: "light shafts (fog)", build: buildShaftScene },
   { id: "indirect", name: "indirect only (hard)", build: buildIndirectScene },
+  { id: "enclosed", name: "enclosed light (brutal)", build: buildEnclosedScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;
