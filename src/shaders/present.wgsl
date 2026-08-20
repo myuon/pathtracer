@@ -22,6 +22,10 @@ struct Uniforms {
   mis: u32,
   qmc: u32,
   bvhNodeCount: u32,
+  envIs: u32,
+  envWidth: u32,
+  envHeight: u32,
+  envPdfScale: f32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;

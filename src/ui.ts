@@ -19,6 +19,8 @@ export interface RenderSettings {
   mis: boolean;
   /** スクランブル済み Sobol (0,2) 列を使う */
   qmc: boolean;
+  /** 環境マップを光源としてサンプルする */
+  envIs: boolean;
 }
 
 export interface UiOptions {
@@ -327,6 +329,7 @@ export function createUi(options: UiOptions): UiHandle {
     nee: true,
     mis: true,
     qmc: true,
+    envIs: true,
   };
 
   const panel = document.createElement("div");
@@ -490,6 +493,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const envIsRow = createToggleRow({
+    label: "env importance sampling",
+    value: settings.envIs,
+    onChange: (v) => {
+      settings.envIs = v;
+      notifyChange();
+    },
+  });
+
   const resetButton = document.createElement("button");
   resetButton.type = "button";
   resetButton.className = "pt-reset";
@@ -509,6 +521,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(neeRow);
   body.appendChild(misRow);
   body.appendChild(qmcRow);
+  body.appendChild(envIsRow);
   body.appendChild(resetButton);
 
   const status = document.createElement("div");

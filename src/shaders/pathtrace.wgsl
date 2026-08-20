@@ -23,6 +23,12 @@ struct Uniforms {
   /// スクランブル済み Sobol (0,2) 列を使うか
   qmc: u32,
   bvhNodeCount: u32,
+  /// 環境マップを光源としてサンプルするか
+  envIs: u32,
+  envWidth: u32,
+  envHeight: u32,
+  /// pdf_omega = max(luminance, 1e-6) * envPdfScale
+  envPdfScale: f32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -36,6 +42,11 @@ const MAT_EMISSIVE: u32 = 3u;
 
 const ENV_SKY: u32 = 0u;
 const ENV_BLACK: u32 = 1u;
+/// 太陽つきの空を焼いた lat-long マップ
+const ENV_HDRI: u32 = 2u;
+
+/// CDF の重みが 0 になる方向を作らないための下限。TS 側と一致させること
+const ENV_MIN_WEIGHT: f32 = 1e-6;
 
 const PI: f32 = 3.14159265;
 /// このバウンス数までは低食い違い列に次元を割り当てる。
@@ -108,6 +119,9 @@ struct Triangle {
 };
 
 @group(0) @binding(7) var<storage, read> triangles: array<Triangle>;
+
+/// [テクセル rgba][周辺 CDF][条件付き CDF] を連結した 1 本の配列
+@group(0) @binding(8) var<storage, read> envData: array<f32>;
 
 // ---------------------------------------------------------------- random
 // PCG hash ベースなので状態バッファは不要。seed は毎回呼び出し側で進める。
@@ -186,13 +200,133 @@ fn cosineHemisphere(u: vec2f) -> vec3f {
   return vec3f(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u.x)));
 }
 
-// ---------------------------------------------------------------- sky
+// ---------------------------------------------------------------- 環境光
+fn envLuminance(c: vec3f) -> f32 {
+  return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+fn envMarginalOffset() -> u32 {
+  return U.envWidth * U.envHeight * 4u;
+}
+
+fn envCondOffset() -> u32 {
+  return envMarginalOffset() + U.envHeight + 1u;
+}
+
+fn envTexel(iu: u32, iv: u32) -> vec3f {
+  let u = min(iu, U.envWidth - 1u);
+  let v = min(iv, U.envHeight - 1u);
+  let o = (v * U.envWidth + u) * 4u;
+  return vec3f(envData[o], envData[o + 1u], envData[o + 2u]);
+}
+
+/// 方向を lat-long の [0,1]^2 座標へ
+fn dirToUv(dir: vec3f) -> vec2f {
+  let d = normalize(dir);
+  let theta = acos(clamp(d.y, -1.0, 1.0));
+  var phi = atan2(d.z, d.x);
+  if (phi < 0.0) {
+    phi = phi + 2.0 * PI;
+  }
+  return vec2f(phi / (2.0 * PI), theta / PI);
+}
+
+/// 双線形補間。経度方向は巻き戻し、緯度方向は端で留める
+fn envSample(dir: vec3f) -> vec3f {
+  let uv = dirToUv(dir);
+  let fx = uv.x * f32(U.envWidth) - 0.5;
+  let fy = uv.y * f32(U.envHeight) - 0.5;
+  let ix = i32(floor(fx));
+  let iy = i32(floor(fy));
+  let tx = fx - floor(fx);
+  let ty = fy - floor(fy);
+  let w = i32(U.envWidth);
+  let h = i32(U.envHeight);
+  let x0 = u32(((ix % w) + w) % w);
+  let x1 = u32((((ix + 1) % w) + w) % w);
+  let y0 = u32(clamp(iy, 0, h - 1));
+  let y1 = u32(clamp(iy + 1, 0, h - 1));
+  let a = mix(envTexel(x0, y0), envTexel(x1, y0), tx);
+  let b = mix(envTexel(x0, y1), envTexel(x1, y1), tx);
+  return mix(a, b, ty);
+}
+
 fn envColor(dir: vec3f) -> vec3f {
   if (U.env == ENV_BLACK) {
     return vec3f(0.0);
   }
+  if (U.env == ENV_HDRI) {
+    return envSample(dir);
+  }
   let t = 0.5 * (normalize(dir).y + 1.0);
   return mix(vec3f(1.0, 1.0, 1.0), vec3f(0.5, 0.7, 1.0), t);
+}
+
+/// この方向を環境マップからサンプルしたときの立体角 pdf。
+/// CDF は最近傍テクセルの区分定数なので、pdf も最近傍で引く
+fn envPdf(dir: vec3f) -> f32 {
+  let uv = dirToUv(dir);
+  let iu = min(u32(uv.x * f32(U.envWidth)), U.envWidth - 1u);
+  let iv = min(u32(uv.y * f32(U.envHeight)), U.envHeight - 1u);
+  return max(envLuminance(envTexel(iu, iv)), ENV_MIN_WEIGHT) * U.envPdfScale;
+}
+
+/// 正規化済み CDF の中から xi 以下の最大の区間を探す
+fn cdfSearch(base: u32, count: u32, xi: f32) -> u32 {
+  var lo = 0u;
+  var hi = count;
+  for (var i = 0u; i < 32u; i = i + 1u) {
+    if (lo + 1u >= hi) {
+      break;
+    }
+    let mid = (lo + hi) / 2u;
+    if (envData[base + mid] <= xi) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+/// 環境マップから方向をサンプルする。xyz = 方向, w = 立体角 pdf
+fn sampleEnvDir(xi: vec2f) -> vec4f {
+  let mOff = envMarginalOffset();
+  let cOff = envCondOffset();
+
+  let iv = cdfSearch(mOff, U.envHeight, xi.x);
+  let m0 = envData[mOff + iv];
+  let m1 = envData[mOff + iv + 1u];
+  var dv = 0.5;
+  if (m1 > m0) {
+    dv = (xi.x - m0) / (m1 - m0);
+  }
+
+  let rowBase = cOff + iv * (U.envWidth + 1u);
+  let iu = cdfSearch(rowBase, U.envWidth, xi.y);
+  let c0 = envData[rowBase + iu];
+  let c1 = envData[rowBase + iu + 1u];
+  var du = 0.5;
+  if (c1 > c0) {
+    du = (xi.y - c0) / (c1 - c0);
+  }
+
+  let theta = (f32(iv) + dv) / f32(U.envHeight) * PI;
+  let phi = (f32(iu) + du) / f32(U.envWidth) * 2.0 * PI;
+  let sinT = sin(theta);
+  let dir = vec3f(sinT * cos(phi), cos(theta), sinT * sin(phi));
+  let pdf = max(envLuminance(envTexel(iu, iv)), ENV_MIN_WEIGHT) * U.envPdfScale;
+  return vec4f(dir, pdf);
+}
+
+/// 環境マップを光源として扱えるか
+fn envIsActive() -> bool {
+  return U.envIs != 0u && U.env == ENV_HDRI;
+}
+
+/// 一様に選ぶ光源の総数 (面光源 + 環境マップ)
+fn lightSelectCount() -> u32 {
+  return U.lightCount + select(0u, 1u, envIsActive());
 }
 
 // ---------------------------------------------------------------- camera
@@ -595,7 +729,34 @@ fn misWeight(pA: f32, pB: f32) -> f32 {
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
 /// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
 fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f) -> vec3f {
-  let pick = min(u32(rand() * f32(U.lightCount)), U.lightCount - 1u);
+  let n = lightSelectCount();
+  if (n == 0u) {
+    return vec3f(0.0);
+  }
+  let pick = min(u32(rand() * f32(n)), n - 1u);
+
+  // 面光源の後ろに環境マップを 1 個ぶら下げて、一様に選ぶ
+  if (pick >= U.lightCount) {
+    let smp = sampleEnvDir(u);
+    let wi = smp.xyz;
+    let pL = smp.w / f32(n);
+    if (pL <= 0.0) {
+      return vec3f(0.0);
+    }
+    let fcos = bsdfEval(hit, rayDir, wi);
+    if (all(fcos <= vec3f(0.0))) {
+      return vec3f(0.0);
+    }
+    if (occluded(hit.p + hit.normal * 1e-4, wi, 1e30)) {
+      return vec3f(0.0);
+    }
+    var w = 1.0;
+    if (U.mis != 0u) {
+      w = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
+    }
+    return envColor(wi) * fcos * w / pL;
+  }
+
   let light = quads[lights[pick]];
 
   // 光源上の一様サンプル
@@ -620,7 +781,7 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f) -> vec3f {
   }
 
   // 面積についての pdf 1 / (lightCount * area) を立体角に変換したもの
-  let pL = dist2 / (cosLight * area * f32(U.lightCount));
+  let pL = dist2 / (cosLight * area * f32(n));
 
   // MIS。BSDF サンプリングでも作りやすい方向ほど寄与を下げる
   var weight = 1.0;
@@ -705,13 +866,22 @@ fn trace(primary: Ray) -> vec3f {
   // 直前の頂点で BSDF サンプリングした方向の立体角 pdf。
   // 負ならカメラレイかスペキュラ反射で、光源サンプリングでは作れない方向なので重みは 1
   var bsdfPdf = -1.0;
-  let useNee = U.nee != 0u && U.lightCount > 0u;
+  let useNee = U.nee != 0u && lightSelectCount() > 0u;
+  let useEnvNee = U.nee != 0u && envIsActive();
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
     if (!hitScene(ray, 1e-3, 1e30, &hit)) {
-      // 環境光は NEE の対象外なので常に足す
-      radiance = radiance + throughput * envColor(ray.dir);
+      // 環境マップを光源としてサンプルしているなら、ここも二重計上になる
+      var w = 1.0;
+      if (useEnvNee && bsdfPdf > 0.0) {
+        if (U.mis != 0u) {
+          w = misWeight(bsdfPdf, envPdf(ray.dir) / f32(lightSelectCount()));
+        } else {
+          w = 0.0;
+        }
+      }
+      radiance = radiance + throughput * envColor(ray.dir) * w;
       break;
     }
 
@@ -721,7 +891,7 @@ fn trace(primary: Ray) -> vec3f {
       if (U.mis != 0u) {
         // この方向を光源サンプリングで作る場合の pdf。sampleDirectLight と同じ式
         let cosLight = max(abs(dot(hit.normal, ray.dir)), 1e-6);
-        let pL = hit.t * hit.t / (cosLight * hit.lightArea * f32(U.lightCount));
+        let pL = hit.t * hit.t / (cosLight * hit.lightArea * f32(lightSelectCount()));
         weight = misWeight(bsdfPdf, pL);
       } else {
         // MIS なしなら NEE 側に完全に任せる (二重計上の防止)

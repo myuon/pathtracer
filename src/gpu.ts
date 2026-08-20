@@ -1,7 +1,8 @@
 import pathtraceWgsl from "./shaders/pathtrace.wgsl?raw";
 import presentWgsl from "./shaders/present.wgsl?raw";
 import { buildBvh } from "./bvh";
-import { packLights, packQuads, packSpheres, packTriangles, type Scene } from "./scene";
+import { buildSunSkyEnv } from "./envmap";
+import { ENV, packLights, packQuads, packSpheres, packTriangles, type Scene } from "./scene";
 
 export interface GpuContext {
   device: GPUDevice;
@@ -38,7 +39,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 128;
+const UNIFORM_SIZE = 144;
 const WORKGROUP = 8;
 
 export interface FrameParams {
@@ -62,6 +63,8 @@ export interface FrameParams {
   mis: boolean;
   /** スクランブル済み Sobol (0,2) 列を使う */
   qmc: boolean;
+  /** 環境マップを光源としてサンプルする */
+  envIs: boolean;
 }
 
 export class Renderer {
@@ -85,6 +88,10 @@ export class Renderer {
   private bvhBuffer: GPUBuffer | null = null;
   private bvhRefBuffer: GPUBuffer | null = null;
   private triBuffer: GPUBuffer | null = null;
+  private envBuffer: GPUBuffer | null = null;
+  private envWidth = 1;
+  private envHeight = 1;
+  private envPdfScale = 0;
   private bvhNodeCount = 0;
   private sphereCount = 0;
   private quadCount = 0;
@@ -146,6 +153,21 @@ export class Renderer {
     this.triBuffer?.destroy();
     this.triBuffer = this.uploadGeometry(packTriangles(scene.triangles), "triangles");
 
+    // 環境マップは使うシーンだけ焼く。それ以外はダミーを 1 個置く
+    this.envBuffer?.destroy();
+    if (scene.env === ENV.hdri) {
+      const env = buildSunSkyEnv();
+      this.envWidth = env.width;
+      this.envHeight = env.height;
+      this.envPdfScale = env.pdfScale;
+      this.envBuffer = this.uploadGeometry(env.data.buffer as ArrayBuffer, "env");
+    } else {
+      this.envWidth = 1;
+      this.envHeight = 1;
+      this.envPdfScale = 0;
+      this.envBuffer = this.uploadGeometry(new Float32Array(16).buffer, "env");
+    }
+
     const bvh = buildBvh(scene.spheres, scene.quads, scene.triangles);
     this.bvhNodeCount = bvh.nodeCount;
     this.bvhBuffer?.destroy();
@@ -180,6 +202,7 @@ export class Renderer {
         { binding: 5, resource: { buffer: this.bvhBuffer! } },
         { binding: 6, resource: { buffer: this.bvhRefBuffer! } },
         { binding: 7, resource: { buffer: this.triBuffer! } },
+        { binding: 8, resource: { buffer: this.envBuffer! } },
       ],
     });
     this.presentBindGroup = this.device.createBindGroup({
@@ -234,6 +257,10 @@ export class Renderer {
     u[28] = p.mis ? 1 : 0;
     u[29] = p.qmc ? 1 : 0;
     u[30] = this.bvhNodeCount;
+    u[31] = p.envIs ? 1 : 0;
+    u[32] = this.envWidth;
+    u[33] = this.envHeight;
+    f[34] = this.envPdfScale;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 

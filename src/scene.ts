@@ -74,6 +74,8 @@ export const ENV = {
   sky: 0,
   /** 真っ黒 (閉じた部屋を光源だけで照らす) */
   black: 1,
+  /** 太陽つきの空を焼いた lat-long マップ。重要度サンプリングの対象になる */
+  hdri: 2,
 } as const;
 
 export type EnvKind = (typeof ENV)[keyof typeof ENV];
@@ -191,7 +193,7 @@ function buildSpheresScene(): Scene {
     spheres,
     quads: [],
     triangles: [],
-    env: ENV.sky,
+    env: ENV.hdri,
     camera: {
       target: [0, 1, 0],
       distance: 12,
@@ -434,7 +436,7 @@ function buildMeshScene(): Scene {
       },
     ],
     triangles,
-    env: ENV.sky,
+    env: ENV.hdri,
     camera: {
       target: [0, 1.9, 0],
       distance: 17,
