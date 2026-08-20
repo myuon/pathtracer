@@ -32,6 +32,11 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
       cap,
     ),
     maxBufferSize: Math.min(adapter.limits.maxBufferSize, cap),
+    // SPPM で光子とグリッドを足したので既定の 8 本では足りない
+    maxStorageBuffersPerShaderStage: Math.min(
+      adapter.limits.maxStorageBuffersPerShaderStage,
+      12,
+    ),
   };
   const device = await adapter
     .requestDevice({ requiredLimits })
@@ -51,15 +56,22 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 272;
+const UNIFORM_SIZE = 288;
 
 /**
  * 履歴バッファの 1 画素あたりのバイト数。
  * WGSL 側の vec4f 2 個 (色とサンプル数 / 1 次交差の世界座標) と一致させること。
  * ここと maxPixels() がずれると、上限判定をすり抜けて bind group の作成が落ちる。
  */
-const HIST_BYTES_PER_PIXEL = 32;
+const HIST_BYTES_PER_PIXEL = 64;
 const WORKGROUP = 8;
+
+/** 1 反復あたりに撒く光子の数 */
+const PHOTON_COUNT = 1 << 17;
+/** ハッシュグリッドのセル数 */
+const GRID_CELLS = 1 << 18;
+/** 1 セルに入る光子の上限。WGSL 側の GRID_CAP と一致させること */
+const GRID_CAP = 48;
 
 export interface FrameParams {
   camPos: [number, number, number];
@@ -92,6 +104,8 @@ export interface FrameParams {
   fixedSeed: boolean;
   /** 参加媒質を有効にする */
   fog: boolean;
+  /** SPPM を使う */
+  sppm: boolean;
 }
 
 export class Renderer {
@@ -102,6 +116,14 @@ export class Renderer {
   private readonly uniformF32 = new Float32Array(this.uniformData);
   private readonly uniformU32 = new Uint32Array(this.uniformData);
   private readonly computePipeline: GPUComputePipeline;
+  private readonly sppmPipeline: GPUComputePipeline;
+  private readonly photonPipeline: GPUComputePipeline;
+  private readonly clearGridPipeline: GPUComputePipeline;
+  private readonly computeLayout: GPUBindGroupLayout;
+  private readonly photonBuffer: GPUBuffer;
+  private readonly gridBuffer: GPUBuffer;
+  private radius0 = 0.05;
+  private photonsEmitted = 0;
   private readonly presentPipeline: GPURenderPipeline;
 
   /** ping-pong する履歴バッファ。1 画素あたり vec4f 2 個 */
@@ -137,15 +159,53 @@ export class Renderer {
       size: UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    // 光子 1 個あたり vec4f 3 個
+    this.photonBuffer = this.device.createBuffer({
+      // 1 本の光子が複数回堆積するので枠は 2 倍取る
+      size: PHOTON_COUNT * 2 * 3 * 16,
+      usage: GPUBufferUsage.STORAGE,
+      label: "photons",
+    });
+    // [セルごとの個数][セルごとの光子インデックス][書き込んだ光子の総数]
+    this.gridBuffer = this.device.createBuffer({
+      size: (GRID_CELLS * (1 + GRID_CAP) + 1) * 4,
+      usage: GPUBufferUsage.STORAGE,
+      label: "grid",
+    });
 
     const traceModule = this.device.createShaderModule({
       code: pathtraceWgsl,
       label: "pathtrace",
     });
-    this.computePipeline = this.device.createComputePipeline({
-      layout: "auto",
-      compute: { module: traceModule, entryPoint: "main" },
+
+    // エントリポイントごとに使う binding が違うので、layout: "auto" ではなく
+    // 明示的なレイアウトを共有する
+    const st = (type: GPUBufferBindingType): GPUBindGroupLayoutEntry["buffer"] => ({ type });
+    this.computeLayout = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: st("uniform") },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: st("storage") },
+        ...[2, 3, 4, 5, 6, 7, 8].map((b) => ({
+          binding: b,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: st("read-only-storage"),
+        })),
+        { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: st("storage") },
+        { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: st("storage") },
+      ],
     });
+    const pipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [this.computeLayout],
+    });
+    const mk = (entryPoint: string) =>
+      this.device.createComputePipeline({
+        layout: pipelineLayout,
+        compute: { module: traceModule, entryPoint },
+      });
+    this.computePipeline = mk("main");
+    this.sppmPipeline = mk("sppmMain");
+    this.photonPipeline = mk("photonMain");
+    this.clearGridPipeline = mk("clearGrid");
 
     const presentModule = this.device.createShaderModule({
       code: presentWgsl,
@@ -200,6 +260,9 @@ export class Renderer {
 
     const bvh = buildBvh(scene.spheres, scene.quads, scene.triangles);
     this.bvhNodeCount = bvh.nodeCount;
+    // シーンの対角長の 1% を光子ギャザーの初期半径にする
+    const d = bvh.bounds.max.map((v, i) => v - bvh.bounds.min[i]);
+    this.radius0 = Math.max(1e-3, Math.hypot(d[0], d[1], d[2]) * 0.012);
     this.bvhBuffer?.destroy();
     this.bvhBuffer = this.uploadGeometry(bvh.nodes, "bvh");
 
@@ -231,7 +294,7 @@ export class Renderer {
     // ping-pong の 2 通りぶん作っておき、フレームごとに入れ替える
     this.computeBindGroups = [0, 1].map((i) =>
       this.device.createBindGroup({
-        layout: this.computePipeline.getBindGroupLayout(0),
+        layout: this.computeLayout,
         entries: [
           { binding: 0, resource: { buffer: this.uniformBuffer } },
           { binding: 1, resource: { buffer: this.histBuffers![i] } },
@@ -242,6 +305,8 @@ export class Renderer {
           { binding: 6, resource: { buffer: this.histBuffers![1 - i] } },
           { binding: 7, resource: { buffer: this.triBuffer! } },
           { binding: 8, resource: { buffer: this.envBuffer! } },
+          { binding: 9, resource: { buffer: this.photonBuffer } },
+          { binding: 10, resource: { buffer: this.gridBuffer } },
         ],
       }),
     );
@@ -330,19 +395,40 @@ export class Renderer {
     } else {
       u[65] = 0;
     }
+    u[66] = p.sppm ? 1 : 0;
+    u[67] = PHOTON_COUNT;
+    u[68] = GRID_CELLS;
+    f[69] = this.radius0;
+    f[70] = this.radius0;
+    f[71] = this.photonsEmitted;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
   render(p: FrameParams) {
     this.ensureAccum(p.width * p.height);
-    this.writeUniforms(p);
-    const write = this.parity;
+    // 光子は面光源からしか撒いていないので、環境光だけのシーンでは
+    // 間接光が丸ごと欠ける。その場合は素直にパストレースに落とす
+    const sppm = p.sppm && this.lightCount > 0;
+    const q: FrameParams = sppm === p.sppm ? p : { ...p, sppm };
+    // SPPM は画素ごとの状態を持ち越す必要があるので ping-pong を止める
+    const write = sppm ? 0 : this.parity;
+    if (sppm && p.samplesBefore === 0) this.photonsEmitted = 0;
+    this.writeUniforms(q);
 
     const encoder = this.device.createCommandEncoder();
-
     const compute = encoder.beginComputePass();
-    compute.setPipeline(this.computePipeline);
     compute.setBindGroup(0, this.computeBindGroups[write]);
+
+    if (sppm) {
+      // グリッドを空にする -> 光子を撒く -> カメラ側で集める
+      compute.setPipeline(this.clearGridPipeline);
+      compute.dispatchWorkgroups(Math.ceil(GRID_CELLS / 64));
+      compute.setPipeline(this.photonPipeline);
+      compute.dispatchWorkgroups(Math.ceil(PHOTON_COUNT / 64));
+      compute.setPipeline(this.sppmPipeline);
+    } else {
+      compute.setPipeline(this.computePipeline);
+    }
     compute.dispatchWorkgroups(
       Math.ceil(p.width / WORKGROUP),
       Math.ceil(p.height / WORKGROUP),
@@ -365,7 +451,8 @@ export class Renderer {
     pass.end();
 
     this.device.queue.submit([encoder.finish()]);
+    if (sppm) this.photonsEmitted += PHOTON_COUNT;
     this.prevCam = p;
-    this.parity = 1 - write;
+    this.parity = sppm ? 0 : 1 - write;
   }
 }

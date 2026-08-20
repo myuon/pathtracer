@@ -139,6 +139,8 @@ export interface BvhData {
   nodes: ArrayBuffer;
   refs: ArrayBuffer;
   nodeCount: number;
+  /** シーン全体の AABB。SPPM の初期半径やセルの大きさを決めるのに使う */
+  bounds: { min: Vec3; max: Vec3 };
 }
 
 export function buildBvh(
@@ -169,5 +171,10 @@ export function buildBvh(
   const refBuf = new ArrayBuffer(Math.max(1, refs.length) * 4);
   new Uint32Array(refBuf).set(refs.map((r) => r.code >>> 0));
 
-  return { nodes: nodeBuf, refs: refBuf, nodeCount: nodes.length };
+  return {
+    nodes: nodeBuf,
+    refs: refBuf,
+    nodeCount: nodes.length,
+    bounds: { min: nodes[0].min, max: nodes[0].max },
+  };
 }

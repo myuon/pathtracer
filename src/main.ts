@@ -136,6 +136,7 @@ async function main() {
       debugMode: ui.settings.debugMode,
       fixedSeed: ui.settings.fixedSeed,
       fog: ui.settings.fog,
+      sppm: ui.settings.sppm,
     });
 
     samples += spp;

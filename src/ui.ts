@@ -29,6 +29,8 @@ export interface RenderSettings {
   fixedSeed: boolean;
   /** 参加媒質を有効にする */
   fog: boolean;
+  /** SPPM を使う */
+  sppm: boolean;
 }
 
 export interface UiOptions {
@@ -353,6 +355,7 @@ export function createUi(options: UiOptions): UiHandle {
     debugMode: 0,
     fixedSeed: false,
     fog: true,
+    sppm: false,
   };
 
   const panel = document.createElement("div");
@@ -553,6 +556,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const sppmRow = createToggleRow({
+    label: "SPPM (photon mapping)",
+    value: settings.sppm,
+    onChange: (v) => {
+      settings.sppm = v;
+      notifyChange();
+    },
+  });
+
   const fixedSeedRow = createToggleRow({
     label: "fixed seed",
     value: settings.fixedSeed,
@@ -584,6 +596,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(envIsRow);
   body.appendChild(reprojectRow);
   body.appendChild(fogRow);
+  body.appendChild(sppmRow);
   body.appendChild(fixedSeedRow);
   body.appendChild(debugRow);
   body.appendChild(resetButton);

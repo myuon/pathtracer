@@ -52,6 +52,17 @@ struct Uniforms {
   /// Henyey-Greenstein の非対称パラメータ (正で前方散乱)
   fogG: f32,
   fogEnabled: u32,
+  /// SPPM を使うか
+  sppm: u32,
+  /// 1 反復あたりに撒く光子の数
+  photonCount: u32,
+  /// ハッシュグリッドのセル数
+  gridCells: u32,
+  cellSize: f32,
+  /// 半径の初期値
+  radius0: f32,
+  /// これまでに撒いた光子の総数
+  photonsEmitted: f32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -151,6 +162,25 @@ struct Triangle {
 
 /// [テクセル rgba][周辺 CDF][条件付き CDF] を連結した 1 本の配列
 @group(0) @binding(8) var<storage, read> envData: array<f32>;
+
+// -------------------------------------------------------------- SPPM
+/// 光子 1 個あたり vec4f 3 個 (位置 / 入射方向 / 出力)
+@group(0) @binding(9) var<storage, read_write> photons: array<vec4f>;
+/// [セルごとの個数][セルごとの光子インデックス] を連結したもの。
+/// WGSL の atomic は u32 と i32 しかないので、すべて u32 で通す
+@group(0) @binding(10) var<storage, read_write> grid: array<atomic<u32>>;
+
+/// 1 セルに入る光子の上限。あふれた分は捨てる
+const GRID_CAP: u32 = 48u;
+
+fn gridHash(ix: i32, iy: i32, iz: i32) -> u32 {
+  let h = (u32(ix) * 73856093u) ^ (u32(iy) * 19349663u) ^ (u32(iz) * 83492791u);
+  return h % U.gridCells;
+}
+
+fn gridCoord(p: vec3f) -> vec3i {
+  return vec3i(floor(p / U.cellSize));
+}
 
 // ---------------------------------------------------------------- random
 // PCG hash ベースなので状態バッファは不要。seed は毎回呼び出し側で進める。
@@ -1269,6 +1299,239 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
 }
 
 @compute @workgroup_size(8, 8, 1)
+fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= U.width || gid.y >= U.height) {
+    return;
+  }
+  let pixel = gid.y * U.width + gid.x;
+  let o = pixel * 4u;
+  rngState = pcg(pixel * 9781u + U.frameIndex * 6271u + 1u);
+  pixelSeed = pcg(pixel * 26699u + 1u);
+  sampleIdx = U.samplesBefore;
+
+  // ping-pong は使わず、同じバッファを読み書きして状態を持ち越す
+  var flux = vec3f(0.0);
+  var nAcc = 0.0;
+  var radius = U.radius0;
+  var direct = vec3f(0.0);
+  var count = 0.0;
+  if (U.samplesBefore > 0u) {
+    let s2 = histWrite[o + 2u];
+    flux = s2.rgb;
+    nAcc = s2.w;
+    radius = max(histWrite[o + 3u].x, 1e-5);
+    let s0 = histWrite[o];
+    direct = s0.rgb;
+    count = s0.w;
+  }
+
+  let jitter = sample2d(0u, true);
+  let px = (f32(gid.x) + jitter.x) / f32(U.width) * 2.0 - 1.0;
+  let py = 1.0 - (f32(gid.y) + jitter.y) / f32(U.height) * 2.0;
+
+  var newFlux = vec3f(0.0);
+  var m = 0.0;
+  let d = traceSppm(makeRay(px, py, sample2d(1u, true)), radius, &newFlux, &m);
+
+  // SPPM の半径・フラックス更新 (Hachisuka & Jensen)
+  let ALPHA = 0.7;
+  if (nAcc + m > 0.0) {
+    let ratio = (nAcc + ALPHA * m) / (nAcc + m);
+    radius = radius * sqrt(ratio);
+    flux = (flux + newFlux) * ratio;
+    nAcc = nAcc + ALPHA * m;
+  }
+
+  histWrite[o] = vec4f(direct + d, count + 1.0);
+  histWrite[o + 2u] = vec4f(flux, nAcc);
+  histWrite[o + 3u] = vec4f(radius, 0.0, 0.0, 0.0);
+}
+
+// -------------------------------------------------------------- SPPM ギャザー
+/// 半径 r 以内の光子を集め、BRDF を掛けたフラックスの和と個数を返す
+fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> vec3f {
+  var sum = vec3f(0.0);
+  var m = 0.0;
+  let r2 = r * r;
+  let c = gridCoord(hit.p);
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        let cell = gridHash(c.x + dx, c.y + dy, c.z + dz);
+        let cnt = min(atomicLoad(&grid[cell]), GRID_CAP);
+        for (var k = 0u; k < cnt; k = k + 1u) {
+          let pi = atomicLoad(&grid[U.gridCells + cell * GRID_CAP + k]);
+          let d = photons[pi * 3u + 0u].xyz - hit.p;
+          if (dot(d, d) > r2) {
+            continue;
+          }
+          let wi = -photons[pi * 3u + 1u].xyz;
+          let cosI = dot(hit.normal, wi);
+          if (cosI <= 1e-4) {
+            continue;
+          }
+          // bsdfEval は f * cos を返すので、余弦で割って裸の BRDF に戻す
+          sum = sum + (bsdfEval(hit, rayDir, wi) / cosI) * photons[pi * 3u + 2u].xyz;
+          m = m + 1.0;
+        }
+      }
+    }
+  }
+  *found = m;
+  return sum;
+}
+
+/// SPPM のカメラ側。最初にギャザーできる面まで辿り、直接光は NEE、
+/// 間接光はそこで光子を集めて求める
+fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<function, f32>) -> vec3f {
+  var ray = primary;
+  var throughput = vec3f(1.0);
+  var radiance = vec3f(0.0);
+  var bsdfPdf = -1.0;
+  let useNee = U.nee != 0u && lightSelectCount() > 0u;
+  let useEnvNee = U.nee != 0u && envIsActive();
+
+  for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
+    var hit: Hit;
+    if (!hitScene(ray, 1e-3, 1e30, &hit)) {
+      var w = 1.0;
+      if (useEnvNee && bsdfPdf > 0.0) {
+        if (U.mis != 0u) {
+          w = misWeight(bsdfPdf, envPdf(ray.dir) / f32(lightSelectCount()));
+        } else {
+          w = 0.0;
+        }
+      }
+      return radiance + throughput * envColor(ray.dir) * w;
+    }
+
+    var we = 1.0;
+    if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
+      if (U.mis != 0u) {
+        let cosLight = max(abs(dot(hit.normal, ray.dir)), 1e-6);
+        we = misWeight(bsdfPdf, hit.t * hit.t / (cosLight * hit.lightArea * f32(lightSelectCount())));
+      } else {
+        we = 0.0;
+      }
+    }
+    radiance = radiance + throughput * hit.mat.emission * we;
+
+    if (hit.mat.kind == MAT_LAMBERT || hit.mat.kind == MAT_GGX) {
+      if (useNee) {
+        var mw = 1.0;
+        radiance = radiance + throughput
+          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw);
+      }
+      *flux = throughput * gatherPhotons(hit, ray.dir, radius, found);
+      return radiance;
+    }
+
+    // スペキュラ面は通り抜けて、次のギャザーできる面を探す
+    var attenuation: vec3f;
+    var scattered: Ray;
+    if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered)) {
+      return radiance;
+    }
+    let pv = bsdfPdfFor(hit, ray.dir, scattered.dir);
+    bsdfPdf = select(-1.0, max(pv, 1e-8), pv > 0.0 && isDiffuseLike(hit.mat));
+    throughput = throughput * attenuation;
+    ray = scattered;
+  }
+  return radiance;
+}
+
+// -------------------------------------------------------------- 光子パス
+/// グリッドの個数カウンタを 0 に戻す
+@compute @workgroup_size(64, 1, 1)
+fn clearGrid(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x == 0u) {
+    // 末尾に置いた「今回書き込んだ光子の数」も戻す
+    atomicStore(&grid[U.gridCells + U.gridCells * GRID_CAP], 0u);
+  }
+  if (gid.x >= U.gridCells) {
+    return;
+  }
+  atomicStore(&grid[gid.x], 0u);
+}
+
+/// 光子を 1 個グリッドに入れる。あふれたセルは捨てる (その分だけ暗くなる)
+fn depositPhoton(index: u32, p: vec3f) {
+  let c = gridCoord(p);
+  let cell = gridHash(c.x, c.y, c.z);
+  let slot = atomicAdd(&grid[cell], 1u);
+  if (slot < GRID_CAP) {
+    atomicStore(&grid[U.gridCells + cell * GRID_CAP + slot], index);
+  }
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= U.photonCount || U.lightCount == 0u) {
+    return;
+  }
+  rngState = pcg(gid.x * 15487469u + U.frameIndex * 2654435761u + 7u);
+  pixelSeed = rngState;
+  sampleIdx = U.frameIndex;
+
+  // 光源を 1 つ選び、面上の点と余弦分布の方向をサンプルする
+  let li = min(u32(rand() * f32(U.lightCount)), U.lightCount - 1u);
+  let light = quads[indices[li]];
+  let n = cross(light.u, light.v);
+  let area = length(n);
+  var nrm = n / area;
+  // 発光面は両面なので、どちら側に出すかを選んで重みを倍にする
+  if (rand() < 0.5) {
+    nrm = -nrm;
+  }
+  let origin = light.q + light.u * rand() + light.v * rand();
+  let dir = normalize(onb(nrm) * cosineHemisphere(vec2f(rand(), rand())));
+
+  // 出力 = 放射輝度 * 面積 * PI * (光源の選択確率の逆数) * (表裏の選択で 2 倍)。
+  // 撒いた総数で割るのは present 側なので、ここでは割らない
+  var power = light.mat.emission * area * PI * f32(U.lightCount) * 2.0;
+  var ray = Ray(origin + nrm * 1e-4, dir);
+
+  var bounces = 0u;
+  for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
+    var hit: Hit;
+    if (!hitScene(ray, 1e-3, 1e30, &hit)) {
+      return;
+    }
+    let kind = hit.mat.kind;
+    let gatherable = kind == MAT_LAMBERT || kind == MAT_GGX;
+
+    // 直接光はカメラ側の NEE が担当しているので、1 回以上散乱した後だけ堆積させる
+    if (gatherable && bounces >= 1u) {
+      let slot = atomicAdd(&grid[U.gridCells + U.gridCells * GRID_CAP], 1u);
+      if (slot < U.photonCount * 2u) {
+        photons[slot * 3u + 0u] = vec4f(hit.p, 1.0);
+        photons[slot * 3u + 1u] = vec4f(ray.dir, 0.0);
+        photons[slot * 3u + 2u] = vec4f(power, 0.0);
+        depositPhoton(slot, hit.p);
+      }
+    }
+
+    var attenuation: vec3f;
+    var scattered: Ray;
+    if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered)) {
+      return;
+    }
+    power = power * attenuation;
+    ray = scattered;
+    bounces = bounces + 1u;
+
+    // ロシアンルーレット
+    if (depth >= 2u) {
+      let q = min(max(power.r, max(power.g, power.b)), 1.0);
+      if (rand() > q) {
+        return;
+      }
+      power = power / max(q, 1e-4);
+    }
+  }
+}
+
+@compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= U.width || gid.y >= U.height) {
     return;
@@ -1300,7 +1563,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
-  let o = pixel * 2u;
+  let o = pixel * 4u;
   var prevSum = vec3f(0.0);
   var prevCount = 0.0;
 
@@ -1327,7 +1590,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
   } else if (U.samplesBefore > 0u) {
     // カメラが動いていないので同じ画素からそのまま引き継ぐ
-    let hc = histRead[o];
+    let hc = select(histRead[o], histWrite[o], U.sppm != 0u);
     prevSum = hc.rgb;
     prevCount = hc.w;
   }

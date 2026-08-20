@@ -42,6 +42,12 @@ struct Uniforms {
   sigmaA: f32,
   fogG: f32,
   fogEnabled: u32,
+  sppm: u32,
+  photonCount: u32,
+  gridCells: u32,
+  cellSize: f32,
+  radius0: f32,
+  photonsEmitted: f32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -78,9 +84,15 @@ fn acesFilm(x: vec3f) -> vec3f {
 fn fsMain(in: VsOut) -> @location(0) vec4f {
   let x = min(u32(in.uv.x * f32(U.width)), U.width - 1u);
   let y = min(u32(in.uv.y * f32(U.height)), U.height - 1u);
-  let c = hist[(y * U.width + x) * 2u];
+  let o = (y * U.width + x) * 4u;
+  let c = hist[o];
   // 再投影で画素ごとにサンプル数が変わるので、一律の除算ではなく画素の値を使う
-  let v = c.rgb / max(c.w, 1.0);
+  var v = c.rgb / max(c.w, 1.0);
+  if (U.sppm != 0u) {
+    // 間接光は「集めたフラックス / (pi r^2 * これまでに撒いた光子数)」
+    let r = max(hist[o + 3u].x, 1e-5);
+    v = v + hist[o + 2u].rgb / (3.14159265 * r * r * max(U.photonsEmitted, 1.0));
+  }
   if (U.debugMode != 0u) {
     // 中間量はそのまま見たいのでトーンマップもガンマも通さない
     return vec4f(clamp(v, vec3f(0.0), vec3f(1.0)), 1.0);
