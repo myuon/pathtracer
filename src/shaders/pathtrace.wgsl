@@ -186,6 +186,11 @@ struct Triangle {
 /// 1 セルに入る光子の上限。あふれた分は捨てる
 const GRID_CAP: u32 = 48u;
 
+/// BVH 走査のスタック段数。中央値分割なので木はほぼ平衡で、
+/// 13.5 万三角形でも深さ 16 程度。スレッドごとの private メモリを
+/// 食うので、余裕を見つつ小さくしておく
+const BVH_STACK: u32 = 24u;
+
 fn gridHash(ix: i32, iy: i32, iz: i32) -> u32 {
   let h = (u32(ix) * 73856093u) ^ (u32(iy) * 19349663u) ^ (u32(iz) * 83492791u);
   return h % U.gridCells;
@@ -463,7 +468,7 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
   }
   let invD = vec3f(1.0) / ray.dir;
 
-  var stack: array<u32, 32>;
+  var stack: array<u32, BVH_STACK>;
   var sp = 0u;
   var node = 0u;
   loop {
@@ -565,7 +570,7 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
     if (descend) {
       // 手前の子から降りると、遠い側を早く枝刈りできる
       let order = childOrder((n.count >> 8u) & 3u, ray.dir, node + 1u, n.leftFirst);
-      if (sp < 32u) {
+      if (sp < BVH_STACK) {
         stack[sp] = order.y;
         sp = sp + 1u;
       }
@@ -591,7 +596,7 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
   }
   let invD = vec3f(1.0) / dir;
 
-  var stack: array<u32, 32>;
+  var stack: array<u32, BVH_STACK>;
   var sp = 0u;
   var node = 0u;
   loop {
@@ -673,7 +678,7 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
     if (descend) {
       // 手前の子から降りると、遠い側を早く枝刈りできる
       let order = childOrder((n.count >> 8u) & 3u, dir, node + 1u, n.leftFirst);
-      if (sp < 32u) {
+      if (sp < BVH_STACK) {
         stack[sp] = order.y;
         sp = sp + 1u;
       }

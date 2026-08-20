@@ -108,8 +108,27 @@ function unionBounds(refs: Ref[], from: number, to: number): [Vec3, Vec3] {
   return [min, max];
 }
 
+/** SAH のビン数 */
+const BINS = 12;
+
+function areaOf(min: Vec3, max: Vec3): number {
+  const d = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+  return 2 * (d[0] * d[1] + d[1] * d[2] + d[2] * d[0]);
+}
+
+function growTo(min: Vec3, max: Vec3, r: Ref) {
+  for (let a = 0; a < 3; a++) {
+    min[a] = Math.min(min[a], r.min[a]);
+    max[a] = Math.max(max[a], r.max[a]);
+  }
+}
+
 /**
- * 中央値分割の BVH。プリミティブ数が少ないおもちゃなので SAH までは行わない。
+ * SAH (surface area heuristic) による BVH。
+ * 中央値分割は「巨大なプリミティブが 1 つ混ざる」ようなシーンで木の品質が
+ * 落ちる。SAH は分割後の表面積とプリミティブ数の積でコストを見積もるので、
+ * そういう場合でも素直な木になる。
+ *
  * refs は再帰の過程で並べ替えられ、葉はその連続範囲を指す。
  */
 function build(refs: Ref[], from: number, to: number, nodes: Node[]): number {
@@ -117,20 +136,114 @@ function build(refs: Ref[], from: number, to: number, nodes: Node[]): number {
   const self = nodes.length;
   nodes.push({ min, max, leftFirst: from, count: to - from });
 
-  if (to - from <= LEAF_SIZE) {
+  const n = to - from;
+  if (n <= LEAF_SIZE) {
     return self;
   }
 
-  // 一番広がっている軸の中央値で二分する
-  const extent: Vec3 = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-  let axis = 0;
-  if (extent[1] > extent[axis]) axis = 1;
-  if (extent[2] > extent[axis]) axis = 2;
+  // 重心の広がりでビンを切る。全部同じ位置なら分けようがない
+  const cmin: Vec3 = [Infinity, Infinity, Infinity];
+  const cmax: Vec3 = [-Infinity, -Infinity, -Infinity];
+  for (let i = from; i < to; i++) {
+    for (let a = 0; a < 3; a++) {
+      cmin[a] = Math.min(cmin[a], refs[i].centroid[a]);
+      cmax[a] = Math.max(cmax[a], refs[i].centroid[a]);
+    }
+  }
 
-  const slice = refs.slice(from, to).sort((a, b) => a.centroid[axis] - b.centroid[axis]);
-  for (let i = 0; i < slice.length; i++) refs[from + i] = slice[i];
+  let bestAxis = -1;
+  let bestCost = Infinity;
+  let bestBin = 0;
+  for (let axis = 0; axis < 3; axis++) {
+    const lo = cmin[axis];
+    const extent = cmax[axis] - lo;
+    if (extent < 1e-12) continue;
+    const scale = BINS / extent;
 
-  const mid = (from + to) >> 1;
+    const counts = new Array<number>(BINS).fill(0);
+    const bmin: Vec3[] = [];
+    const bmax: Vec3[] = [];
+    for (let b = 0; b < BINS; b++) {
+      bmin.push([Infinity, Infinity, Infinity]);
+      bmax.push([-Infinity, -Infinity, -Infinity]);
+    }
+    for (let i = from; i < to; i++) {
+      const b = Math.min(BINS - 1, Math.floor((refs[i].centroid[axis] - lo) * scale));
+      counts[b]++;
+      growTo(bmin[b], bmax[b], refs[i]);
+    }
+
+    // 左右から走査して、各分割位置での「表面積 x 個数」を求める
+    const leftArea = new Array<number>(BINS).fill(0);
+    const leftCount = new Array<number>(BINS).fill(0);
+    const accMin: Vec3 = [Infinity, Infinity, Infinity];
+    const accMax: Vec3 = [-Infinity, -Infinity, -Infinity];
+    let acc = 0;
+    for (let b = 0; b < BINS - 1; b++) {
+      for (let a = 0; a < 3; a++) {
+        accMin[a] = Math.min(accMin[a], bmin[b][a]);
+        accMax[a] = Math.max(accMax[a], bmax[b][a]);
+      }
+      acc += counts[b];
+      leftArea[b] = acc > 0 ? areaOf(accMin, accMax) : 0;
+      leftCount[b] = acc;
+    }
+    const rMin: Vec3 = [Infinity, Infinity, Infinity];
+    const rMax: Vec3 = [-Infinity, -Infinity, -Infinity];
+    let rAcc = 0;
+    for (let b = BINS - 1; b > 0; b--) {
+      for (let a = 0; a < 3; a++) {
+        rMin[a] = Math.min(rMin[a], bmin[b][a]);
+        rMax[a] = Math.max(rMax[a], bmax[b][a]);
+      }
+      rAcc += counts[b];
+      if (leftCount[b - 1] === 0 || rAcc === 0) continue;
+      const cost = leftArea[b - 1] * leftCount[b - 1] + areaOf(rMin, rMax) * rAcc;
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestAxis = axis;
+        bestBin = b;
+      }
+    }
+  }
+
+  // 分割しないほうが安いなら葉にする
+  if (bestAxis < 0 || bestCost >= areaOf(min, max) * n) {
+    if (n <= LEAF_SIZE * 4) {
+      return self;
+    }
+  }
+  const axis = bestAxis < 0 ? 0 : bestAxis;
+
+  let mid = from;
+  if (bestAxis >= 0) {
+    const lo = cmin[axis];
+    const scale = BINS / (cmax[axis] - lo);
+    // ビン境界で in-place に振り分ける
+    let i = from;
+    let j = to - 1;
+    while (i <= j) {
+      const b = Math.min(BINS - 1, Math.floor((refs[i].centroid[axis] - lo) * scale));
+      if (b < bestBin) {
+        i++;
+      } else {
+        const t = refs[i];
+        refs[i] = refs[j];
+        refs[j] = t;
+        j--;
+      }
+    }
+    mid = i;
+  }
+  // 片側が空になったら中央で割る
+  if (mid === from || mid === to) {
+    const slice = refs
+      .slice(from, to)
+      .sort((a, b) => a.centroid[axis] - b.centroid[axis]);
+    for (let k = 0; k < slice.length; k++) refs[from + k] = slice[k];
+    mid = (from + to) >> 1;
+  }
+
   nodes[self].count = axis << 8;
   build(refs, from, mid, nodes);
   // 左の子は自分の直後に置かれるので、右の子だけ番号を控える
