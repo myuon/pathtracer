@@ -106,6 +106,8 @@ export interface FrameParams {
   fog: boolean;
   /** SPPM を使う */
   sppm: boolean;
+  /** 1 反復あたりに撒く光子数の倍率 (1 以下) */
+  photonScale: number;
 }
 
 export class Renderer {
@@ -127,6 +129,7 @@ export class Renderer {
   private sceneRadius = 1;
   private camDistance = 1;
   private photonsEmitted = 0;
+  private photonsThisFrame = PHOTON_COUNT;
   private readonly presentPipeline: GPURenderPipeline;
 
   /** ping-pong する履歴バッファ。1 画素あたり vec4f 2 個 */
@@ -407,7 +410,7 @@ export class Renderer {
       u[65] = 0;
     }
     u[66] = p.sppm ? 1 : 0;
-    u[67] = PHOTON_COUNT;
+    u[67] = this.photonsThisFrame;
     u[68] = GRID_CELLS;
     f[69] = this.radius0;
     f[70] = this.radius0;
@@ -434,6 +437,11 @@ export class Renderer {
     // SPPM は画素ごとの状態を持ち越す必要があるので ping-pong を止める
     const write = sppm ? 0 : this.parity;
     if (sppm && p.samplesBefore === 0) this.photonsEmitted = 0;
+    // 弱いマシンでは光子数を落として 1 フレームの固定費を下げる
+    this.photonsThisFrame = Math.max(
+      4096,
+      Math.round(PHOTON_COUNT * Math.min(1, Math.max(1 / 16, p.photonScale))),
+    );
     this.writeUniforms(q);
 
     const encoder = this.device.createCommandEncoder();
@@ -445,7 +453,7 @@ export class Renderer {
       compute.setPipeline(this.clearGridPipeline);
       compute.dispatchWorkgroups(Math.ceil(GRID_CELLS / 64));
       compute.setPipeline(this.photonPipeline);
-      compute.dispatchWorkgroups(Math.ceil(PHOTON_COUNT / 64));
+      compute.dispatchWorkgroups(Math.ceil(this.photonsThisFrame / 64));
       compute.setPipeline(this.sppmPipeline);
     } else {
       compute.setPipeline(this.computePipeline);
@@ -472,7 +480,7 @@ export class Renderer {
     pass.end();
 
     this.device.queue.submit([encoder.finish()]);
-    if (sppm) this.photonsEmitted += PHOTON_COUNT;
+    if (sppm) this.photonsEmitted += this.photonsThisFrame;
     this.prevCam = p;
     this.parity = sppm ? 0 : 1 - write;
   }

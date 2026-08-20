@@ -70,8 +70,32 @@ async function main() {
   let fpsEma = 0;
   let lastTime = performance.now();
 
+  // 目標とする GPU 時間 (ms)。操作中は応答性、収束中は処理量を優先する。
+  // 収束中に細かく刻むと 1 フレームの固定費ばかり払うことになって逆に遅い
+  const TARGET_FAST = 16;
+  const TARGET_CONVERGED = 100;
+  /** 前フレームの GPU がまだ終わっていないか。終わるまで次を投入しない */
+  let gpuBusy = false;
+  /** 直近の GPU フレーム時間 (ms)。操作中と収束中で別に持つ */
+  let gpuMsFast = 0;
+  let gpuMsSlow = 0;
+  /** 操作中の解像度スケールの自動調整 (ユーザー設定に掛ける) */
+  let autoResScale = 1;
+  /** 自動調整した spp/frame */
+  let autoSpp = 1;
+  /**
+   * 光子数の倍率。SPPM は spp に依存しない固定費 (光子を撒く処理) が
+   * 支配的なので、spp を削っても効かない。こちらが本命の調整先
+   */
+  let photonScale = 1;
+
   const frame = () => {
     requestAnimationFrame(frame);
+    // 投入しすぎるとキューが積み上がって操作に反応しなくなる。
+    // 弱いマシンほどここで効く
+    if (gpuBusy) {
+      return;
+    }
     resizeCanvas();
 
     const now = performance.now();
@@ -82,7 +106,19 @@ async function main() {
     const settling = !interacting && now < settleAt;
     const fast = interacting || settling;
 
-    const scale = fast ? ui.settings.interactiveScale : ui.settings.resolutionScale;
+    // 操作中が重ければ解像度を落とす。収束中の解像度には触らない
+    if (ui.settings.adaptive && fast && gpuMsFast > 0) {
+      if (gpuMsFast > TARGET_FAST * 1.3) {
+        autoResScale = Math.max(0.25, autoResScale * 0.8);
+      } else if (gpuMsFast < TARGET_FAST * 0.5) {
+        autoResScale = Math.min(1, autoResScale * 1.1);
+      }
+    } else if (!ui.settings.adaptive) {
+      autoResScale = 1;
+    }
+    const scale = fast
+      ? ui.settings.interactiveScale * autoResScale
+      : ui.settings.resolutionScale;
     let width = Math.max(1, Math.round(canvasW * scale));
     let height = Math.max(1, Math.round(canvasH * scale));
     if (width * height > maxPixels) {
@@ -110,7 +146,33 @@ async function main() {
     }
     camera.dirty = false;
 
-    const spp = fast ? 1 : ui.settings.sppPerFrame;
+    // 収束中は目標が緩い。1 フレームが長くなりすぎない範囲で処理量を稼ぐ
+    if (ui.settings.adaptive && gpuMsSlow > 0) {
+      // 削る順番が肝心。SPPM では光子を撒く処理が spp に依存しない固定費
+      // として支配的なので、spp から削ると時間が減らないまま収束だけ遅くなる
+      const photonsFirst = ui.settings.sppm;
+      if (gpuMsSlow > TARGET_CONVERGED * 1.2) {
+        if (photonsFirst && photonScale > 1 / 16) {
+          photonScale = Math.max(1 / 16, photonScale / 2);
+        } else if (autoSpp > 1) {
+          autoSpp = Math.max(1, autoSpp >> 1);
+        } else {
+          photonScale = Math.max(1 / 16, photonScale / 2);
+        }
+      } else if (gpuMsSlow < TARGET_CONVERGED * 0.85) {
+        // 減らしても時間が変わらない場合に下がったまま戻れなくならないよう、
+        // 戻す側の閾値は緩めに取る
+        if (autoSpp < ui.settings.sppPerFrame) {
+          autoSpp = autoSpp + 1;
+        } else {
+          photonScale = Math.min(1, photonScale * 2);
+        }
+      }
+    } else {
+      autoSpp = ui.settings.sppPerFrame;
+      photonScale = 1;
+    }
+    const spp = fast ? 1 : autoSpp;
     const maxBounces = fast ? ui.settings.interactiveBounces : ui.settings.maxBounces;
     const b = camera.basis();
 
@@ -137,6 +199,20 @@ async function main() {
       fixedSeed: ui.settings.fixedSeed,
       fog: ui.settings.fog,
       sppm: ui.settings.sppm,
+      photonScale,
+    });
+
+    // GPU が終わるまで次を投入しない。ついでに 1 spp あたりの時間を測る
+    gpuBusy = true;
+    const submitted = performance.now();
+    void gpu.device.queue.onSubmittedWorkDone().then(() => {
+      const ms = performance.now() - submitted;
+      if (fast) {
+        gpuMsFast = gpuMsFast === 0 ? ms : gpuMsFast * 0.7 + ms * 0.3;
+      } else {
+        gpuMsSlow = gpuMsSlow === 0 ? ms : gpuMsSlow * 0.7 + ms * 0.3;
+      }
+      gpuBusy = false;
     });
 
     samples += spp;
@@ -144,7 +220,9 @@ async function main() {
 
     ui.setStatus(
       `${width}x${height} / ${samples} spp / ${fpsEma.toFixed(0)} fps` +
-        (fast ? " / interactive" : ""),
+        (fast ? " / interactive" : ` / ${spp} spp per frame`) +
+        ` / ${(fast ? gpuMsFast : gpuMsSlow).toFixed(0)} ms` +
+        (photonScale < 1 ? ` / photons 1/${Math.round(1 / photonScale)}` : ""),
     );
   };
 

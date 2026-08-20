@@ -31,6 +31,8 @@ export interface RenderSettings {
   fog: boolean;
   /** SPPM を使う */
   sppm: boolean;
+  /** 1 フレームの GPU 時間が目標に収まるよう spp を自動調整する */
+  adaptive: boolean;
 }
 
 export interface UiOptions {
@@ -356,6 +358,7 @@ export function createUi(options: UiOptions): UiHandle {
     fixedSeed: false,
     fog: true,
     sppm: false,
+    adaptive: true,
   };
 
   const panel = document.createElement("div");
@@ -565,6 +568,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const adaptiveRow = createToggleRow({
+    label: "adaptive spp",
+    value: settings.adaptive,
+    onChange: (v) => {
+      settings.adaptive = v;
+      notifyChange();
+    },
+  });
+
   const fixedSeedRow = createToggleRow({
     label: "fixed seed",
     value: settings.fixedSeed,
@@ -597,6 +609,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(reprojectRow);
   body.appendChild(fogRow);
   body.appendChild(sppmRow);
+  body.appendChild(adaptiveRow);
   body.appendChild(fixedSeedRow);
   body.appendChild(debugRow);
   body.appendChild(resetButton);
