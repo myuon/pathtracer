@@ -32,9 +32,18 @@ export const ggx = (albedo: Vec3, roughness: number): Material => ({
   albedo,
   roughness,
 });
-export const dielectric = (ior = 1.5): Material => ({
+/**
+ * 誘電体。roughness を上げるとすりガラスになる。
+ * albedo は「1 単位距離あたりの透過色」として距離依存の吸収に使う
+ */
+export const dielectric = (
+  ior = 1.5,
+  roughness = 0,
+  transmittance: Vec3 = [1, 1, 1],
+): Material => ({
   kind: MATERIAL.dielectric,
-  albedo: [1, 1, 1],
+  albedo: transmittance,
+  roughness,
   ior,
 });
 export const emissive = (emission: Vec3): Material => ({
@@ -448,6 +457,53 @@ function buildMeshScene(): Scene {
   };
 }
 
+
+/** すりガラスと色ガラスの確認用。粗さを 0 から段階的に上げた球を並べる */
+function buildGlassScene(): Scene {
+  const stripe = (i: number, color: Vec3): Quad => ({
+    q: [-6.6 + i * 2.2, 0, 3.2],
+    u: [2.2, 0, 0],
+    v: [0, 3.6, 0],
+    material: lambert(color),
+  });
+
+  const balls: { x: number; mat: Material }[] = [
+    { x: -4.75, mat: dielectric(1.5, 0) },
+    { x: -2.85, mat: dielectric(1.5, 0.12) },
+    { x: -0.95, mat: dielectric(1.5, 0.25) },
+    { x: 0.95, mat: dielectric(1.5, 0.45) },
+    // 色ガラス (距離依存の吸収)
+    { x: 2.85, mat: dielectric(1.5, 0, [0.62, 0.34, 0.12]) },
+    { x: 4.75, mat: dielectric(1.5, 0.08, [0.28, 0.72, 0.45]) },
+  ];
+
+  return {
+    spheres: balls.map((b) => ({
+      center: [b.x, 0.85, 0] as Vec3,
+      radius: 0.85,
+      material: b.mat,
+    })),
+    quads: [
+      { q: [-14, 0, -12], u: [28, 0, 0], v: [0, 0, 24], material: lambert([0.5, 0.5, 0.53]) },
+      // 屈折のぼけ具合が分かるよう、後ろに色の帯を置く
+      ...[
+        [0.85, 0.2, 0.2], [0.9, 0.6, 0.15], [0.85, 0.85, 0.2],
+        [0.2, 0.7, 0.3], [0.2, 0.5, 0.85], [0.55, 0.3, 0.8],
+      ].map((c, i) => stripe(i, c as Vec3)),
+    ],
+    triangles: [],
+    env: ENV.hdri,
+    camera: {
+      target: [0, 0.95, 0.6],
+      distance: 12.5,
+      yaw: -Math.PI * 0.5,
+      pitch: 0.1,
+      fovDeg: 40,
+      aperture: 0,
+    },
+  };
+}
+
 export interface SceneEntry {
   id: string;
   name: string;
@@ -459,6 +515,7 @@ export const SCENES: SceneEntry[] = [
   { id: "cornell", name: "cornell box", build: buildCornellScene },
   { id: "veach", name: "veach MIS test", build: buildVeachScene },
   { id: "mesh", name: "torus knot (mesh)", build: buildMeshScene },
+  { id: "glass", name: "rough / colored glass", build: buildGlassScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;

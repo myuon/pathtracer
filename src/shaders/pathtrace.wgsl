@@ -863,17 +863,50 @@ fn scatter(
   }
 
   // MAT_DIELECTRIC
-  let ratio = select(m.ior, 1.0 / m.ior, hit.frontFace);
-  let cosTheta = min(dot(-ray.dir, hit.normal), 1.0);
-  let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-  var dir: vec3f;
-  if (ratio * sinTheta > 1.0 || schlick(cosTheta, ratio) > rand()) {
-    dir = reflect(ray.dir, hit.normal);
-  } else {
-    dir = refract(ray.dir, hit.normal, ratio);
+  let eta = select(m.ior, 1.0 / m.ior, hit.frontFace);  // ni / nt
+  let a = ggxAlpha(m.roughness);
+
+  // 粗さがあればマイクロファセット法線を引く。0 なら幾何法線そのままで完全鏡面
+  var h = hit.normal;
+  if (m.roughness > 0.0) {
+    let basis = onb(hit.normal);
+    let vv = -ray.dir;
+    let vl = vec3f(dot(vv, basis[0]), dot(vv, basis[1]), dot(vv, basis[2]));
+    if (vl.z <= 0.0) {
+      return false;
+    }
+    h = basis * sampleGgxVndf(vl, a, u.x, u.y);
   }
-  *attenuation = m.albedo;
-  *scattered = Ray(hit.p + sign(dot(dir, hit.normal)) * hit.normal * 1e-4, normalize(dir));
+
+  let cosVH = min(dot(-ray.dir, h), 1.0);
+  let sin2 = eta * eta * max(0.0, 1.0 - cosVH * cosVH);
+  var dir: vec3f;
+  if (sin2 > 1.0 || schlick(cosVH, eta) > rand()) {
+    dir = reflect(ray.dir, h);
+    if (dot(dir, hit.normal) <= 0.0) {
+      // マイクロファセットの裏に回った分は捨てる
+      return false;
+    }
+  } else {
+    dir = refract(ray.dir, h, eta);
+    if (dot(dir, hit.normal) >= 0.0) {
+      return false;
+    }
+  }
+  dir = normalize(dir);
+
+  // Fresnel は反射/屈折の確率的な選択で消化済みなので、残る重みは G2 / G1(v) = G1(l)
+  var weight = vec3f(1.0);
+  if (m.roughness > 0.0) {
+    weight = vec3f(ggxG1(abs(dot(hit.normal, dir)), a));
+  }
+  // 内側から当たったなら、その区間ぶんだけ媒質を通ってきている (Beer-Lambert)
+  if (!hit.frontFace) {
+    weight = weight * pow(max(m.albedo, vec3f(1e-4)), vec3f(hit.t));
+  }
+
+  *attenuation = weight;
+  *scattered = Ray(hit.p + sign(dot(dir, hit.normal)) * hit.normal * 1e-4, dir);
   return true;
 }
 
