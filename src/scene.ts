@@ -773,6 +773,107 @@ function buildMazeScene(): Scene {
   };
 }
 
+
+/** 水面の高さ。低い周波数を数本重ねただけの簡単な波 */
+function waveHeight(x: number, z: number, amp: number): number {
+  return (
+    amp *
+    (Math.sin(6.1 * x + 1.3) * Math.cos(5.3 * z) +
+      0.6 * Math.sin(9.7 * z + 2.1) * Math.cos(8.3 * x) +
+      0.35 * Math.sin(15.1 * (x * 0.7 + z * 0.7) + 0.7))
+  );
+}
+
+/** 波打つ水面をハイトフィールドのメッシュにする。法線は差分から求める */
+function waterSurface(
+  x0: number,
+  z0: number,
+  size: number,
+  level: number,
+  amp: number,
+  n: number,
+  material: Material,
+): Triangle[] {
+  const norm = (v: Vec3): Vec3 => {
+    const l = Math.hypot(v[0], v[1], v[2]) || 1;
+    return [v[0] / l, v[1] / l, v[2] / l];
+  };
+  const E = 1e-3;
+  const pos: Vec3[][] = [];
+  const nrm: Vec3[][] = [];
+  for (let i = 0; i <= n; i++) {
+    const px: Vec3[] = [];
+    const nx: Vec3[] = [];
+    for (let j = 0; j <= n; j++) {
+      const x = x0 + (i / n) * size;
+      const z = z0 + (j / n) * size;
+      px.push([x, level + waveHeight(x, z, amp), z]);
+      // 上向きの法線 (-dh/dx, 1, -dh/dz)
+      const hx = (waveHeight(x + E, z, amp) - waveHeight(x - E, z, amp)) / (2 * E);
+      const hz = (waveHeight(x, z + E, amp) - waveHeight(x, z - E, amp)) / (2 * E);
+      nx.push(norm([-hx, 1, -hz]));
+    }
+    pos.push(px);
+    nrm.push(nx);
+  }
+
+  const tris: Triangle[] = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const a = { p: pos[i][j], n: nrm[i][j] };
+      const b = { p: pos[i + 1][j], n: nrm[i + 1][j] };
+      const c = { p: pos[i + 1][j + 1], n: nrm[i + 1][j + 1] };
+      const d = { p: pos[i][j + 1], n: nrm[i][j + 1] };
+      tris.push({ v0: a.p, v1: b.p, v2: c.p, n0: a.n, n1: b.n, n2: c.n, material });
+      tris.push({ v0: a.p, v1: c.p, v2: d.p, n0: a.n, n1: c.n, n2: d.n, material });
+    }
+  }
+  return tris;
+}
+
+/**
+ * Cornell box に水を張ったシーン。天井の光源が波打つ水面で屈折し、
+ * プールの底に集光模様を作る。単方向パストレーシングでは届かない
+ * 経路なので、SPPM の効きどころがそのまま見える。
+ */
+function buildWaterScene(): Scene {
+  const S = 5.55;
+  const white = lambert([0.76, 0.75, 0.72]);
+  const red = lambert([0.65, 0.05, 0.05]);
+  const green = lambert([0.12, 0.45, 0.15]);
+  // わずかに青緑がかった水。1 単位距離あたりの透過色
+  const water = dielectric(1.33, 0, [0.72, 0.9, 0.86]);
+
+  return {
+    spheres: [],
+    quads: [
+      { q: [S, 0, 0], u: [0, S, 0], v: [0, 0, S], material: green },
+      { q: [0, 0, 0], u: [0, S, 0], v: [0, 0, S], material: red },
+      { q: [0, 0, 0], u: [S, 0, 0], v: [0, 0, S], material: white },
+      { q: [S, S, S], u: [-S, 0, 0], v: [0, 0, -S], material: white },
+      { q: [0, 0, S], u: [S, 0, 0], v: [0, S, 0], material: white },
+      // 集光を鋭くしたいので光源は小さめ
+      {
+        q: [3.15, S - 0.01, 3.1],
+        u: [-0.75, 0, 0],
+        v: [0, 0, -0.65],
+        material: emissive([95, 90, 78]),
+      },
+    ],
+    // 波打つ縁が見えないよう、水面は壁の外まで伸ばす
+    triangles: waterSurface(-0.2, -0.2, S + 0.4, 1.15, 0.032, 210, water),
+    env: ENV.black,
+    camera: {
+      target: [S / 2, 1.5, S / 2],
+      distance: 9.6,
+      yaw: -Math.PI * 0.5,
+      pitch: 0.3,
+      fovDeg: 42,
+      aperture: 0,
+    },
+  };
+}
+
 export interface SceneEntry {
   id: string;
   name: string;
@@ -789,6 +890,7 @@ export const SCENES: SceneEntry[] = [
   { id: "indirect", name: "indirect only (hard)", build: buildIndirectScene },
   { id: "enclosed", name: "enclosed light (brutal)", build: buildEnclosedScene },
   { id: "maze", name: "baffle maze (BDPT test)", build: buildMazeScene },
+  { id: "water", name: "water caustics", build: buildWaterScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;
