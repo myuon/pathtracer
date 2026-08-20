@@ -874,6 +874,52 @@ function buildWaterScene(): Scene {
   };
 }
 
+
+/**
+ * 部屋ごと水没した Cornell box。水面は天井のすぐ下にあり、箱も床も水中。
+ * 天井の光源が波打つ水面で屈折して、床だけでなく左右の壁や箱にまで
+ * 集光が回る。水面を下から見ると臨界角の外は全反射して鏡のようになる。
+ */
+function buildSubmergedScene(): Scene {
+  const S = 5.55;
+  const white = lambert([0.76, 0.75, 0.72]);
+  const red = lambert([0.65, 0.05, 0.05]);
+  const green = lambert([0.12, 0.45, 0.15]);
+  const water = dielectric(1.33, 0, [0.86, 0.95, 0.93]);
+
+  return {
+    spheres: [],
+    quads: [
+      { q: [S, 0, 0], u: [0, S, 0], v: [0, 0, S], material: green },
+      { q: [0, 0, 0], u: [0, S, 0], v: [0, 0, S], material: red },
+      { q: [0, 0, 0], u: [S, 0, 0], v: [0, 0, S], material: white },
+      { q: [S, S, S], u: [-S, 0, 0], v: [0, 0, -S], material: white },
+      { q: [0, 0, S], u: [S, 0, 0], v: [0, S, 0], material: white },
+      // 水面より上にある光源。小さめにして集光を鋭くする
+      {
+        q: [2.95, S - 0.01, 2.95],
+        u: [-0.36, 0, 0],
+        v: [0, 0, -0.3],
+        material: emissive([760, 720, 620]),
+      },
+      // 沈んでいる 2 つの箱
+      ...place(box([0, 0, 0], [1.65, 3.3, 1.65], white), 15, [2.65, 0, 2.95]),
+      ...place(box([0, 0, 0], [1.65, 1.65, 1.65], white), -18, [1.3, 0, 0.65]),
+    ],
+    // 水面は天井のすぐ下。壁の外まで伸ばして縁を隠す
+    triangles: waterSurface(-0.25, -0.25, S + 0.5, 4.35, 0.072, 220, water),
+    env: ENV.black,
+    camera: {
+      target: [S / 2, 2.4, S / 2],
+      distance: 10.2,
+      yaw: -Math.PI * 0.5,
+      pitch: 0.07,
+      fovDeg: 44,
+      aperture: 0,
+    },
+  };
+}
+
 export interface SceneEntry {
   id: string;
   name: string;
@@ -891,6 +937,7 @@ export const SCENES: SceneEntry[] = [
   { id: "enclosed", name: "enclosed light (brutal)", build: buildEnclosedScene },
   { id: "maze", name: "baffle maze (BDPT test)", build: buildMazeScene },
   { id: "water", name: "water caustics", build: buildWaterScene },
+  { id: "submerged", name: "submerged cornell", build: buildSubmergedScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;
