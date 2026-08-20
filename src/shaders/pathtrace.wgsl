@@ -38,6 +38,10 @@ struct Uniforms {
   reproject: u32,
   prevCamW: vec3f,
   _pad: u32,
+  /// 0 なら通常描画、それ以外は中間量を疑似カラーで出す
+  debugMode: u32,
+  /// 乱数の種をフレーム番号ではなく累積サンプル数から作る (A/B を再現可能にする)
+  fixedSeed: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -741,7 +745,7 @@ fn misWeight(pA: f32, pB: f32) -> f32 {
 
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
 /// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
-fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f) -> vec3f {
+fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f, misOut: ptr<function, f32>) -> vec3f {
   let n = lightSelectCount();
   if (n == 0u) {
     return vec3f(0.0);
@@ -767,6 +771,7 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f) -> vec3f {
     if (U.mis != 0u) {
       w = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
     }
+    *misOut = w;
     return envColor(wi) * fcos * w / pL;
   }
 
@@ -801,6 +806,7 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f) -> vec3f {
   if (U.mis != 0u) {
     weight = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
   }
+  *misOut = weight;
   return light.mat.emission * fcos * weight / pL;
 }
 
@@ -871,8 +877,42 @@ fn scatter(
   return true;
 }
 
+// ---------------------------------------------------------------- デバッグ
+/// 1 次交差まわりの中間量。debugMode が 0 でなければこれを画に出す
+struct Aov {
+  normal: vec3f,
+  albedo: vec3f,
+  dist: f32,
+  bsdfPdf: f32,
+  misWeight: f32,
+  bounces: f32,
+};
+
+fn aovColor(a: Aov) -> vec3f {
+  if (U.debugMode == 1u) {
+    return a.normal * 0.5 + vec3f(0.5);
+  }
+  if (U.debugMode == 2u) {
+    return a.albedo;
+  }
+  if (U.debugMode == 3u) {
+    // 単調に [0,1) へ潰すだけ。絶対値ではなく分布を見るためのもの
+    return vec3f(a.dist / (a.dist + 8.0));
+  }
+  if (U.debugMode == 4u) {
+    return vec3f(a.bsdfPdf / (a.bsdfPdf + 1.0));
+  }
+  if (U.debugMode == 5u) {
+    return vec3f(a.misWeight);
+  }
+  if (U.debugMode == 6u) {
+    return vec3f(a.bounces / max(f32(U.maxBounces), 1.0));
+  }
+  return vec3f(0.0);
+}
+
 // ---------------------------------------------------------------- trace
-fn trace(primary: Ray, firstHit: ptr<function, vec4f>) -> vec3f {
+fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) -> vec3f {
   var ray = primary;
   var throughput = vec3f(1.0);
   var radiance = vec3f(0.0);
@@ -899,7 +939,11 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>) -> vec3f {
     }
     if (depth == 0u) {
       *firstHit = vec4f(hit.p, 1.0);
+      (*aov).normal = hit.normal;
+      (*aov).albedo = hit.mat.albedo;
+      (*aov).dist = hit.t;
     }
+    (*aov).bounces = f32(depth + 1u);
 
     // 光源に当たったときの放射。NEE と重複するぶんを MIS 重みで削る
     var weight = 1.0;
@@ -918,7 +962,12 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>) -> vec3f {
 
     // pdf を評価できる面だけ光源を直接サンプルする。デルタ面は BSDF サンプリングに任せる
     if (useNee && isDiffuseLike(hit.mat.kind)) {
-      radiance = radiance + throughput * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH));
+      var mw = 1.0;
+      radiance = radiance + throughput
+        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
+      if (depth == 0u) {
+        (*aov).misWeight = mw;
+      }
     }
 
     var attenuation: vec3f;
@@ -932,6 +981,9 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>) -> vec3f {
       bsdfPdf = max(bsdfPdfFor(hit, ray.dir, scattered.dir), 1e-5);
     } else {
       bsdfPdf = -1.0;
+    }
+    if (depth == 0u) {
+      (*aov).bsdfPdf = max(bsdfPdf, 0.0);
     }
     throughput = throughput * attenuation;
     ray = scattered;
@@ -954,7 +1006,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     return;
   }
   let pixel = gid.y * U.width + gid.x;
-  rngState = pcg(pixel * 9781u + U.frameIndex * 6271u + 1u);
+  // 固定 seed では累積サンプル数から種を作るので、同条件なら毎回同じ絵になる
+  let seedBase = select(U.frameIndex, U.samplesBefore, U.fixedSeed != 0u);
+  rngState = pcg(pixel * 9781u + seedBase * 6271u + 1u);
   pixelSeed = pcg(pixel * 26699u + 1u);
 
   var sum = vec3f(0.0);
@@ -966,7 +1020,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let px = (f32(gid.x) + jitter.x) / f32(U.width) * 2.0 - 1.0;
     let py = 1.0 - (f32(gid.y) + jitter.y) / f32(U.height) * 2.0;
     var fh = vec4f(0.0);
-    sum = sum + trace(makeRay(px, py, sample2d(1u, true)), &fh);
+    var aov = Aov(vec3f(0.0), vec3f(0.0), 0.0, 0.0, 0.0, 0.0);
+    let radiance = trace(makeRay(px, py, sample2d(1u, true)), &fh, &aov);
+    if (U.debugMode == 0u) {
+      sum = sum + radiance;
+    } else {
+      sum = sum + aovColor(aov);
+    }
     if (s == 0u) {
       firstHit = fh;
     }

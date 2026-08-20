@@ -23,6 +23,10 @@ export interface RenderSettings {
   envIs: boolean;
   /** 操作中に累積を再投影して引き継ぐ */
   reproject: boolean;
+  /** 0 なら通常描画、それ以外は中間量を疑似カラーで出す */
+  debugMode: number;
+  /** 乱数の種を累積サンプル数から作り、同条件を再現可能にする */
+  fixedSeed: boolean;
 }
 
 export interface UiOptions {
@@ -44,6 +48,17 @@ export interface UiHandle {
   /** カメラ側を書き換えたあと、スライダーの表示を追従させる */
   syncCamera: () => void;
 }
+
+/** デバッグ表示。WGSL 側の aovColor と一致させること */
+const DEBUG_MODES = [
+  { id: "0", name: "off (通常描画)" },
+  { id: "1", name: "normal" },
+  { id: "2", name: "albedo" },
+  { id: "3", name: "distance" },
+  { id: "4", name: "bsdf pdf" },
+  { id: "5", name: "MIS weight" },
+  { id: "6", name: "bounces" },
+];
 
 /** 解像度スケール系スライダーで選べる離散値 */
 const RESOLUTION_SCALES = [0.25, 0.33, 0.5, 0.75, 1];
@@ -333,6 +348,8 @@ export function createUi(options: UiOptions): UiHandle {
     qmc: true,
     envIs: true,
     reproject: true,
+    debugMode: 0,
+    fixedSeed: false,
   };
 
   const panel = document.createElement("div");
@@ -514,6 +531,25 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const debugRow = createSelectRow({
+    label: "debug view",
+    items: DEBUG_MODES,
+    value: String(settings.debugMode),
+    onChange: (id) => {
+      settings.debugMode = Number(id);
+      notifyChange();
+    },
+  });
+
+  const fixedSeedRow = createToggleRow({
+    label: "fixed seed",
+    value: settings.fixedSeed,
+    onChange: (v) => {
+      settings.fixedSeed = v;
+      notifyChange();
+    },
+  });
+
   const resetButton = document.createElement("button");
   resetButton.type = "button";
   resetButton.className = "pt-reset";
@@ -535,6 +571,8 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(qmcRow);
   body.appendChild(envIsRow);
   body.appendChild(reprojectRow);
+  body.appendChild(fixedSeedRow);
+  body.appendChild(debugRow);
   body.appendChild(resetButton);
 
   const status = document.createElement("div");

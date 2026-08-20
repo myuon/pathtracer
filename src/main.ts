@@ -133,6 +133,8 @@ async function main() {
       qmc: ui.settings.qmc,
       envIs: ui.settings.envIs,
       reproject,
+      debugMode: ui.settings.debugMode,
+      fixedSeed: ui.settings.fixedSeed,
     });
 
     samples += spp;

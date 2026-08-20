@@ -34,6 +34,8 @@ struct Uniforms {
   reproject: u32,
   prevCamW: vec3f,
   _pad: u32,
+  debugMode: u32,
+  fixedSeed: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -72,6 +74,10 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
   let y = min(u32(in.uv.y * f32(U.height)), U.height - 1u);
   let c = hist[(y * U.width + x) * 2u];
   // 再投影で画素ごとにサンプル数が変わるので、一律の除算ではなく画素の値を使う
-  let color = acesFilm(c.rgb / max(c.w, 1.0));
-  return vec4f(pow(color, vec3f(1.0 / 2.2)), 1.0);
+  let v = c.rgb / max(c.w, 1.0);
+  if (U.debugMode != 0u) {
+    // 中間量はそのまま見たいのでトーンマップもガンマも通さない
+    return vec4f(clamp(v, vec3f(0.0), vec3f(1.0)), 1.0);
+  }
+  return vec4f(pow(acesFilm(v), vec3f(1.0 / 2.2)), 1.0);
 }

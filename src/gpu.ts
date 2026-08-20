@@ -51,7 +51,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 208;
+const UNIFORM_SIZE = 224;
 
 /**
  * 履歴バッファの 1 画素あたりのバイト数。
@@ -86,6 +86,10 @@ export interface FrameParams {
   envIs: boolean;
   /** 累積を前フレームから再投影して引き継ぐ */
   reproject: boolean;
+  /** 0 なら通常描画、それ以外は中間量を疑似カラーで出す */
+  debugMode: number;
+  /** 乱数の種を累積サンプル数から作り、同条件を再現可能にする */
+  fixedSeed: boolean;
 }
 
 export class Renderer {
@@ -309,6 +313,8 @@ export class Renderer {
     f.set(q.camV, 44);
     u[47] = p.reproject && this.prevCam ? 1 : 0;
     f.set(q.camW, 48);
+    u[52] = p.debugMode;
+    u[53] = p.fixedSeed ? 1 : 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
