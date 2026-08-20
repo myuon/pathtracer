@@ -42,6 +42,16 @@ struct Uniforms {
   debugMode: u32,
   /// 乱数の種をフレーム番号ではなく累積サンプル数から作る (A/B を再現可能にする)
   fixedSeed: u32,
+  /// 霧の入っている軸並行な箱
+  fogMin: vec3f,
+  /// 散乱係数
+  sigmaS: f32,
+  fogMax: vec3f,
+  /// 吸収係数
+  sigmaA: f32,
+  /// Henyey-Greenstein の非対称パラメータ (正で前方散乱)
+  fogG: f32,
+  fogEnabled: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -58,6 +68,8 @@ const MAT_LAMBERT: u32 = 0u;
 const MAT_GGX: u32 = 1u;
 const MAT_DIELECTRIC: u32 = 2u;
 const MAT_EMISSIVE: u32 = 3u;
+/// 媒質内の散乱点。表面ではないが、位相関数を BSDF と同じ枠で扱えるようにする
+const MAT_PHASE: u32 = 4u;
 
 const ENV_SKY: u32 = 0u;
 const ENV_BLACK: u32 = 1u;
@@ -622,6 +634,61 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
   return false;
 }
 
+// ---------------------------------------------------------------- 参加媒質
+fn fogActive() -> bool {
+  return U.fogEnabled != 0u;
+}
+
+fn sigmaT() -> f32 {
+  return U.sigmaS + U.sigmaA;
+}
+
+/// レイと霧の箱が重なる区間 [t0, t1]。重なりがなければ y <= x になる
+fn fogRange(origin: vec3f, dir: vec3f, tMax: f32) -> vec2f {
+  let invD = vec3f(1.0) / dir;
+  let a = (U.fogMin - origin) * invD;
+  let b = (U.fogMax - origin) * invD;
+  let lo = min(a, b);
+  let hi = max(a, b);
+  return vec2f(
+    max(max(lo.x, lo.y), max(lo.z, 0.0)),
+    min(min(hi.x, hi.y), min(hi.z, tMax)),
+  );
+}
+
+/// その区間を通り抜ける透過率。影レイの減衰に使う
+fn fogTransmittance(origin: vec3f, dir: vec3f, tMax: f32) -> f32 {
+  if (!fogActive()) {
+    return 1.0;
+  }
+  let r = fogRange(origin, dir, tMax);
+  if (r.y <= r.x) {
+    return 1.0;
+  }
+  return exp(-sigmaT() * (r.y - r.x));
+}
+
+/// Henyey-Greenstein 位相関数。cosT は進行方向と出射方向の内積
+fn hgPhase(cosT: f32, g: f32) -> f32 {
+  let d = max(1.0 + g * g - 2.0 * g * cosT, 1e-6);
+  return (1.0 - g * g) / (4.0 * PI * d * sqrt(d));
+}
+
+/// hgPhase に対応する逆関数サンプリング。dir は進行方向
+fn sampleHg(dir: vec3f, g: f32, u: vec2f) -> vec3f {
+  var cosT: f32;
+  if (abs(g) < 1e-3) {
+    cosT = 1.0 - 2.0 * u.x;
+  } else {
+    let sq = (1.0 - g * g) / (1.0 - g + 2.0 * g * u.x);
+    cosT = (1.0 + g * g - sq * sq) / (2.0 * g);
+  }
+  cosT = clamp(cosT, -1.0, 1.0);
+  let sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+  let phi = 2.0 * PI * u.y;
+  return normalize(onb(dir) * vec3f(sinT * cos(phi), sinT * sin(phi), cosT));
+}
+
 // ---------------------------------------------------------------- BSDF
 /// n を z 軸とする正規直交基底 (Duff et al. の分岐なし版)
 fn onb(n: vec3f) -> mat3x3f {
@@ -682,11 +749,15 @@ fn sampleGgxVndf(ve: vec3f, a: f32, u1: f32, u2: f32) -> vec3f {
 /// 光源サンプリングできるのは pdf を評価できるマテリアルだけ。
 /// dielectric はデルタ分布なので対象外
 fn isDiffuseLike(kind: u32) -> bool {
-  return kind == MAT_LAMBERT || kind == MAT_GGX;
+  return kind == MAT_LAMBERT || kind == MAT_GGX || kind == MAT_PHASE;
 }
 
 /// BRDF * cos(theta_i)。デルタ分布のマテリアルでは 0 を返す
 fn bsdfEval(hit: Hit, rayDir: vec3f, wi: vec3f) -> vec3f {
+  if (hit.mat.kind == MAT_PHASE) {
+    // 媒質にはコサイン項がないので位相関数そのもの
+    return vec3f(hgPhase(dot(rayDir, wi), U.fogG));
+  }
   let cosI = dot(hit.normal, wi);
   if (cosI <= 0.0) {
     return vec3f(0.0);
@@ -712,6 +783,9 @@ fn bsdfEval(hit: Hit, rayDir: vec3f, wi: vec3f) -> vec3f {
 
 /// bsdfEval と同じ方向に対する立体角 pdf
 fn bsdfPdfFor(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
+  if (hit.mat.kind == MAT_PHASE) {
+    return hgPhase(dot(rayDir, wi), U.fogG);
+  }
   let cosI = dot(hit.normal, wi);
   if (cosI <= 0.0) {
     return 0.0;
@@ -767,12 +841,13 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f, misOut: ptr<function, f3
     if (occluded(hit.p + hit.normal * 1e-4, wi, 1e30)) {
       return vec3f(0.0);
     }
+    let tr = fogTransmittance(hit.p, wi, 1e30);
     var w = 1.0;
     if (U.mis != 0u) {
       w = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
     }
     *misOut = w;
-    return envColor(wi) * fcos * w / pL;
+    return envColor(wi) * fcos * tr * w / pL;
   }
 
   let light = quads[indices[pick]];
@@ -797,6 +872,7 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f, misOut: ptr<function, f3
   if (occluded(hit.p + hit.normal * 1e-4, wi, dist - 1e-3)) {
     return vec3f(0.0);
   }
+  let trq = fogTransmittance(hit.p, wi, dist);
 
   // 面積についての pdf 1 / (lightCount * area) を立体角に変換したもの
   let pL = dist2 / (cosLight * area * f32(n));
@@ -807,7 +883,7 @@ fn sampleDirectLight(hit: Hit, rayDir: vec3f, u: vec2f, misOut: ptr<function, f3
     weight = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
   }
   *misOut = weight;
-  return light.mat.emission * fcos * weight / pL;
+  return light.mat.emission * fcos * trq * weight / pL;
 }
 
 // ---------------------------------------------------------------- material
@@ -837,6 +913,14 @@ fn scatter(
     let dir = normalize(onb(hit.normal) * cosineHemisphere(u));
     *attenuation = m.albedo;
     *scattered = Ray(hit.p + hit.normal * 1e-4, dir);
+    return true;
+  }
+
+  if (m.kind == MAT_PHASE) {
+    let dir = sampleHg(ray.dir, U.fogG, u);
+    // 位相関数からサンプルしているので f / pdf = 1
+    *attenuation = vec3f(1.0);
+    *scattered = Ray(hit.p, dir);
     return true;
   }
 
@@ -957,7 +1041,55 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
-    if (!hitScene(ray, 1e-3, 1e30, &hit)) {
+    let hitSurface = hitScene(ray, 1e-3, 1e30, &hit);
+
+    // 表面に届く前に媒質で散乱するかを先に決める
+    if (fogActive()) {
+      let tSurf = select(1e30, hit.t, hitSurface);
+      let r = fogRange(ray.origin, ray.dir, tSurf);
+      if (r.y > r.x) {
+        let d = -log(max(1.0 - rand(), 1e-9)) / sigmaT();
+        if (d < r.y - r.x) {
+          // 媒質内で散乱した。透過率と pdf が約分され、残るのは単散乱アルベド
+          throughput = throughput * (U.sigmaS / sigmaT());
+
+          var mhit: Hit;
+          mhit.t = r.x + d;
+          mhit.p = ray.origin + mhit.t * ray.dir;
+          mhit.normal = vec3f(0.0, 1.0, 0.0);  // 位相関数では使わない
+          mhit.frontFace = true;
+          mhit.lightArea = 0.0;
+          mhit.mat = Material(vec3f(0.0), 0.0, vec3f(0.0), 1.0, MAT_PHASE);
+
+          if (useNee) {
+            var mw = 1.0;
+            radiance = radiance + throughput
+              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
+            if (depth == 0u) {
+              (*aov).misWeight = mw;
+            }
+          }
+
+          let inDir = ray.dir;
+          let outDir = sampleHg(inDir, U.fogG, sample2d(3u + depth * 2u, depth < QMC_DEPTH));
+          bsdfPdf = max(hgPhase(dot(inDir, outDir), U.fogG), 1e-8);
+          ray = Ray(mhit.p, outDir);
+          (*aov).bounces = f32(depth + 1u);
+
+          // ロシアンルーレット (4 バウンス目以降)
+          if (depth >= 3u) {
+            let q = max(throughput.r, max(throughput.g, throughput.b));
+            if (rand() > q) {
+              break;
+            }
+            throughput = throughput / max(q, 1e-4);
+          }
+          continue;
+        }
+      }
+    }
+
+    if (!hitSurface) {
       // 環境マップを光源としてサンプルしているなら、ここも二重計上になる
       var w = 1.0;
       if (useEnvNee && bsdfPdf > 0.0) {

@@ -99,12 +99,25 @@ export interface CameraPreset {
   aperture: number;
 }
 
+/** 箱で区切った一様媒質 */
+export interface Fog {
+  min: Vec3;
+  max: Vec3;
+  /** 散乱係数 */
+  sigmaS: number;
+  /** 吸収係数 */
+  sigmaA: number;
+  /** Henyey-Greenstein の非対称パラメータ。正で前方散乱 */
+  g: number;
+}
+
 export interface Scene {
   spheres: Sphere[];
   quads: Quad[];
   triangles: Triangle[];
   env: EnvKind;
   camera: CameraPreset;
+  fog?: Fog;
 }
 
 // ---------------------------------------------------------------- geometry
@@ -504,6 +517,52 @@ function buildGlassScene(): Scene {
   };
 }
 
+
+/** 参加媒質の確認用。窓の入った暗い部屋に霧を満たし、光芒を出す */
+function buildShaftScene(): Scene {
+  const wall = lambert([0.55, 0.53, 0.5]);
+  const W = 8;
+  const H = 5;
+  const D = 11;
+
+  // +x の壁を縦の板に分け、隙間から陽が差し込むようにする
+  const slats: Quad[] = [];
+  for (let i = 0; i < 7; i++) {
+    const z0 = i * 1.62;
+    slats.push({
+      q: [W, 0, z0],
+      u: [0, H, 0],
+      v: [0, 0, 1.05],
+      material: wall,
+    });
+  }
+
+  return {
+    spheres: [
+      { center: [4.8, 0.9, 8.5], radius: 0.9, material: ggx([0.95, 0.82, 0.5], 0.14) },
+    ],
+    quads: [
+      { q: [0, 0, 0], u: [W, 0, 0], v: [0, 0, D], material: lambert([0.42, 0.4, 0.38]) },
+      { q: [0, H, 0], u: [W, 0, 0], v: [0, 0, D], material: wall },
+      { q: [0, 0, 0], u: [0, H, 0], v: [0, 0, D], material: wall },
+      { q: [0, 0, D], u: [W, 0, 0], v: [0, H, 0], material: wall },
+      { q: [0, 0, 0], u: [W, 0, 0], v: [0, H, 0], material: wall },
+      ...slats,
+    ],
+    triangles: [],
+    env: ENV.hdri,
+    fog: { min: [0, 0, 0], max: [W, H, D], sigmaS: 0.09, sigmaA: 0.006, g: 0.62 },
+    camera: {
+      target: [5.4, 2.2, 6.0],
+      distance: 4.4,
+      yaw: Math.PI * 0.97,
+      pitch: 0.06,
+      fovDeg: 60,
+      aperture: 0,
+    },
+  };
+}
+
 export interface SceneEntry {
   id: string;
   name: string;
@@ -516,6 +575,7 @@ export const SCENES: SceneEntry[] = [
   { id: "veach", name: "veach MIS test", build: buildVeachScene },
   { id: "mesh", name: "torus knot (mesh)", build: buildMeshScene },
   { id: "glass", name: "rough / colored glass", build: buildGlassScene },
+  { id: "shaft", name: "light shafts (fog)", build: buildShaftScene },
 ];
 
 export const DEFAULT_SCENE_ID = SCENES[0].id;

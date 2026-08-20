@@ -36,6 +36,12 @@ struct Uniforms {
   _pad: u32,
   debugMode: u32,
   fixedSeed: u32,
+  fogMin: vec3f,
+  sigmaS: f32,
+  fogMax: vec3f,
+  sigmaA: f32,
+  fogG: f32,
+  fogEnabled: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;

@@ -27,6 +27,8 @@ export interface RenderSettings {
   debugMode: number;
   /** 乱数の種を累積サンプル数から作り、同条件を再現可能にする */
   fixedSeed: boolean;
+  /** 参加媒質を有効にする */
+  fog: boolean;
 }
 
 export interface UiOptions {
@@ -350,6 +352,7 @@ export function createUi(options: UiOptions): UiHandle {
     reproject: true,
     debugMode: 0,
     fixedSeed: false,
+    fog: true,
   };
 
   const panel = document.createElement("div");
@@ -541,6 +544,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const fogRow = createToggleRow({
+    label: "participating media",
+    value: settings.fog,
+    onChange: (v) => {
+      settings.fog = v;
+      notifyChange();
+    },
+  });
+
   const fixedSeedRow = createToggleRow({
     label: "fixed seed",
     value: settings.fixedSeed,
@@ -571,6 +583,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(qmcRow);
   body.appendChild(envIsRow);
   body.appendChild(reprojectRow);
+  body.appendChild(fogRow);
   body.appendChild(fixedSeedRow);
   body.appendChild(debugRow);
   body.appendChild(resetButton);

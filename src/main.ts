@@ -135,6 +135,7 @@ async function main() {
       reproject,
       debugMode: ui.settings.debugMode,
       fixedSeed: ui.settings.fixedSeed,
+      fog: ui.settings.fog,
     });
 
     samples += spp;

@@ -51,7 +51,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 224;
+const UNIFORM_SIZE = 272;
 
 /**
  * 履歴バッファの 1 画素あたりのバイト数。
@@ -90,6 +90,8 @@ export interface FrameParams {
   debugMode: number;
   /** 乱数の種を累積サンプル数から作り、同条件を再現可能にする */
   fixedSeed: boolean;
+  /** 参加媒質を有効にする */
+  fog: boolean;
 }
 
 export class Renderer {
@@ -120,6 +122,7 @@ export class Renderer {
   private envWidth = 1;
   private envHeight = 1;
   private envPdfScale = 0;
+  private fog: Scene["fog"] = undefined;
   private bvhNodeCount = 0;
   private sphereCount = 0;
   private quadCount = 0;
@@ -164,6 +167,7 @@ export class Renderer {
 
   /** ジオメトリを丸ごと差し替える。バッファのサイズが変わるので作り直す */
   setScene(scene: Scene) {
+    this.fog = scene.fog;
     this.sphereCount = scene.spheres.length;
     this.quadCount = scene.quads.length;
     this.env = scene.env;
@@ -315,6 +319,17 @@ export class Renderer {
     f.set(q.camW, 48);
     u[52] = p.debugMode;
     u[53] = p.fixedSeed ? 1 : 0;
+    const fog = this.fog;
+    if (fog && p.fog) {
+      f.set(fog.min, 56);
+      f[59] = fog.sigmaS;
+      f.set(fog.max, 60);
+      f[63] = fog.sigmaA;
+      f[64] = fog.g;
+      u[65] = 1;
+    } else {
+      u[65] = 0;
+    }
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
