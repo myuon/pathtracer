@@ -26,7 +26,10 @@ interface Node {
   max: Vec3;
   /** 葉なら refs の開始位置、内部ノードなら右の子のノード番号 */
   leftFirst: number;
-  /** 0 なら内部ノード */
+  /**
+   * 下位 8 ビットが葉のプリミティブ数 (0 なら内部ノード)。
+   * 内部ノードは bit 8-9 に分割軸を入れておき、走査時に手前の子を先に選ぶ
+   */
   count: number;
 }
 
@@ -128,7 +131,7 @@ function build(refs: Ref[], from: number, to: number, nodes: Node[]): number {
   for (let i = 0; i < slice.length; i++) refs[from + i] = slice[i];
 
   const mid = (from + to) >> 1;
-  nodes[self].count = 0;
+  nodes[self].count = axis << 8;
   build(refs, from, mid, nodes);
   // 左の子は自分の直後に置かれるので、右の子だけ番号を控える
   nodes[self].leftFirst = build(refs, mid, to, nodes);

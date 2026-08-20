@@ -139,9 +139,19 @@ struct BvhNode {
   /// 葉なら bvhRefs の開始位置、内部ノードなら右の子のノード番号
   leftFirst: u32,
   bmax: vec3f,
-  /// 0 なら内部ノード
+  /// 下位 8 ビットが葉のプリミティブ数 (0 なら内部ノード)。
+  /// 内部ノードは bit 8-9 に分割軸が入っている
   count: u32,
 };
+
+/// レイの向きから、分割軸に沿って手前にある子を先に返す
+fn childOrder(axis: u32, dir: vec3f, left: u32, right: u32) -> vec2u {
+  let d = select(select(dir.x, dir.y, axis == 1u), dir.z, axis == 2u);
+  if (d < 0.0) {
+    return vec2u(right, left);
+  }
+  return vec2u(left, right);
+}
 
 @group(0) @binding(5) var<storage, read> bvh: array<BvhNode>;
 /// 三角形。辺は v0 を原点とする差分で持つ
@@ -460,41 +470,45 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
     let n = bvh[node];
     var descend = false;
 
+    let cnt = n.count & 0xffu;
     if (aabbHit(n.bmin, n.bmax, ray.origin, invD, tMin, closest)) {
-      if (n.count == 0u) {
+      if (cnt == 0u) {
         descend = true;
       } else {
-        for (var k = 0u; k < n.count; k = k + 1u) {
+        for (var k = 0u; k < cnt; k = k + 1u) {
           let code = indices[U.lightCount + n.leftFirst + k];
           let idx = code & 0x3fffffffu;
           let kind = code >> 30u;
 
           if (kind == 2u) {
-            // Moller-Trumbore
-            let tri = triangles[idx];
-            let pv = cross(ray.dir, tri.e2);
-            let det = dot(tri.e1, pv);
+            // Moller-Trumbore。交差が確定するまでは頂点と辺しか読まない
+            // (Triangle は 144 バイトあるが判定に要るのは 48 バイト)
+            let e2 = triangles[idx].e2;
+            let pv = cross(ray.dir, e2);
+            let e1 = triangles[idx].e1;
+            let det = dot(e1, pv);
             if (abs(det) < 1e-12) {
               continue;
             }
             let invDet = 1.0 / det;
-            let tv = ray.origin - tri.v0;
+            let tv = ray.origin - triangles[idx].v0;
             let bu = dot(tv, pv) * invDet;
             if (bu < 0.0 || bu > 1.0) {
               continue;
             }
-            let qv = cross(tv, tri.e1);
+            let qv = cross(tv, e1);
             let bv = dot(ray.dir, qv) * invDet;
             if (bv < 0.0 || bu + bv > 1.0) {
               continue;
             }
-            let t = dot(tri.e2, qv) * invDet;
+            let t = dot(e2, qv) * invDet;
             if (t < tMin || t > closest) {
               continue;
             }
             closest = t;
             found = true;
-            // 頂点法線を重心座標で補間して滑らかにする
+            // ここまで来たら法線とマテリアルも読む
+            let tri = triangles[idx];
             let sm = normalize(tri.n0 * (1.0 - bu - bv) + tri.n1 * bu + tri.n2 * bv);
             fillHit(hit, ray, t, sm, tri.mat, 0.0);
           } else if (kind == 0u) {
@@ -519,21 +533,22 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
             let p = ray.origin + t * ray.dir;
             fillHit(hit, ray, t, (p - sph.center) / sph.radius, sph.mat, 0.0);
           } else {
-            let quad = quads[idx];
-            let nrm = cross(quad.u, quad.v);
+            let qu = quads[idx].u;
+            let qv2 = quads[idx].v;
+            let nrm = cross(qu, qv2);
             let denom = dot(nrm, ray.dir);
             if (abs(denom) < 1e-8) {
               continue;
             }
-            let t = dot(nrm, quad.q - ray.origin) / denom;
+            let t = dot(nrm, quads[idx].q - ray.origin) / denom;
             if (t < tMin || t > closest) {
               continue;
             }
             // 平面上の点を u, v 基底で表したときの係数が両方 [0, 1] なら内側
-            let planar = ray.origin + t * ray.dir - quad.q;
+            let planar = ray.origin + t * ray.dir - quads[idx].q;
             let w = nrm / dot(nrm, nrm);
-            let alpha = dot(w, cross(planar, quad.v));
-            let beta = dot(w, cross(quad.u, planar));
+            let alpha = dot(w, cross(planar, qv2));
+            let beta = dot(w, cross(qu, planar));
             if (alpha < 0.0 || alpha > 1.0 || beta < 0.0 || beta > 1.0) {
               continue;
             }
@@ -541,18 +556,20 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
             found = true;
             // cross(u, v) の長さがそのまま quad の面積になる
             let ln = length(nrm);
-            fillHit(hit, ray, t, nrm / ln, quad.mat, ln);
+            fillHit(hit, ray, t, nrm / ln, quads[idx].mat, ln);
           }
         }
       }
     }
 
     if (descend) {
+      // 手前の子から降りると、遠い側を早く枝刈りできる
+      let order = childOrder((n.count >> 8u) & 3u, ray.dir, node + 1u, n.leftFirst);
       if (sp < 32u) {
-        stack[sp] = n.leftFirst;
+        stack[sp] = order.y;
         sp = sp + 1u;
       }
-      node = node + 1u;
+      node = order.x;
     } else {
       if (sp == 0u) {
         break;
@@ -581,34 +598,36 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
     let n = bvh[node];
     var descend = false;
 
+    let cnt = n.count & 0xffu;
     if (aabbHit(n.bmin, n.bmax, origin, invD, 1e-4, maxT)) {
-      if (n.count == 0u) {
+      if (cnt == 0u) {
         descend = true;
       } else {
-        for (var k = 0u; k < n.count; k = k + 1u) {
+        for (var k = 0u; k < cnt; k = k + 1u) {
           let code = indices[U.lightCount + n.leftFirst + k];
           let idx = code & 0x3fffffffu;
           let kind = code >> 30u;
 
           if (kind == 2u) {
-            let tri = triangles[idx];
-            let pv = cross(dir, tri.e2);
-            let det = dot(tri.e1, pv);
+            let e2 = triangles[idx].e2;
+            let pv = cross(dir, e2);
+            let e1 = triangles[idx].e1;
+            let det = dot(e1, pv);
             if (abs(det) < 1e-12) {
               continue;
             }
             let invDet = 1.0 / det;
-            let tv = origin - tri.v0;
+            let tv = origin - triangles[idx].v0;
             let bu = dot(tv, pv) * invDet;
             if (bu < 0.0 || bu > 1.0) {
               continue;
             }
-            let qv = cross(tv, tri.e1);
+            let qv = cross(tv, e1);
             let bv = dot(dir, qv) * invDet;
             if (bv < 0.0 || bu + bv > 1.0) {
               continue;
             }
-            let t = dot(tri.e2, qv) * invDet;
+            let t = dot(e2, qv) * invDet;
             if (t > 1e-4 && t < maxT) {
               return true;
             }
@@ -628,20 +647,21 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
               return true;
             }
           } else {
-            let quad = quads[idx];
-            let nrm = cross(quad.u, quad.v);
+            let qu = quads[idx].u;
+            let qv2 = quads[idx].v;
+            let nrm = cross(qu, qv2);
             let denom = dot(nrm, dir);
             if (abs(denom) < 1e-8) {
               continue;
             }
-            let t = dot(nrm, quad.q - origin) / denom;
+            let t = dot(nrm, quads[idx].q - origin) / denom;
             if (t <= 1e-4 || t >= maxT) {
               continue;
             }
-            let planar = origin + t * dir - quad.q;
+            let planar = origin + t * dir - quads[idx].q;
             let w = nrm / dot(nrm, nrm);
-            let alpha = dot(w, cross(planar, quad.v));
-            let beta = dot(w, cross(quad.u, planar));
+            let alpha = dot(w, cross(planar, qv2));
+            let beta = dot(w, cross(qu, planar));
             if (alpha >= 0.0 && alpha <= 1.0 && beta >= 0.0 && beta <= 1.0) {
               return true;
             }
@@ -651,11 +671,13 @@ fn occluded(origin: vec3f, dir: vec3f, maxT: f32) -> bool {
     }
 
     if (descend) {
+      // 手前の子から降りると、遠い側を早く枝刈りできる
+      let order = childOrder((n.count >> 8u) & 3u, dir, node + 1u, n.leftFirst);
       if (sp < 32u) {
-        stack[sp] = n.leftFirst;
+        stack[sp] = order.y;
         sp = sp + 1u;
       }
-      node = node + 1u;
+      node = order.x;
     } else {
       if (sp == 0u) {
         break;
@@ -1457,10 +1479,6 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
 /// グリッドの個数カウンタを 0 に戻す
 @compute @workgroup_size(64, 1, 1)
 fn clearGrid(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x == 0u) {
-    // 末尾に置いた「今回書き込んだ光子の数」も戻す
-    atomicStore(&grid[U.gridCells + U.gridCells * GRID_CAP], 0u);
-  }
   if (gid.x >= U.gridCells) {
     return;
   }
@@ -1526,6 +1544,9 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     ray = Ray(origin + nrm * 1e-4, dir);
   }
 
+  // 格納先はスレッドごとに固定で 2 枠取る。単一アドレスへの atomicAdd で
+  // 割り当てると 26 万回が直列化してしまう
+  var localSlot = 0u;
   var bounces = 0u;
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
@@ -1536,14 +1557,14 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     let gatherable = kind == MAT_LAMBERT || kind == MAT_GGX;
 
     // 直接光はカメラ側の NEE が担当しているので、1 回以上散乱した後だけ堆積させる
-    if (gatherable && bounces >= 1u) {
-      let slot = atomicAdd(&grid[U.gridCells + U.gridCells * GRID_CAP], 1u);
-      if (slot < U.photonCount * 2u) {
-        photons[slot * 3u + 0u] = vec4f(hit.p, 1.0);
-        photons[slot * 3u + 1u] = vec4f(ray.dir, 0.0);
-        photons[slot * 3u + 2u] = vec4f(power, 0.0);
-        depositPhoton(slot, hit.p);
-      }
+    if (gatherable && bounces >= 1u && localSlot < 2u) {
+      let slot = gid.x * 2u + localSlot;
+      localSlot = localSlot + 1u;
+      photons[slot * 3u + 0u] = vec4f(hit.p, 1.0);
+      photons[slot * 3u + 1u] = vec4f(ray.dir, 0.0);
+      photons[slot * 3u + 2u] = vec4f(power, 0.0);
+      // 使われなかった枠は grid に載らないので、古い内容が参照されることはない
+      depositPhoton(slot, hit.p);
     }
 
     var attenuation: vec3f;
