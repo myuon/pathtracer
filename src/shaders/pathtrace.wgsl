@@ -1709,9 +1709,41 @@ fn lightVertexAlive(base: u32) -> bool {
   return u32(v - kind * 65536.0) == (U.frameIndex % 65536u);
 }
 
-/// カメラ側の頂点 1 個を、保存した光源側の頂点 1 個とつなぐ。
-/// 枠を一様に 1 つ選ぶので、期待値を合わせるために枠の総数 / 光子の本数
-/// (= MAX_DEPOSITS) を掛ける。空き枠は 0 を返すので偏りは出ない
+/// 候補として引く光源側の頂点の数。影レイを撃たずに評価するので安い
+/// 候補として引く光源側の頂点の数。影レイを撃たずに評価するので安い
+const RIS_CANDIDATES: u32 = 16u;
+
+fn luminanceOf(c: vec3f) -> f32 {
+  return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+/// 影レイを撃たずに評価した、この頂点とつないだときの寄与。
+/// 遮蔽は見ていないので上振れするが、選ぶための目安としてはこれで足りる
+fn unshadowedConnect(hit: Hit, rayDir: vec3f, base: u32) -> vec3f {
+  let lv = lightVertexHit(base);
+  let d = lv.p - hit.p;
+  let dist2 = dot(d, d);
+  if (dist2 < 1e-8) {
+    return vec3f(0.0);
+  }
+  let dir = d * inverseSqrt(dist2);
+  let cosCam = dot(hit.normal, dir);
+  let cosLight = dot(lv.normal, -dir);
+  if (cosCam <= 1e-6 || cosLight <= 1e-6) {
+    return vec3f(0.0);
+  }
+  // bsdfEval は f * cos を返すので、余弦で割って裸の BSDF に戻す
+  let fCam = bsdfEval(hit, rayDir, dir) / cosCam;
+  let fLight = bsdfEval(lv, photons[base + 1u].xyz, -dir) / cosLight;
+  return fCam * fLight * (cosCam * cosLight / dist2) * photons[base + 2u].xyz;
+}
+
+/// カメラ側の頂点 1 個を、光源側の経路の頂点 1 個とつなぐ。
+///
+/// 一様に 1 個引くだけだと、狭い隙間の向こうにしか光源がないシーンでは
+/// ほとんど当たらない。光源側の頂点の大半は扉の裏の小部屋にあって
+/// 部屋からは見えないため。そこで候補を何個か引いて、影レイを撃つ前の
+/// 安い評価で 1 個に絞る (RIS)。選んだ確率で割るので不偏のまま
 fn connectToLightVertex(
   hit: Hit,
   rayDir: vec3f,
@@ -1722,53 +1754,59 @@ fn connectToLightVertex(
   if (slots == 0u) {
     return vec3f(0.0);
   }
-  let base = min(u32(rand() * f32(slots)), slots - 1u) * VTX_SLOTS;
-  if (!lightVertexAlive(base)) {
-    return vec3f(0.0);
-  }
-  let lv = lightVertexHit(base);
-  let d = lv.p - hit.p;
-  let dist2 = dot(d, d);
-  if (dist2 < 1e-8) {
-    return vec3f(0.0);
-  }
-  let dist = sqrt(dist2);
-  let dir = d / dist;
 
+  var bestBase = 0u;
+  var bestP = 0.0;
+  var sumP = 0.0;
+  for (var k = 0u; k < RIS_CANDIDATES; k = k + 1u) {
+    let base = min(u32(rand() * f32(slots)), slots - 1u) * VTX_SLOTS;
+    if (!lightVertexAlive(base)) {
+      continue;
+    }
+    let phat = luminanceOf(unshadowedConnect(hit, rayDir, base));
+    if (phat <= 0.0) {
+      continue;
+    }
+    sumP = sumP + phat;
+    // 貯留サンプリング。寄与の大きさに比例して 1 個選ぶ
+    if (rand() * sumP < phat) {
+      bestBase = base;
+      bestP = phat;
+    }
+  }
+  if (bestP <= 0.0) {
+    return vec3f(0.0);
+  }
+
+  let lv = lightVertexHit(bestBase);
+  let d = lv.p - hit.p;
+  let dist = length(d);
+  let dir = d / dist;
   let cosCam = dot(hit.normal, dir);
   let cosLight = dot(lv.normal, -dir);
-  if (cosCam <= 1e-6 || cosLight <= 1e-6) {
-    return vec3f(0.0);
-  }
   if (occluded(hit.p + hit.normal * 1e-4, dir, dist - 1e-3)) {
     return vec3f(0.0);
   }
-
-  // bsdfEval は f * cos を返すので、余弦で割って裸の BSDF に戻す
-  let fCam = bsdfEval(hit, rayDir, dir) / cosCam;
-  let lIn = photons[base + 1u].xyz;
-  let fLight = bsdfEval(lv, lIn, -dir) / cosLight;
-  let g = cosCam * cosLight / dist2;
-  let contrib = fCam * fLight * g * photons[base + 2u].xyz;
-  if (dot(contrib, contrib) <= 0.0) {
-    return vec3f(0.0);
-  }
+  let contrib = unshadowedConnect(hit, rayDir, bestBase);
 
   // MIS。同じ経路を作りうる他の戦略 (カメラ側をもう 1 段伸ばす、
   // 光源側をもう 1 段伸ばす) との重み付け
+  let lIn = photons[bestBase + 1u].xyz;
+  let dist2 = dist * dist;
   let camPdfW = bsdfPdfFor(hit, rayDir, dir);
   let camRevPdfW = bsdfPdfFor(hit, -dir, -rayDir);
   let lightPdfW = bsdfPdfFor(lv, lIn, -dir);
   let lightRevPdfW = bsdfPdfFor(lv, dir, -lIn);
-  let camPdfA = camPdfW * cosLight / dist2;
-  let lightPdfA = lightPdfW * cosCam / dist2;
-  let wLight = camPdfA * (photons[base + 0u].w + photons[base + 1u].w * lightRevPdfW);
-  let wCamera = lightPdfA * (dVCMc + dVCc * camRevPdfW);
+  let wLight = camPdfW * cosLight / dist2
+    * (photons[bestBase + 0u].w + photons[bestBase + 1u].w * lightRevPdfW);
+  let wCamera = lightPdfW * cosCam / dist2 * (dVCMc + dVCc * camRevPdfW);
   let mis = 1.0 / (wLight + 1.0 + wCamera);
 
-  // 光子 1 本は光源の全光束を運んでいるので、本数で割る。
-  // 使う頂点はこのフレームのものだけなので photonsEmitted ではない
-  return contrib * mis * f32(MAX_DEPOSITS) / f32(max(U.photonCount, 1u));
+  // RIS の重み。候補の平均寄与 / 選んだ頂点の寄与 を掛けると、
+  // 「全部の枠を足したもの」の不偏推定になる
+  let risW = (sumP / f32(RIS_CANDIDATES)) * f32(slots) / bestP;
+  // 光子 1 本は光源の全光束を運んでいるので、本数で割る
+  return contrib * mis * risW / f32(max(U.photonCount, 1u));
 }
 
 // -------------------------------------------------------------- 光子パス
