@@ -1816,7 +1816,21 @@ fn connectToLightVertex(
   let contrib = connectContribution(hit, rayDir, bestBase);
 
   // MIS。同じ経路を作りうる他の戦略 (カメラ側をもう 1 段伸ばす、
-  // 光源側をもう 1 段伸ばす) との重み付け
+  // 光源側をもう 1 段伸ばす) との重み付け。
+  //
+  // **既知の不具合**: この重みだけを VCM の式にしても足りない。
+  // NEE と発光の重みは trace 側で misWeight() (2 戦略の power heuristic) の
+  // ままになっていて、その 2 つだけで和がちょうど 1 になっている。そこへ
+  // 接続戦略の正の重みを足すので、必ず 1 を超えて二重計上になる (+41%)。
+  // 直すには NEE と発光の重みも VCM の形に置き換える必要がある。
+  //
+  //   発光に当たったとき: 1 / (1 + directPdfA * dVCMc + emissionPdfW * dVCc)
+  //   NEE:                1 / (wLight + 1 + wCamera)
+  //     wLight  = bsdfDirPdfW / directPdfW
+  //     wCamera = emissionPdfW * cosToLight / (directPdfW * cosAtLight)
+  //               * (dVCMc + dVCc * bsdfRevPdfW)
+  //
+  // emissionPdfW は光子を撒くときに使っている混合分布の pdf と同じもの
   let lIn = photons[bestBase + 1u].xyz;
   let dist2 = dist * dist;
   let camPdfW = bsdfPdfFor(hit, rayDir, dir);
