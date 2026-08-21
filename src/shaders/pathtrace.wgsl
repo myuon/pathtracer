@@ -67,6 +67,8 @@ struct Uniforms {
   /// シーンの外接球。環境マップから光子を撒くときの始点に使う
   sceneCenter: vec3f,
   sceneRadius: f32,
+  /// カメラ側の頂点と光源側の頂点をつなぐ戦略 (VCM の vertex connection) を使うか
+  vcm: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -1310,6 +1312,12 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   var bsdfPdf = -1.0;
   let useNee = U.nee != 0u && lightSelectCount() > 0u;
   let useEnvNee = U.nee != 0u && envIsActive();
+  // VCM の接続戦略用。光源側と対になる漸化式をカメラ側でも回す。
+  // 初期値が 0 なのは「光源側の経路をカメラに直接つなぐ」戦略 (light tracing)
+  // を実装していないため。使っていない戦略は重みから外す
+  let useVcm = U.vcm != 0u && U.photonCount > 0u;
+  var dVCMc = 0.0;
+  var dVCc = 0.0;
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
@@ -1382,6 +1390,13 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     }
     (*aov).bounces = f32(depth + 1u);
 
+    // 面積についての pdf に直す補正。光源側と同じ形
+    let cosInC = abs(dot(hit.normal, ray.dir));
+    if (useVcm && cosInC > 1e-6) {
+      dVCMc = dVCMc * hit.t * hit.t / cosInC;
+      dVCc = dVCc / cosInC;
+    }
+
     // 光源に当たったときの放射。NEE と重複するぶんを MIS 重みで削る
     var weight = 1.0;
     if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
@@ -1407,6 +1422,12 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
       }
     }
 
+    // 光源側の経路の頂点とつなぐ。隙間の向こうまで届いた光源側の頂点を
+    // 仮想的な光源として使い回せるので、NEE がほぼ効かないシーンで効く
+    if (useVcm && isDiffuseLike(hit.mat)) {
+      radiance = radiance + throughput * connectToLightVertex(hit, ray.dir, dVCMc, dVCc);
+    }
+
     var attenuation: vec3f;
     var scattered: Ray;
     if (!scatter(ray, hit, sample2d(3u + depth * 2u, depth < QMC_DEPTH), &attenuation, &scattered)) {
@@ -1425,6 +1446,22 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     if (depth == 0u) {
       (*aov).bsdfPdf = max(bsdfPdf, 0.0);
     }
+
+    // VCM の漸化式。光源側とまったく同じ形
+    if (useVcm) {
+      let pF = bsdfPdfFor(hit, ray.dir, scattered.dir);
+      if (pF > 0.0) {
+        let pR = bsdfPdfFor(hit, -scattered.dir, -ray.dir);
+        let cosOut = abs(dot(hit.normal, scattered.dir));
+        dVCc = (cosOut / pF) * (dVCc * pR + dVCMc);
+        dVCMc = 1.0 / pF;
+      } else {
+        // デルタ的な散乱。方向を選ぶ確率が定義できないので接続もできない
+        dVCc = 0.0;
+        dVCMc = 0.0;
+      }
+    }
+
     throughput = throughput * attenuation;
     ray = scattered;
 
@@ -1640,6 +1677,100 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
   return radiance;
 }
 
+// ------------------------------------------------- VCM: 頂点どうしの接続
+/// 保存した光源側の頂点を Hit の形に戻す。BSDF を評価するのに要る
+fn lightVertexHit(base: u32) -> Hit {
+  let n = photons[base + 3u];
+  let a = photons[base + 4u];
+  var m: Material;
+  m.albedo = a.xyz;
+  m.roughness = a.w;
+  m.emission = vec3f(0.0);
+  m.ior = 1.5;
+  m.kind = u32(n.w / 65536.0);
+  var h: Hit;
+  h.t = 0.0;
+  h.p = photons[base + 0u].xyz;
+  h.normal = n.xyz;
+  h.frontFace = true;
+  h.mat = m;
+  h.lightArea = 0.0;
+  return h;
+}
+
+/// この枠に今フレームの頂点が入っているか。使われなかった枠には
+/// 前フレームの内容が残るので、フレーム番号を一緒に入れて見分ける
+fn lightVertexAlive(base: u32) -> bool {
+  let v = photons[base + 3u].w;
+  if (v <= 0.0) {
+    return false;
+  }
+  let kind = floor(v / 65536.0);
+  return u32(v - kind * 65536.0) == (U.frameIndex % 65536u);
+}
+
+/// カメラ側の頂点 1 個を、保存した光源側の頂点 1 個とつなぐ。
+/// 枠を一様に 1 つ選ぶので、期待値を合わせるために枠の総数 / 光子の本数
+/// (= MAX_DEPOSITS) を掛ける。空き枠は 0 を返すので偏りは出ない
+fn connectToLightVertex(
+  hit: Hit,
+  rayDir: vec3f,
+  dVCMc: f32,
+  dVCc: f32,
+) -> vec3f {
+  let slots = U.photonCount * MAX_DEPOSITS;
+  if (slots == 0u) {
+    return vec3f(0.0);
+  }
+  let base = min(u32(rand() * f32(slots)), slots - 1u) * VTX_SLOTS;
+  if (!lightVertexAlive(base)) {
+    return vec3f(0.0);
+  }
+  let lv = lightVertexHit(base);
+  let d = lv.p - hit.p;
+  let dist2 = dot(d, d);
+  if (dist2 < 1e-8) {
+    return vec3f(0.0);
+  }
+  let dist = sqrt(dist2);
+  let dir = d / dist;
+
+  let cosCam = dot(hit.normal, dir);
+  let cosLight = dot(lv.normal, -dir);
+  if (cosCam <= 1e-6 || cosLight <= 1e-6) {
+    return vec3f(0.0);
+  }
+  if (occluded(hit.p + hit.normal * 1e-4, dir, dist - 1e-3)) {
+    return vec3f(0.0);
+  }
+
+  // bsdfEval は f * cos を返すので、余弦で割って裸の BSDF に戻す
+  let fCam = bsdfEval(hit, rayDir, dir) / cosCam;
+  let lIn = photons[base + 1u].xyz;
+  let fLight = bsdfEval(lv, lIn, -dir) / cosLight;
+  let g = cosCam * cosLight / dist2;
+  let contrib = fCam * fLight * g * photons[base + 2u].xyz;
+  if (dot(contrib, contrib) <= 0.0) {
+    return vec3f(0.0);
+  }
+
+  // MIS。同じ経路を作りうる他の戦略 (カメラ側をもう 1 段伸ばす、
+  // 光源側をもう 1 段伸ばす) との重み付け
+  let camPdfW = bsdfPdfFor(hit, rayDir, dir);
+  let camRevPdfW = bsdfPdfFor(hit, -dir, -rayDir);
+  let lightPdfW = bsdfPdfFor(lv, lIn, -dir);
+  let lightRevPdfW = bsdfPdfFor(lv, dir, -lIn);
+  let camPdfA = camPdfW * cosLight / dist2;
+  let lightPdfA = lightPdfW * cosCam / dist2;
+  let wLight = camPdfA * (photons[base + 0u].w + photons[base + 1u].w * lightRevPdfW);
+  let wCamera = lightPdfA * (dVCMc + dVCc * camRevPdfW);
+  let mis = 1.0 / (wLight + 1.0 + wCamera);
+
+  // 光子 1 本は光源の全光束を運んでいるので、本数で割る。
+  // 使う頂点はこのフレームのものだけなので photonsEmitted ではない
+  return contrib * mis * f32(MAX_DEPOSITS) / f32(max(U.photonCount, 1u));
+}
+
 // -------------------------------------------------------------- 光子パス
 /// グリッドの個数カウンタを 0 に戻す
 @compute @workgroup_size(64, 1, 1)
@@ -1789,7 +1920,10 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       photons[slot * VTX_SLOTS + 0u] = vec4f(hit.p, dVCM);
       photons[slot * VTX_SLOTS + 1u] = vec4f(ray.dir, dVC);
       photons[slot * VTX_SLOTS + 2u] = vec4f(power, emitBin);
-      photons[slot * VTX_SLOTS + 3u] = vec4f(hit.normal, f32(kind));
+      // 材質の種類とフレーム番号を 1 つの f32 に詰める。使われなかった枠に
+      // 前フレームの内容が残るので、これで今フレームのものだけを拾う
+      photons[slot * VTX_SLOTS + 3u] =
+        vec4f(hit.normal, f32(kind) * 65536.0 + f32(U.frameIndex % 65536u));
       photons[slot * VTX_SLOTS + 4u] = vec4f(hit.mat.albedo, hit.mat.roughness);
       // 使われなかった枠は grid に載らないので、古い内容が参照されることはない
       depositPhoton(slot, hit.p);

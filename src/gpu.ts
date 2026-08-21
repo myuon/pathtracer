@@ -56,7 +56,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 304;
+const UNIFORM_SIZE = 320;
 
 /**
  * 履歴バッファの 1 画素あたりのバイト数。
@@ -113,6 +113,8 @@ export interface FrameParams {
   fog: boolean;
   /** SPPM を使う */
   sppm: boolean;
+  /// 光源側の経路頂点との接続 (VCM)
+  vcm: boolean;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
   denoise: boolean;
   /** 1 反復あたりに撒く光子数の倍率 (1 以下) */
@@ -432,6 +434,7 @@ export class Renderer {
     f[71] = this.photonsEmitted;
     f.set(this.sceneCenter, 72);
     f[75] = this.sceneRadius;
+    u[76] = p.vcm ? 1 : 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
@@ -448,10 +451,13 @@ export class Renderer {
     const envPhotons =
       this.envWidth > 1 && p.envIs && this.sceneRadius < this.camDistance * 20;
     const sppm = p.sppm && (this.lightCount > 0 || envPhotons);
-    const q: FrameParams = sppm === p.sppm ? p : { ...p, sppm };
+    // VCM の接続は SPPM とは独立に使える。どちらも光源側の経路を撒く必要がある
+    const vcm = p.vcm && !sppm && this.lightCount > 0;
+    const q: FrameParams =
+      sppm === p.sppm && vcm === p.vcm ? p : { ...p, sppm, vcm };
     // SPPM は画素ごとの状態を持ち越す必要があるので ping-pong を止める
     const write = sppm ? 0 : this.parity;
-    if (sppm && p.samplesBefore === 0) this.photonsEmitted = 0;
+    if ((sppm || vcm) && p.samplesBefore === 0) this.photonsEmitted = 0;
     // 弱いマシンでは光子数を落として 1 フレームの固定費を下げる
     this.photonsThisFrame = Math.max(
       4096,
@@ -466,14 +472,18 @@ export class Renderer {
       const compute = encoder.beginComputePass();
       compute.setBindGroup(0, this.computeBindGroups[write]);
 
-    if (sppm) {
-      // グリッドを空にする -> 光子を撒く -> カメラ側で集める
+    if (sppm || vcm) {
+      // グリッドを空にする -> 光源側の経路を撒く
       compute.setPipeline(this.clearGridPipeline);
       compute.dispatchWorkgroups(Math.ceil(GRID_CELLS / 64));
       compute.setPipeline(this.photonPipeline);
       compute.dispatchWorkgroups(Math.ceil(this.photonsThisFrame / 64));
+    }
+    if (sppm) {
+      // カメラ側で集める (merging)
       compute.setPipeline(this.sppmPipeline);
     } else {
+      // 通常のパストレース。VCM のときは接続戦略が中で足される
       compute.setPipeline(this.computePipeline);
     }
     compute.dispatchWorkgroups(

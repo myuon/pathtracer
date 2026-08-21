@@ -31,6 +31,7 @@ export interface RenderSettings {
   fog: boolean;
   /** SPPM を使う */
   sppm: boolean;
+  vcm: boolean;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
   denoise: boolean;
   /** 1 フレームの GPU 時間が目標に収まるよう spp を自動調整する */
@@ -367,6 +368,7 @@ export function createUi(options: UiOptions): UiHandle {
     denoise: false,
     adaptive: true,
     paused: false,
+    vcm: false,
   };
 
   const panel = document.createElement("div");
@@ -585,6 +587,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const vcmRow = createToggleRow({
+    label: "VCM (vertex connection)",
+    value: settings.vcm,
+    onChange: (v) => {
+      settings.vcm = v;
+      notifyChange();
+    },
+  });
+
   const pauseRow = createToggleRow({
     label: "pause (space)",
     value: settings.paused,
@@ -635,6 +646,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(fogRow);
   body.appendChild(sppmRow);
   body.appendChild(denoiseRow);
+  body.appendChild(vcmRow);
   body.appendChild(pauseRow);
   body.appendChild(adaptiveRow);
   body.appendChild(fixedSeedRow);

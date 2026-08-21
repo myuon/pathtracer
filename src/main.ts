@@ -204,6 +204,7 @@ async function main() {
       // 低解像度プレビューには重すぎるうえ、カメラが動いている間は
       // 画素ごとの統計 (半径や累積光子数) が意味を持たない
       sppm: ui.settings.sppm && !fast,
+      vcm: ui.settings.vcm && !fast,
       denoise: ui.settings.denoise,
       photonScale,
       paused: ui.settings.paused,
