@@ -71,6 +71,7 @@ const DEBUG_MODES = [
   { id: "4", name: "bsdf pdf" },
   { id: "5", name: "MIS weight" },
   { id: "6", name: "bounces" },
+  { id: "7", name: "VCM connect" },
 ];
 
 /** 解像度スケール系スライダーで選べる離散値 */

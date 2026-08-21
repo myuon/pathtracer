@@ -1277,6 +1277,9 @@ struct Aov {
   bsdfPdf: f32,
   misWeight: f32,
   bounces: f32,
+  /// VCM の接続の内訳。効かない理由を推測で決めないための計測用。
+  /// x: 生存判定を通った候補の割合 / y: 遮蔽を抜けた割合 / z: 寄与の輝度
+  connStat: vec3f,
 };
 
 fn aovColor(a: Aov) -> vec3f {
@@ -1298,6 +1301,12 @@ fn aovColor(a: Aov) -> vec3f {
   }
   if (U.debugMode == 6u) {
     return vec3f(a.bounces / max(f32(U.maxBounces), 1.0));
+  }
+  if (U.debugMode == 7u) {
+    // 赤: 枠に今フレームの頂点が入っていた割合
+    // 緑: そのうち遮蔽を抜けた割合
+    // 青: 実際の寄与 (見やすいように潰してある)
+    return vec3f(a.connStat.x, a.connStat.y, a.connStat.z / (a.connStat.z + 0.01));
   }
   return vec3f(0.0);
 }
@@ -1425,7 +1434,11 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     // 光源側の経路の頂点とつなぐ。隙間の向こうまで届いた光源側の頂点を
     // 仮想的な光源として使い回せるので、NEE がほぼ効かないシーンで効く
     if (useVcm && isDiffuseLike(hit.mat)) {
-      radiance = radiance + throughput * connectToLightVertex(hit, ray.dir, dVCMc, dVCc);
+      var st = vec3f(0.0);
+      radiance = radiance + throughput * connectToLightVertex(hit, ray.dir, dVCMc, dVCc, &st);
+      if (depth == 0u) {
+        (*aov).connStat = st;
+      }
     }
 
     var attenuation: vec3f;
@@ -1756,6 +1769,7 @@ fn connectToLightVertex(
   rayDir: vec3f,
   dVCMc: f32,
   dVCc: f32,
+  stat: ptr<function, vec3f>,
 ) -> vec3f {
   let slots = U.photonCount * MAX_DEPOSITS;
   if (slots == 0u) {
@@ -1770,10 +1784,12 @@ fn connectToLightVertex(
     if (!lightVertexAlive(base)) {
       continue;
     }
+    (*stat).x = (*stat).x + 1.0 / f32(RIS_CANDIDATES);
     let phat = luminanceOf(connectContribution(hit, rayDir, base));
     if (phat <= 0.0) {
       continue;
     }
+    (*stat).y = (*stat).y + 1.0 / f32(RIS_CANDIDATES);
     sumP = sumP + phat;
     // 貯留サンプリング。寄与の大きさに比例して 1 個選ぶ
     if (rand() * sumP < phat) {
@@ -1813,7 +1829,9 @@ fn connectToLightVertex(
   // (経路 1 本あたりの重みに直す)、2 回目は光源側の経路 N 本について
   // 平均を取るぶん。ここを 1 回にしていて二重計上していた
   let n = f32(max(U.photonCount, 1u));
-  return contrib * mis * risW / (n * n);
+  let out = contrib * mis * risW / (n * n);
+  (*stat).z = (*stat).z + luminanceOf(out);
+  return out;
 }
 
 // -------------------------------------------------------------- 光子パス
@@ -2026,7 +2044,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let px = (f32(gid.x) + jitter.x) / f32(U.width) * 2.0 - 1.0;
     let py = 1.0 - (f32(gid.y) + jitter.y) / f32(U.height) * 2.0;
     var fh = vec4f(0.0);
-    var aov = Aov(vec3f(0.0), vec3f(0.0), 0.0, 0.0, 0.0, 0.0);
+    var aov = Aov(vec3f(0.0), vec3f(0.0), 0.0, 0.0, 0.0, 0.0, vec3f(0.0));
     let radiance = trace(makeRay(px, py, sample2d(1u, true)), &fh, &aov);
     if (U.debugMode == 0u) {
       sum = sum + radiance;
