@@ -73,6 +73,8 @@ const DEBUG_MODES = [
   { id: "6", name: "bounces" },
   { id: "7", name: "VCM connect" },
   { id: "8", name: "photon waste" },
+  { id: "9", name: "direct only" },
+  { id: "10", name: "indirect only" },
 ];
 
 /** 解像度スケール系スライダーで選べる離散値 */

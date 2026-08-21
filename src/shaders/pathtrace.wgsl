@@ -240,6 +240,7 @@ fn markOff() -> u32 {
   return cdfOff() + HIST_BINS + 1u;
 }
 /// [0] 今フレームの堆積の総数 / [1] そのうち集光している場所に入った数
+/// [2] 集光の回数 / [3] 見つかった光子数の和 / [4] その 2 乗和
 fn statOff() -> u32 {
   return markOff() + U.gridCells;
 }
@@ -1328,7 +1329,22 @@ fn aovColor(a: Aov) -> vec3f {
     // 画面全体を単色で塗る。赤 = 集光している場所に届いた光子の割合
     let tot = f32(atomicLoad(&grid[statOff()]));
     let hit = f32(atomicLoad(&grid[statOff() + 1u]));
-    return vec3f(select(0.0, hit / tot, tot > 0.0), tot / 4096.0, 0.0);
+    let n = f32(atomicLoad(&grid[statOff() + 2u]));
+    let sm = f32(atomicLoad(&grid[statOff() + 3u]));
+    let s2 = f32(atomicLoad(&grid[statOff() + 4u]));
+    let mean = select(0.0, sm / n, n > 0.0);
+    let varm = max(select(0.0, s2 / n - mean * mean, n > 0.0), 0.0);
+    // 赤: 有効な光子の割合 / 緑: 集光で見つかる光子数の平均 (1/256 に潰す)
+    // 青: そのばらつき (変動係数、1/4 に潰す)
+    return vec3f(
+      select(0.0, hit / tot, tot > 0.0),
+      mean / 256.0,
+      // 青: 光子ごとの寄与の変動係数 (1/8 に潰す)
+      select(0.0,
+        f32(atomicLoad(&grid[statOff() + 6u]))
+          / (100.0 * f32(max(atomicLoad(&grid[statOff() + 5u]), 1u))),
+        true) / 8.0,
+    );
   }
   if (U.debugMode == 7u) {
     // 赤: 枠に今フレームの頂点が入っていた割合
@@ -1620,6 +1636,10 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
   // 位置とフレーム番号から作った別のハッシュを使う
   var creditBin = -1.0;
   var seen = 0u;
+  // 1 回の集光の中で、光子ごとの寄与がどれだけばらついているか。
+  // 同じ数の光子を集めても、運ぶエネルギーがばらけていれば絵は荒れる
+  var powSum = 0.0;
+  var powSq = 0.0;
   let seed = pcg(bitcast<u32>(hit.p.x) ^ bitcast<u32>(hit.p.z) ^ U.frameIndex);
   let r2 = r * r;
   let c = gridCoord(hit.p);
@@ -1643,8 +1663,12 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
             continue;
           }
           // bsdfEval は f * cos を返すので、余弦で割って裸の BRDF に戻す
-          sum = sum + (bsdfEval(hit, rayDir, wi) / cosI) * photons[pi * VTX_SLOTS + 2u].xyz;
+          let c1 = (bsdfEval(hit, rayDir, wi) / cosI) * photons[pi * VTX_SLOTS + 2u].xyz;
+          sum = sum + c1;
           m = m + 1.0;
+          let l1 = luminanceOf(c1);
+          powSum = powSum + l1;
+          powSq = powSq + l1 * l1;
 
           // 使われた光子の放出方向を 1 個だけ選んで覚えておく (貯留サンプリング)。
           // ここで毎回 atomicAdd すると 1 画素あたり数百回になり、512 個の
@@ -1660,6 +1684,22 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
       }
     }
   }
+  // 集光で見つかった光子数の分布。SPPM の分散を直接動かしているのはここ。
+  // 平均だけでなくばらつきを見たいので 2 乗和も取る
+  if ((seed & 63u) == 0u) {
+    let mi = u32(m);
+    atomicAdd(&grid[statOff() + 2u], 1u);
+    atomicAdd(&grid[statOff() + 3u], mi);
+    atomicAdd(&grid[statOff() + 4u], mi * mi);
+    if (m > 1.0 && powSum > 0.0) {
+      let mu = powSum / m;
+      let v = max(powSq / m - mu * mu, 0.0);
+      // 変動係数を 100 倍の固定小数で貯める (WGSL に f32 の atomic がない)
+      atomicAdd(&grid[statOff() + 5u], 1u);
+      atomicAdd(&grid[statOff() + 6u], u32(min(sqrt(v) / mu, 40.0) * 100.0));
+    }
+  }
+
   // 記録は間引いてよい。ヒストグラムは何フレームも貯め続けるので、
   // 1 フレームで密に集める必要はない
   if (creditBin >= 0.0 && f32(seed >> 22u) < CREDIT_RATE * 1024.0) {
@@ -2044,7 +2084,7 @@ fn clearGrid(@builtin(global_invocation_id) gid: vec3u) {
   if (reset && gid.x < HIST_BINS) {
     atomicStore(&grid[histOff() + gid.x], 0u);
   }
-  if (gid.x < 2u) {
+  if (gid.x < 7u) {
     atomicStore(&grid[statOff() + gid.x], 0u);
   }
   if (gid.x == 0u) {

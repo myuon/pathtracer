@@ -297,6 +297,16 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
     v = v + hist[o + 2u].rgb / (3.14159265 * r * r * max(U.photonsEmitted, 1.0));
   }
 
+  // 直接光と間接光を分けて見る。どちらがノイズを持ち込んでいるかの切り分け用。
+  // 比べられるよう、通常描画と同じトーンマップを通す
+  if (U.debugMode == 9u || U.debugMode == 10u) {
+    let direct = c.rgb / max(c.w, 1.0);
+    var part = direct;
+    if (U.debugMode == 10u) {
+      part = v - direct;
+    }
+    return vec4f(pow(acesFilm(part), vec3f(1.0 / 2.2)), 1.0);
+  }
   if (U.debugMode != 0u) {
     // 中間量はそのまま見たいのでトーンマップもガンマも通さない
     return vec4f(clamp(v, vec3f(0.0), vec3f(1.0)), 1.0);
