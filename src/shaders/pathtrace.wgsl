@@ -199,10 +199,10 @@ const BVH_STACK: u32 = 24u;
 
 /// 光源側の経路頂点 1 個が使うスロット数 (vec4f 単位)。
 /// [0] 位置 + dVCM / [1] 入射方向 + dVC / [2] 経路の重み + 放出方向のビン
-/// [3] 法線 + 材質の種類 / [4] アルベド + 粗さ
+/// [3] 法線 + 材質の種類 / [4] アルベド + 粗さ / [5] dVM
 /// 後半 2 つは VCM の接続 (camera 側の頂点とつなぐ) で光源側の BSDF を
 /// 評価するために要る。SPPM の集光だけなら [0..2] しか使わない
-const VTX_SLOTS: u32 = 5u;
+const VTX_SLOTS: u32 = 6u;
 
 /// 光子 1 本が堆積できる回数の上限。白い部屋では光子が 3〜5 回跳ねるので、
 /// 2 回で打ち切ると間接光がごっそり欠ける。水面越しの集光はさらに跳ねるため、
@@ -1163,7 +1163,7 @@ fn sampleDirectLight(
     let emissionPdfW = emissionPdfDir(ln / area, -wi) / (area * f32(n));
     let wLight = bsdfPdfFor(hit, rayDir, wi) / pL;
     let wCamera = emissionPdfW * cosToLight / (pL * cosLight)
-      * (dVCMc + dVCc * bsdfPdfFor(hit, -wi, -rayDir));
+      * (etaVcm() + dVCMc + dVCc * bsdfPdfFor(hit, -wi, -rayDir));
     weight = 1.0 / (wLight + 1.0 + wCamera);
   } else if (U.mis != 0u) {
     weight = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
@@ -1339,6 +1339,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   let useVcm = U.vcm != 0u && U.photonCount > 0u;
   var dVCMc = 0.0;
   var dVCc = 0.0;
+  var dVMc = 0.0;
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
@@ -1420,6 +1421,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     if (useVcm && cosInC > 1e-6) {
       dVCMc = dVCMc * hit.t * hit.t / cosInC;
       dVCc = dVCc / cosInC;
+      dVMc = dVMc / cosInC;
     }
 
     // 光源に当たったときの放射。NEE と重複するぶんを MIS 重みで削る
@@ -1460,6 +1462,9 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     if (useVcm && isDiffuseLike(hit.mat)) {
       var st = vec3f(0.0);
       radiance = radiance + throughput * connectToLightVertex(hit, ray.dir, dVCMc, dVCc, &st);
+      if (VCM_MERGE) {
+        radiance = radiance + throughput * mergeAtVertex(hit, ray.dir, dVCMc, dVCc, dVMc);
+      }
       if (depth == 0u) {
         (*aov).connStat = st;
       }
@@ -1490,12 +1495,15 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
       if (pF > 0.0) {
         let pR = bsdfPdfFor(hit, -scattered.dir, -ray.dir);
         let cosOut = abs(dot(hit.normal, scattered.dir));
-        dVCc = (cosOut / pF) * (dVCc * pR + dVCMc);
+        let eta = etaVcm();
+        dVCc = (cosOut / pF) * (dVCc * pR + dVCMc + eta);
+        dVMc = (cosOut / pF) * (dVMc * pR + dVCMc / eta + 1.0);
         dVCMc = 1.0 / pF;
       } else {
-        // デルタ的な散乱。方向を選ぶ確率が定義できないので接続もできない
+        // デルタ的な散乱。方向を選ぶ確率が定義できないので接続も同一視もできない
         dVCc = 0.0;
         dVCMc = 0.0;
+        dVMc = 0.0;
       }
     }
 
@@ -1550,7 +1558,6 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
   let d = traceSppm(makeRay(px, py, sample2d(1u, true)), radius, &newFlux, &m);
 
   // SPPM の半径・フラックス更新 (Hachisuka & Jensen)
-  let ALPHA = 0.7;
   if (nAcc + m > 0.0) {
     let ratio = (nAcc + ALPHA * m) / (nAcc + m);
     radius = radius * sqrt(ratio);
@@ -1751,6 +1758,33 @@ fn lightVertexAlive(base: u32) -> bool {
   return u32(v - kind * 65536.0) == (U.frameIndex % 65536u);
 }
 
+/// merging を MIS に統合するか。**まだ正しくない** ので既定は false。
+/// 有効にすると偏りもノイズも悪化する (cornell +0.62% -> +2.30%,
+/// ノイズ 1.63 -> 1.99)。二重計上しているが、どの項かは未特定。
+/// merging の重み式・dVM の漸化式・光源側と camera 側の対応のどこかにある
+const VCM_MERGE: bool = false;
+
+/// 半径の縮み方。0 と 1 の間なら、反復とともに半径は 0 に、累積光子数は
+/// 無限に増える。SPPM と VCM で同じ値を使う
+const ALPHA: f32 = 0.7;
+
+/// VCM の半径。SPPM の画素ごとの半径と違い、全体で 1 つの値を反復ごとに縮める
+fn vcmRadius() -> f32 {
+  let it = f32(U.samplesBefore) / f32(max(U.sppPerFrame, 1u)) + 1.0;
+  return U.radius0 * pow(max(it, 1.0), (ALPHA - 1.0) * 0.5);
+}
+
+/// merging の戦略 1 個が connection 何個ぶんに相当するかの比。
+/// 半径 r の円盤に光子が入る確率が pi r^2 * 本数 に比例することから来る
+fn etaVcm() -> f32 {
+  if (!VCM_MERGE) {
+    // merging を戦略として使わないなら、他の戦略の重みからも外す必要がある
+    return 0.0;
+  }
+  let r = vcmRadius();
+  return PI * r * r * f32(max(U.photonCount, 1u));
+}
+
 /// 候補として引く光源側の頂点の数。影レイを撃たずに評価するので安い
 /// 候補として引く光源側の頂点の数。影レイを撃たずに評価するので安い
 const RIS_CANDIDATES: u32 = 8u;
@@ -1818,6 +1852,53 @@ fn candidateScore(hit: Hit, rayDir: vec3f, base: u32) -> f32 {
     return 0.0;
   }
   return luminanceOf(photons[base + 2u].xyz) * cosCam * cosLight / dist2;
+}
+
+/// カメラ側の頂点で、半径内にある光源側の頂点を同一視して集める (merging)。
+/// 影レイが要らないので遮蔽に強い。半径ぶんのボケが乗るが、反復とともに
+/// 半径が縮むので消える
+fn mergeAtVertex(
+  hit: Hit,
+  rayDir: vec3f,
+  dVCMc: f32,
+  dVCc: f32,
+  dVMc: f32,
+) -> vec3f {
+  let r = vcmRadius();
+  let r2 = r * r;
+  let invEta = 1.0 / etaVcm();
+  var sum = vec3f(0.0);
+  let c = gridCoord(hit.p);
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        let cell = gridHash(c.x + dx, c.y + dy, c.z + dz);
+        let cnt = min(atomicLoad(&grid[cell]), GRID_CAP);
+        for (var k = 0u; k < cnt; k = k + 1u) {
+          let pi = atomicLoad(&grid[U.gridCells + cell * GRID_CAP + k]);
+          let base = pi * VTX_SLOTS;
+          let d = photons[base + 0u].xyz - hit.p;
+          if (dot(d, d) > r2) {
+            continue;
+          }
+          let wi = -photons[base + 1u].xyz;
+          let cosI = dot(hit.normal, wi);
+          if (cosI <= 1e-4) {
+            continue;
+          }
+          // bsdfEval は f * cos を返すので、余弦で割って裸の BSDF に戻す
+          let f = bsdfEval(hit, rayDir, wi) / cosI;
+          let pF = bsdfPdfFor(hit, rayDir, wi);
+          let pR = bsdfPdfFor(hit, -wi, -rayDir);
+          let wLight = photons[base + 0u].w * invEta + photons[base + 5u].x * pF;
+          let wCamera = dVCMc * invEta + dVMc * pR;
+          let mis = 1.0 / (wLight + 1.0 + wCamera);
+          sum = sum + f * photons[base + 2u].xyz * mis;
+        }
+      }
+    }
+  }
+  return sum / (PI * r2 * f32(max(U.photonCount, 1u)));
 }
 
 /// カメラ側の頂点 1 個を、光源側の経路の頂点 1 個とつなぐ。
@@ -1895,9 +1976,10 @@ fn connectToLightVertex(
   let camRevPdfW = bsdfPdfFor(hit, -dir, -rayDir);
   let lightPdfW = bsdfPdfFor(lv, lIn, -dir);
   let lightRevPdfW = bsdfPdfFor(lv, dir, -lIn);
+  let eta = etaVcm();
   let wLight = camPdfW * cosLight / dist2
-    * (photons[bestBase + 0u].w + photons[bestBase + 1u].w * lightRevPdfW);
-  let wCamera = lightPdfW * cosCam / dist2 * (dVCMc + dVCc * camRevPdfW);
+    * (eta + photons[bestBase + 0u].w + photons[bestBase + 1u].w * lightRevPdfW);
+  let wCamera = lightPdfW * cosCam / dist2 * (eta + dVCMc + dVCc * camRevPdfW);
   let mis = 1.0 / (wLight + 1.0 + wCamera);
 
   // RIS の重み。これで「全部の枠を足したもの」の不偏推定になる
@@ -1971,6 +2053,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
   /// VCM の MIS 用の量。環境マップからの光子には未対応なので 0 のまま
   var dVCM = 0.0;
   var dVC = 0.0;
+  var dVM = 0.0;
 
   if (pick >= U.lightCount) {
     // 環境マップ。CDF から方向を引き、外接球の外から中へ向けて撒く
@@ -2028,6 +2111,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     // どちらも pdf の比なので単位は無次元
     dVCM = 1.0 / pdf;
     dVC = cosE * area * f32(ln) / pdf;
+    dVM = dVC / etaVcm();
     // 出力 = 放射輝度 * 面積 * cos * (選択確率の逆数) / pdf。
     // 撒いた総数で割るのは present 側なので、ここでは割らない
     power = light.mat.emission * area * f32(ln) * cosE / pdf;
@@ -2051,6 +2135,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     if (cosIn > 1e-6) {
       dVCM = dVCM * hit.t * hit.t / cosIn;
       dVC = dVC / cosIn;
+      dVM = dVM / cosIn;
     }
 
     // SPPM では直接光はカメラ側の NEE が担当するので、1 回以上散乱した後だけ
@@ -2068,6 +2153,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       photons[slot * VTX_SLOTS + 3u] =
         vec4f(hit.normal, f32(kind) * 65536.0 + f32(U.frameIndex % 65536u));
       photons[slot * VTX_SLOTS + 4u] = vec4f(hit.mat.albedo, hit.mat.roughness);
+      photons[slot * VTX_SLOTS + 5u] = vec4f(dVM, 0.0, 0.0, 0.0);
       // 使われなかった枠は grid に載らないので、古い内容が参照されることはない
       depositPhoton(slot, hit.p);
     }
@@ -2085,7 +2171,9 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     if (pF > 0.0) {
       let pR = bsdfPdfFor(hit, -scattered.dir, -ray.dir);
       let cosOut = abs(dot(hit.normal, scattered.dir));
-      dVC = (cosOut / pF) * (dVC * pR + dVCM);
+      let eta = etaVcm();
+      dVC = (cosOut / pF) * (dVC * pR + dVCM + eta);
+      dVM = (cosOut / pF) * (dVM * pR + dVCM / eta + 1.0);
       dVCM = 1.0 / pF;
     }
 

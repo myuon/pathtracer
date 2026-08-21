@@ -182,7 +182,7 @@ export class Renderer {
     this.photonBuffer = this.device.createBuffer({
       // 1 本の光子が複数回堆積するので、その回数ぶんの枠を取る
       // 1 頂点 5 スロット。WGSL 側の VTX_SLOTS と一致させること
-      size: PHOTON_COUNT * MAX_DEPOSITS * 5 * 16,
+      size: PHOTON_COUNT * MAX_DEPOSITS * 6 * 16,
       usage: GPUBufferUsage.STORAGE,
       label: "photons",
     });
