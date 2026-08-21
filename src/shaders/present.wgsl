@@ -139,6 +139,40 @@ fn luminance(c: vec3f) -> f32 {
   return dot(c, vec3f(0.2126, 0.7152, 0.0722));
 }
 
+/// SPPM は稀に強い外れ値 (fire fly) を出す。それが a-trous のタップとして
+/// 遠くの画素にまで混ざると、タップの格子間隔 (4px, 8px, ...) に沿った
+/// 破線・点線状の「エコー」になって非常に目立つ (法線・距離・輝度が
+/// 近くても、値そのものが桁違いに大きいタップは重みだけでは弾き切れない)。
+/// 直近 (step=1) の 5x5 だけを見た局所平均を基準に、タップの値をクランプする
+const FIREFLY_MULT: f32 = 3.0;
+
+fn localIndirectLuma(x: u32, y: u32, g0: vec4f) -> f32 {
+  var sum = 0.0;
+  var wsum = 0.0;
+  for (var j = 0u; j < 5u; j = j + 1u) {
+    let ty = i32(y) + i32(j) - 2;
+    if (ty < 0 || ty >= i32(U.height)) { continue; }
+    for (var i = 0u; i < 5u; i = i + 1u) {
+      let tx = i32(x) + i32(i) - 2;
+      if (tx < 0 || tx >= i32(U.width)) { continue; }
+      let to = (u32(ty) * U.width + u32(tx)) * 4u;
+      let gt = hist[to + 3u];
+      let dn = g0.yz - gt.yz;
+      let dz = g0.w - gt.w;
+      let z0 = max(g0.w, 1.0);
+      let wn = exp(-dot(dn, dn) / SIGMA_N);
+      let wz = exp(-abs(dz) / (SIGMA_Z * z0));
+      let w = KERNEL5[i] * KERNEL5[j] * wn * wz;
+      let rt = max(gt.x, 1e-5);
+      let lum = luminance(hist[to + 2u].rgb) / (3.14159265 * rt * rt * max(U.photonsEmitted, 1.0));
+      sum = sum + lum * w;
+      wsum = wsum + w;
+    }
+  }
+  if (wsum < 1e-6) { return 0.0; }
+  return sum / wsum;
+}
+
 /// タップ (i, j) の空間・法線・距離・輝度の重みの積。
 /// g0/gt は hist[.+3] (半径, 法線oct, 距離)、l0/lt は中心・タップの直接光輝度
 fn atrousTapWeight(i: u32, j: u32, g0: vec4f, gt: vec4f, l0: f32, lt: f32) -> f32 {
@@ -159,6 +193,7 @@ fn denoiseIndirect(x: u32, y: u32) -> vec3f {
   let g0 = hist[o + 3u];
   let c0 = hist[o];
   let l0 = luminance(c0.rgb / max(c0.w, 1.0));
+  let localRef = localIndirectLuma(x, y, g0);
   var sum = vec3f(0.0);
   var wsum = 0.0;
   let steps = array<u32, 5>(1u, 2u, 4u, 8u, 16u);
@@ -176,7 +211,13 @@ fn denoiseIndirect(x: u32, y: u32) -> vec3f {
         let lt = luminance(ct.rgb / max(ct.w, 1.0));
         let w = atrousTapWeight(i, j, g0, gt, l0, lt);
         let rt = max(gt.x, 1e-5);
-        let indirect = hist[to + 2u].rgb / (3.14159265 * rt * rt * max(U.photonsEmitted, 1.0));
+        var indirect = hist[to + 2u].rgb / (3.14159265 * rt * rt * max(U.photonsEmitted, 1.0));
+        // fire fly クランプ。局所平均の何倍までしか許さない
+        let lt2 = luminance(indirect);
+        let cap = localRef * FIREFLY_MULT + 1e-4;
+        if (lt2 > cap) {
+          indirect = indirect * (cap / lt2);
+        }
         sum = sum + indirect * w;
         wsum = wsum + w;
       }
