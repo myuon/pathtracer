@@ -261,6 +261,8 @@ const GUIDE_BINS: u32 = 64u;
 /// 学習した分布を使う確率。残りは今までどおり BSDF から引く。
 /// 混ぜておかないと pdf が 0 の方向ができて破綻する
 const GUIDE_MIX_C: f32 = 0.5;
+/// 教師データとして覚えておく頂点の数。深い頂点ほど寄与が小さいので浅い側だけ
+const GUIDE_REC: u32 = 4u;
 
 fn guideOff() -> u32 {
   return statOff() + 8u;
@@ -1496,6 +1498,15 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   var dVMc = 0.0;
   let useGuide = U.guide != 0u;
   var mdir = vec3f(0.0);
+  // ガイディングの教師データ。各頂点で「サンプルした方向から実際に
+  // どれだけの放射輝度が返ってきたか」を、経路を最後までたどってから
+  // 書き戻す。NEE の寄与を教師にすると「NEE が既に拾えている方向」を
+  // 学習するだけで冗長になり、分散が減らない
+  var gN = 0u;
+  var gPos = array<vec3f, GUIDE_REC>();
+  var gDir = array<vec3f, GUIDE_REC>();
+  var gThr = array<f32, GUIDE_REC>();
+  var gRad = array<f32, GUIDE_REC>();
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
@@ -1609,11 +1620,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
         * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw, &mdir,
           useVcm, dVCMc, dVCc);
       radiance = radiance + nee;
-      // 光が来た方向を学習する。NEE は「そこに光がある」と分かっている
-      // 方向なので、いちばん質の良い教師データになる
-      if (useGuide) {
-        guideRecord(hit.p, mdir, luminanceOf(nee / max(throughput, vec3f(1e-6))));
-      }
+
       if (depth == 0u) {
         (*aov).misWeight = mw;
       }
@@ -1637,7 +1644,9 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     // 学習した分布と BSDF の混合から方向を引く。混ぜてあるので pdf が 0 の
     // 方向はできない = 不偏性が保たれる。拡散面だけを対象にする
     var guidedPdf = -1.0;
-    if (useGuide && hit.mat.kind == MAT_LAMBERT && guideHasData(guideVoxel(hit.p))) {
+    let guideHere = useGuide && hit.mat.kind == MAT_LAMBERT
+      && guideHasData(guideVoxel(hit.p));
+    if (guideHere) {
       let vox = guideVoxel(hit.p);
       var wi: vec3f;
       if (rand() < GUIDE_MIX_C) {
@@ -1646,16 +1655,20 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
         wi = normalize(onb(hit.normal) * cosineHemisphere(vec2f(rand(), rand())));
       }
       let cosI = dot(hit.normal, wi);
-      if (cosI > 1e-6) {
-        let pd = (1.0 - GUIDE_MIX_C) * cosI * INV_PI + GUIDE_MIX_C * guidePdf(vox, wi);
-        if (pd > 0.0) {
-          attenuation = bsdfEval(hit, ray.dir, wi) / pd;
-          scattered = Ray(hit.p + hit.normal * 1e-4, wi);
-          guidedPdf = pd;
-        }
+      // 面の裏に出た方向はここで打ち切る。scatter() に差し戻すと、
+      // 実際にサンプルした分布が混合分布と違うものになって偏る
+      if (cosI <= 1e-6) {
+        break;
       }
+      let pd = (1.0 - GUIDE_MIX_C) * cosI * INV_PI + GUIDE_MIX_C * guidePdf(vox, wi);
+      if (pd <= 0.0) {
+        break;
+      }
+      attenuation = bsdfEval(hit, ray.dir, wi) / pd;
+      scattered = Ray(hit.p + hit.normal * 1e-4, wi);
+      guidedPdf = pd;
     }
-    if (guidedPdf < 0.0) {
+    if (!guideHere) {
       if (!scatter(ray, hit, sample2d(3u + depth * 2u, depth < QMC_DEPTH), &attenuation, &scattered)) {
         break;
       }
@@ -1697,6 +1710,15 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     }
 
     throughput = throughput * attenuation;
+    // この頂点でサンプルした方向を覚えておく。返ってきた放射輝度は
+    // 経路が終わってから (最終値 - ここまでの値) / スループット で出る
+    if (useGuide && gN < GUIDE_REC && hit.mat.kind == MAT_LAMBERT) {
+      gPos[gN] = hit.p;
+      gDir[gN] = scattered.dir;
+      gThr[gN] = max(luminanceOf(throughput), 1e-6);
+      gRad[gN] = luminanceOf(radiance);
+      gN = gN + 1u;
+    }
     ray = scattered;
 
     // ロシアンルーレット (4 バウンス目以降)
@@ -1706,6 +1728,13 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
         break;
       }
       throughput = throughput / max(q, 1e-4);
+    }
+  }
+  // 覚えておいた各頂点に、その方向から返ってきた放射輝度を書き戻す
+  if (useGuide) {
+    let lf = luminanceOf(radiance);
+    for (var i = 0u; i < gN; i = i + 1u) {
+      guideRecord(gPos[i], gDir[i], max(lf - gRad[i], 0.0) / gThr[i]);
     }
   }
   return radiance;
