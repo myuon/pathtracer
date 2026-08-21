@@ -234,6 +234,16 @@ fn cdfOff() -> u32 {
   return histOff() + HIST_BINS;
 }
 
+/// カメラ側が実際に集光しているセルの印。光子がそこへ届いたかを数えるのに使う。
+/// カメラが止まっていれば印は変わらないので、消さずに貯め続ける
+fn markOff() -> u32 {
+  return cdfOff() + HIST_BINS + 1u;
+}
+/// [0] 今フレームの堆積の総数 / [1] そのうち集光している場所に入った数
+fn statOff() -> u32 {
+  return markOff() + U.gridCells;
+}
+
 fn dirToBin(d: vec3f) -> u32 {
   let it = min(u32((d.y * 0.5 + 0.5) * f32(HIST_THETA)), HIST_THETA - 1u);
   let ip = min(u32((atan2(d.z, d.x) / (2.0 * PI) + 0.5) * f32(HIST_PHI)), HIST_PHI - 1u);
@@ -1314,6 +1324,12 @@ fn aovColor(a: Aov) -> vec3f {
   if (U.debugMode == 6u) {
     return vec3f(a.bounces / max(f32(U.maxBounces), 1.0));
   }
+  if (U.debugMode == 8u) {
+    // 画面全体を単色で塗る。赤 = 集光している場所に届いた光子の割合
+    let tot = f32(atomicLoad(&grid[statOff()]));
+    let hit = f32(atomicLoad(&grid[statOff() + 1u]));
+    return vec3f(select(0.0, hit / tot, tot > 0.0), tot / 4096.0, 0.0);
+  }
   if (U.debugMode == 7u) {
     // 赤: 枠に今フレームの頂点が入っていた割合
     // 緑: そのうち遮蔽を抜けた割合
@@ -1607,6 +1623,9 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
   let seed = pcg(bitcast<u32>(hit.p.x) ^ bitcast<u32>(hit.p.z) ^ U.frameIndex);
   let r2 = r * r;
   let c = gridCoord(hit.p);
+  // ここが「カメラが集光している場所」。印を付けておき、次のフレームの
+  // 光子がここへ届いたかを数えて、無駄になっている割合を出す
+  atomicStore(&grid[markOff() + gridHash(c.x, c.y, c.z)], 1u);
   for (var dz = -1; dz <= 1; dz = dz + 1) {
     for (var dy = -1; dy <= 1; dy = dy + 1) {
       for (var dx = -1; dx <= 1; dx = dx + 1) {
@@ -1779,6 +1798,13 @@ fn lightVertexAlive(base: u32) -> bool {
 ///   cornell  PT 比 +0.72%   (修正前 +2.30%)
 ///   ajar     SPPM 比 +2.80% (約 300 spp 時点。収束不足の可能性あり)
 ///
+/// merging を MIS に統合するか。正しく動くようになったが、接続のみの構成の
+/// 15 倍遅い (267 ms 対 3893 ms) ので既定は false。等時間では接続のみが勝つ。
+///
+///   cornell  PT 比 +0.72%   (修正前 +2.30%)
+///   ajar     SPPM 比 +2.80% (約 300 spp 時点。収束不足の可能性あり)
+const VCM_MERGE: bool = false;
+
 /// 半径の縮み方。0 と 1 の間なら、反復とともに半径は 0 に、累積光子数は
 /// 無限に増える。SPPM と VCM で同じ値を使う
 const ALPHA: f32 = 0.7;
@@ -2018,6 +2044,9 @@ fn clearGrid(@builtin(global_invocation_id) gid: vec3u) {
   if (reset && gid.x < HIST_BINS) {
     atomicStore(&grid[histOff() + gid.x], 0u);
   }
+  if (gid.x < 2u) {
+    atomicStore(&grid[statOff() + gid.x], 0u);
+  }
   if (gid.x == 0u) {
     if (reset) {
       for (var i = 0u; i <= HIST_BINS; i = i + 1u) {
@@ -2046,6 +2075,13 @@ fn depositPhoton(index: u32, p: vec3f) {
   let slot = atomicAdd(&grid[cell], 1u);
   if (slot < GRID_CAP) {
     atomicStore(&grid[U.gridCells + cell * GRID_CAP + slot], index);
+  }
+  // 無駄になっている光子の割合を測る。全部数えると atomic が詰まるので間引く
+  if ((index & 63u) == 0u) {
+    atomicAdd(&grid[statOff()], 1u);
+    if (atomicLoad(&grid[markOff() + cell]) != 0u) {
+      atomicAdd(&grid[statOff() + 1u], 1u);
+    }
   }
 }
 

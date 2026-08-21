@@ -190,7 +190,7 @@ export class Renderer {
     this.gridBuffer = this.device.createBuffer({
       // 後ろにヒストグラムと CDF を間借りさせている。ストレージバッファの
       // 本数が上限に張り付いていて、専用のバッファを増やせないため
-      size: (GRID_CELLS * (1 + GRID_CAP) + 1 + HIST_BINS * 2 + 1) * 4,
+      size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 2) * 4,
       usage: GPUBufferUsage.STORAGE,
       label: "grid",
     });
