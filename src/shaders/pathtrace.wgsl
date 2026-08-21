@@ -1714,6 +1714,11 @@ fn lightVertexHit(base: u32) -> Hit {
 /// この枠に今フレームの頂点が入っているか。使われなかった枠には
 /// 前フレームの内容が残るので、フレーム番号を一緒に入れて見分ける
 fn lightVertexAlive(base: u32) -> bool {
+  // 環境マップから撒いた光子は dVCM / dVC を計算していないので接続に使えない。
+  // 放出方向のビンが負のものがそれ (面光源からのものは必ず 0 以上)
+  if (photons[base + 2u].w < 0.0) {
+    return false;
+  }
   let v = photons[base + 3u].w;
   if (v <= 0.0) {
     return false;
