@@ -327,13 +327,18 @@ fn guideSample(vox: u32, u: f32, uv: vec2f) -> vec3f {
   return guideBinDir(lo, uv);
 }
 
-/// 光が来た方向を記録する。全部数えると atomic が詰まるので間引く
+/// 学習値の上限。これを超えたら全ビンを半分にする。
+/// u32 に足し続けると桁があふれて CDF が壊れ、しかも反復を重ねるほど
+/// 悪化する (誤差が spp とともに拡大するという妙な挙動になる)
+const GUIDE_CAP: u32 = 1u << 28u;
+
+/// 光が来た方向を記録する。1 回の記録が大きくなりすぎないよう抑える
 fn guideRecord(p: vec3f, d: vec3f, lum: f32) {
   if (lum <= 0.0) {
     return;
   }
   atomicAdd(&grid[guideOff() + guideVoxel(p) * GUIDE_BINS + guideBin(d)],
-    u32(min(lum * 64.0, 1.0e6)) + 1u);
+    u32(clamp(lum * 8.0, 0.0, 4096.0)) + 1u);
 }
 
 fn dirToBin(d: vec3f) -> u32 {
@@ -2269,6 +2274,12 @@ fn clearGrid(@builtin(global_invocation_id) gid: vec3u) {
       acc = acc + atomicLoad(&grid[hb + i]);
     }
     atomicStore(&grid[cb + GUIDE_BINS], acc);
+    // 溜まりすぎたら半分に減衰させる。形は保たれ、桁あふれだけ防げる
+    if (acc > GUIDE_CAP) {
+      for (var i = 0u; i < GUIDE_BINS; i = i + 1u) {
+        atomicStore(&grid[hb + i], atomicLoad(&grid[hb + i]) / 2u);
+      }
+    }
   }
   if (gid.x == 0u) {
     if (reset) {
