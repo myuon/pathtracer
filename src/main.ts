@@ -205,6 +205,7 @@ async function main() {
       // 画素ごとの統計 (半径や累積光子数) が意味を持たない
       sppm: ui.settings.sppm && !fast,
       vcm: ui.settings.vcm && !fast,
+      guide: ui.settings.guide,
       denoise: ui.settings.denoise,
       photonScale,
       paused: ui.settings.paused,

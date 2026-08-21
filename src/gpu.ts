@@ -115,6 +115,8 @@ export interface FrameParams {
   sppm: boolean;
   /// 光源側の経路頂点との接続 (VCM)
   vcm: boolean;
+  /// 空間 x 方向の分布を学習して BSDF サンプリングを寄せる
+  guide: boolean;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
   denoise: boolean;
   /** 1 反復あたりに撒く光子数の倍率 (1 以下) */
@@ -190,7 +192,7 @@ export class Renderer {
     this.gridBuffer = this.device.createBuffer({
       // 後ろにヒストグラムと CDF を間借りさせている。ストレージバッファの
       // 本数が上限に張り付いていて、専用のバッファを増やせないため
-      size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 8) * 4,
+      size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 8 + 4096 * 64 + 4096 * 65) * 4,
       usage: GPUBufferUsage.STORAGE,
       label: "grid",
     });
@@ -435,6 +437,7 @@ export class Renderer {
     f.set(this.sceneCenter, 72);
     f[75] = this.sceneRadius;
     u[76] = p.vcm ? 1 : 0;
+    u[77] = p.guide ? 1 : 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
@@ -472,10 +475,13 @@ export class Renderer {
       const compute = encoder.beginComputePass();
       compute.setBindGroup(0, this.computeBindGroups[write]);
 
-    if (sppm || vcm) {
-      // グリッドを空にする -> 光源側の経路を撒く
+    // グリッドを空にするパスは、ガイディングの CDF もここで作っている。
+    // 光源側の経路を撒かない構成でも通す必要がある
+    if (sppm || vcm || p.guide) {
       compute.setPipeline(this.clearGridPipeline);
       compute.dispatchWorkgroups(Math.ceil(GRID_CELLS / 64));
+    }
+    if (sppm || vcm) {
       compute.setPipeline(this.photonPipeline);
       compute.dispatchWorkgroups(Math.ceil(this.photonsThisFrame / 64));
     }

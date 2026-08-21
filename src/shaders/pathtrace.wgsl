@@ -69,6 +69,8 @@ struct Uniforms {
   sceneRadius: f32,
   /// カメラ側の頂点と光源側の頂点をつなぐ戦略 (VCM の vertex connection) を使うか
   vcm: u32,
+  /// 空間 x 方向の分布を学習して BSDF サンプリングを寄せるか
+  guide: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -243,6 +245,93 @@ fn markOff() -> u32 {
 /// [2] 集光の回数 / [3] 見つかった光子数の和 / [4] その 2 乗和
 fn statOff() -> u32 {
   return markOff() + U.gridCells;
+}
+
+// ---------------------------------------------------- パスガイディング
+// 「この辺りにいるときは、どの方向から光が来るか」を学習して、BSDF
+// サンプリングをそちらへ寄せる。BSDF は「面がどの方向へ光を返しやすいか」
+// しか知らないので、光源が狭い方向にしかないシーンでは当てが外れ続ける
+/// 空間の分割数 (1 辺)
+const GUIDE_DIM: u32 = 16u;
+const GUIDE_VOX: u32 = 4096u;
+/// 方向の分割数。cos(theta) と phi で等立体角に切る
+const GUIDE_TH: u32 = 8u;
+const GUIDE_PH: u32 = 8u;
+const GUIDE_BINS: u32 = 64u;
+/// 学習した分布を使う確率。残りは今までどおり BSDF から引く。
+/// 混ぜておかないと pdf が 0 の方向ができて破綻する
+const GUIDE_MIX_C: f32 = 0.5;
+
+fn guideOff() -> u32 {
+  return statOff() + 8u;
+}
+fn guideCdfOff() -> u32 {
+  return guideOff() + GUIDE_VOX * GUIDE_BINS;
+}
+
+/// 位置からボクセル番号。シーンの外接球で正規化する
+fn guideVoxel(p: vec3f) -> u32 {
+  let t = (p - U.sceneCenter) / max(U.sceneRadius, 1e-4) * 0.5 + vec3f(0.5);
+  let c = clamp(vec3u(t * f32(GUIDE_DIM)), vec3u(0u), vec3u(GUIDE_DIM - 1u));
+  return (c.z * GUIDE_DIM + c.y) * GUIDE_DIM + c.x;
+}
+
+fn guideBin(d: vec3f) -> u32 {
+  let it = min(u32((d.y * 0.5 + 0.5) * f32(GUIDE_TH)), GUIDE_TH - 1u);
+  let ip = min(u32((atan2(d.z, d.x) / (2.0 * PI) + 0.5) * f32(GUIDE_PH)), GUIDE_PH - 1u);
+  return it * GUIDE_PH + ip;
+}
+
+fn guideBinDir(bin: u32, u: vec2f) -> vec3f {
+  let cosT = ((f32(bin / GUIDE_PH) + u.x) / f32(GUIDE_TH)) * 2.0 - 1.0;
+  let phi = ((f32(bin % GUIDE_PH) + u.y) / f32(GUIDE_PH) - 0.5) * 2.0 * PI;
+  let sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+  return vec3f(sinT * cos(phi), cosT, sinT * sin(phi));
+}
+
+/// 立体角についての pdf。1 ビンの立体角は 4pi / GUIDE_BINS
+fn guidePdf(vox: u32, d: vec3f) -> f32 {
+  let base = guideCdfOff() + vox * (GUIDE_BINS + 1u);
+  let total = f32(atomicLoad(&grid[base + GUIDE_BINS]));
+  if (total <= 0.0) {
+    return 0.0;
+  }
+  let b = guideBin(d);
+  let lo = f32(atomicLoad(&grid[base + b]));
+  let hi = f32(atomicLoad(&grid[base + b + 1u]));
+  return ((hi - lo) / total) * (f32(GUIDE_BINS) / (4.0 * PI));
+}
+
+fn guideHasData(vox: u32) -> bool {
+  return atomicLoad(&grid[guideCdfOff() + vox * (GUIDE_BINS + 1u) + GUIDE_BINS]) > 0u;
+}
+
+fn guideSample(vox: u32, u: f32, uv: vec2f) -> vec3f {
+  let base = guideCdfOff() + vox * (GUIDE_BINS + 1u);
+  let pickAt = u32(u * f32(atomicLoad(&grid[base + GUIDE_BINS])));
+  var lo = 0u;
+  var hi = GUIDE_BINS;
+  loop {
+    if (lo + 1u >= hi) {
+      break;
+    }
+    let mid = (lo + hi) / 2u;
+    if (atomicLoad(&grid[base + mid]) <= pickAt) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return guideBinDir(lo, uv);
+}
+
+/// 光が来た方向を記録する。全部数えると atomic が詰まるので間引く
+fn guideRecord(p: vec3f, d: vec3f, lum: f32) {
+  if (lum <= 0.0) {
+    return;
+  }
+  atomicAdd(&grid[guideOff() + guideVoxel(p) * GUIDE_BINS + guideBin(d)],
+    u32(min(lum * 64.0, 1.0e6)) + 1u);
 }
 
 fn dirToBin(d: vec3f) -> u32 {
@@ -1091,6 +1180,21 @@ fn bsdfPdfFor(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
 /// Veach の power heuristic (beta = 2)。
 /// balance heuristic (pA / (pA + pB)) より重みが優れた戦略へ鋭く寄るので、
 /// 片方の戦略が明らかに良い領域で「劣る側に重みを配ってしまう」損が小さい
+/// BSDF サンプリング戦略の pdf。ガイディングを使っているときは混合分布の
+/// pdf を返す。MIS の重みはここと trace 側で必ず同じ式を使うこと。
+/// 片方だけ差し替えると重みの和が 1 にならず偏る
+fn samplingPdf(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
+  let pb = bsdfPdfFor(hit, rayDir, wi);
+  if (U.guide == 0u || hit.mat.kind != MAT_LAMBERT) {
+    return pb;
+  }
+  let vox = guideVoxel(hit.p);
+  if (!guideHasData(vox)) {
+    return pb;
+  }
+  return (1.0 - GUIDE_MIX_C) * pb + GUIDE_MIX_C * guidePdf(vox, wi);
+}
+
 fn misWeight(pA: f32, pB: f32) -> f32 {
   let a = pA * pA;
   let b = pB * pB;
@@ -1104,6 +1208,7 @@ fn sampleDirectLight(
   rayDir: vec3f,
   u: vec2f,
   misOut: ptr<function, f32>,
+  dirOut: ptr<function, vec3f>,
   useVcm: bool,
   dVCMc: f32,
   dVCc: f32,
@@ -1132,9 +1237,10 @@ fn sampleDirectLight(
     let tr = fogTransmittance(hit.p, wi, 1e30);
     var w = 1.0;
     if (U.mis != 0u) {
-      w = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
+      w = misWeight(pL, samplingPdf(hit, rayDir, wi));
     }
     *misOut = w;
+    *dirOut = wi;
     return envColor(wi) * fcos * tr * w / pL;
   }
 
@@ -1177,9 +1283,10 @@ fn sampleDirectLight(
       * (etaVcm() + dVCMc + dVCc * bsdfPdfFor(hit, -wi, -rayDir));
     weight = 1.0 / (wLight + 1.0 + wCamera);
   } else if (U.mis != 0u) {
-    weight = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
+    weight = misWeight(pL, samplingPdf(hit, rayDir, wi));
   }
   *misOut = weight;
+  *dirOut = wi;
   return light.mat.emission * fcos * trq * weight / pL;
 }
 
@@ -1387,6 +1494,8 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   }
   var dVCc = 0.0;
   var dVMc = 0.0;
+  let useGuide = U.guide != 0u;
+  var mdir = vec3f(0.0);
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
@@ -1413,7 +1522,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
           if (useNee) {
             var mw = 1.0;
             radiance = radiance + throughput
-              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw,
+              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw, &mdir,
           useVcm, dVCMc, dVCc);
             if (depth == 0u) {
               (*aov).misWeight = mw;
@@ -1496,9 +1605,15 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     // pdf を評価できる面だけ光源を直接サンプルする。デルタ面は BSDF サンプリングに任せる
     if (useNee && isDiffuseLike(hit.mat)) {
       var mw = 1.0;
-      radiance = radiance + throughput
-        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw,
+      let nee = throughput
+        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw, &mdir,
           useVcm, dVCMc, dVCc);
+      radiance = radiance + nee;
+      // 光が来た方向を学習する。NEE は「そこに光がある」と分かっている
+      // 方向なので、いちばん質の良い教師データになる
+      if (useGuide) {
+        guideRecord(hit.p, mdir, luminanceOf(nee / max(throughput, vec3f(1e-6))));
+      }
       if (depth == 0u) {
         (*aov).misWeight = mw;
       }
@@ -1519,12 +1634,39 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
 
     var attenuation: vec3f;
     var scattered: Ray;
-    if (!scatter(ray, hit, sample2d(3u + depth * 2u, depth < QMC_DEPTH), &attenuation, &scattered)) {
-      break;
+    // 学習した分布と BSDF の混合から方向を引く。混ぜてあるので pdf が 0 の
+    // 方向はできない = 不偏性が保たれる。拡散面だけを対象にする
+    var guidedPdf = -1.0;
+    if (useGuide && hit.mat.kind == MAT_LAMBERT && guideHasData(guideVoxel(hit.p))) {
+      let vox = guideVoxel(hit.p);
+      var wi: vec3f;
+      if (rand() < GUIDE_MIX_C) {
+        wi = guideSample(vox, rand(), vec2f(rand(), rand()));
+      } else {
+        wi = normalize(onb(hit.normal) * cosineHemisphere(vec2f(rand(), rand())));
+      }
+      let cosI = dot(hit.normal, wi);
+      if (cosI > 1e-6) {
+        let pd = (1.0 - GUIDE_MIX_C) * cosI * INV_PI + GUIDE_MIX_C * guidePdf(vox, wi);
+        if (pd > 0.0) {
+          attenuation = bsdfEval(hit, ray.dir, wi) / pd;
+          scattered = Ray(hit.p + hit.normal * 1e-4, wi);
+          guidedPdf = pd;
+        }
+      }
+    }
+    if (guidedPdf < 0.0) {
+      if (!scatter(ray, hit, sample2d(3u + depth * 2u, depth < QMC_DEPTH), &attenuation, &scattered)) {
+        break;
+      }
     }
     // 次の頂点で MIS 重みを計算するために pdf を持ち回る。
     // デルタ分布のマテリアルは光源サンプリングで作れない方向なので負にしておく
-    if (isDiffuseLike(hit.mat)) {
+    if (guidedPdf > 0.0) {
+      // ガイドしたときは MIS もこの pdf を使う。BSDF の pdf のままにすると
+      // 重みがずれて偏る
+      bsdfPdf = guidedPdf;
+    } else if (isDiffuseLike(hit.mat)) {
       let pv = bsdfPdfFor(hit, ray.dir, scattered.dir);
       // pdf が 0 の方向 (誘電体の透過ローブ) は光源サンプリングで作れないので
       // 負にしておき、MIS 重み 1 で扱う
@@ -1747,8 +1889,9 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
     if (hit.mat.kind == MAT_LAMBERT || hit.mat.kind == MAT_GGX) {
       if (useNee) {
         var mw = 1.0;
+        var mdir = vec3f(0.0);
         radiance = radiance + throughput
-          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw, false, 0.0, 0.0);
+          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw, &mdir, false, 0.0, 0.0);
 
         // MIS のもう一方の戦略。ここで経路を打ち切ってしまうと BSDF
         // サンプリング側の寄与が丸ごと消えるので、直接光のぶんだけ
@@ -2086,6 +2229,17 @@ fn clearGrid(@builtin(global_invocation_id) gid: vec3u) {
   }
   if (gid.x < 7u) {
     atomicStore(&grid[statOff() + gid.x], 0u);
+  }
+  // ガイディングの CDF をボクセルごとに作る。1 スレッドが 64 個舐めるだけ
+  if (gid.x < GUIDE_VOX) {
+    let hb = guideOff() + gid.x * GUIDE_BINS;
+    let cb = guideCdfOff() + gid.x * (GUIDE_BINS + 1u);
+    var acc = 0u;
+    for (var i = 0u; i < GUIDE_BINS; i = i + 1u) {
+      atomicStore(&grid[cb + i], acc);
+      acc = acc + atomicLoad(&grid[hb + i]);
+    }
+    atomicStore(&grid[cb + GUIDE_BINS], acc);
   }
   if (gid.x == 0u) {
     if (reset) {

@@ -32,6 +32,7 @@ export interface RenderSettings {
   /** SPPM を使う */
   sppm: boolean;
   vcm: boolean;
+  guide: boolean;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
   denoise: boolean;
   /** 1 フレームの GPU 時間が目標に収まるよう spp を自動調整する */
@@ -373,6 +374,7 @@ export function createUi(options: UiOptions): UiHandle {
     adaptive: true,
     paused: false,
     vcm: false,
+    guide: false,
   };
 
   const panel = document.createElement("div");
@@ -591,6 +593,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const guideRow = createToggleRow({
+    label: "path guiding",
+    value: settings.guide,
+    onChange: (v) => {
+      settings.guide = v;
+      notifyChange();
+    },
+  });
+
   const vcmRow = createToggleRow({
     label: "VCM (vertex connection)",
     value: settings.vcm,
@@ -651,6 +662,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(sppmRow);
   body.appendChild(denoiseRow);
   body.appendChild(vcmRow);
+  body.appendChild(guideRow);
   body.appendChild(pauseRow);
   body.appendChild(adaptiveRow);
   body.appendChild(fixedSeedRow);
