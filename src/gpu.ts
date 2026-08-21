@@ -75,6 +75,8 @@ const PHOTON_COUNT = 1 << 16;
 const GRID_CELLS = 1 << 18;
 /** 1 セルに入る光子の上限。WGSL 側の GRID_CAP と一致させること */
 const GRID_CAP = 96;
+/** 光子の放出方向を学習するヒストグラムのビン数。WGSL 側と一致させること */
+const HIST_BINS = 512;
 /** 光子 1 本が堆積できる回数。WGSL 側の MAX_DEPOSITS と一致させること */
 const MAX_DEPOSITS = 10;
 
@@ -181,7 +183,9 @@ export class Renderer {
     });
     // [セルごとの個数][セルごとの光子インデックス][書き込んだ光子の総数]
     this.gridBuffer = this.device.createBuffer({
-      size: (GRID_CELLS * (1 + GRID_CAP) + 1) * 4,
+      // 後ろにヒストグラムと CDF を間借りさせている。ストレージバッファの
+      // 本数が上限に張り付いていて、専用のバッファを増やせないため
+      size: (GRID_CELLS * (1 + GRID_CAP) + 1 + HIST_BINS * 2 + 1) * 4,
       usage: GPUBufferUsage.STORAGE,
       label: "grid",
     });

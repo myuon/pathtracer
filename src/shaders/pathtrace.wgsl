@@ -199,6 +199,78 @@ const BVH_STACK: u32 = 24u;
 /// 6 -> 10 でノイズが 3.26 -> 1.23 まで落ちた
 const MAX_DEPOSITS: u32 = 10u;
 
+// -------------------------------------------- 光子の放出方向のガイディング
+// 光源から無誘導に撒くと、狭い隙間の向こうにしか使い道がないシーンでは
+// ほとんどの光子が無駄になる。実際に集光で使われた光子の放出方向を
+// ヒストグラムに貯めておき、次のフレームはそちらへ優先的に撒く。
+// pdf で割るので推定値は不偏のまま
+/// 方向のヒストグラム。cos(theta) と phi で切ると 1 ビンが等立体角になる
+const HIST_THETA: u32 = 16u;
+const HIST_PHI: u32 = 32u;
+const HIST_BINS: u32 = 512u;
+/// 学習した分布を使う確率。残りは今までどおり余弦分布で撒く。
+/// 混ぜておかないと学習が偏ったときに pdf が 0 の方向ができて破綻する
+const GUIDE_MIX: f32 = 0.5;
+/// 集光に使われた光子を記録する確率。全部記録すると atomic が詰まる。
+/// 間引いても期待値は変わらないので分布の形は保たれる
+const CREDIT_RATE: f32 = 1.0 / 32.0;
+
+/// grid バッファの後ろに間借りしている。ストレージバッファの本数が
+/// 上限に張り付いているので、専用のバッファを増やせない
+fn histOff() -> u32 {
+  return U.gridCells * (1u + GRID_CAP) + 1u;
+}
+fn cdfOff() -> u32 {
+  return histOff() + HIST_BINS;
+}
+
+fn dirToBin(d: vec3f) -> u32 {
+  let it = min(u32((d.y * 0.5 + 0.5) * f32(HIST_THETA)), HIST_THETA - 1u);
+  let ip = min(u32((atan2(d.z, d.x) / (2.0 * PI) + 0.5) * f32(HIST_PHI)), HIST_PHI - 1u);
+  return it * HIST_PHI + ip;
+}
+
+/// ビンの中を一様に引く
+fn binToDir(bin: u32, u: vec2f) -> vec3f {
+  let cosT = ((f32(bin / HIST_PHI) + u.x) / f32(HIST_THETA)) * 2.0 - 1.0;
+  let phi = ((f32(bin % HIST_PHI) + u.y) / f32(HIST_PHI) - 0.5) * 2.0 * PI;
+  let sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+  return vec3f(sinT * cos(phi), cosT, sinT * sin(phi));
+}
+
+fn histTotal() -> u32 {
+  return atomicLoad(&grid[cdfOff() + HIST_BINS]);
+}
+
+/// 立体角についての pdf。1 ビンの立体角は 4pi / HIST_BINS
+fn histPdf(bin: u32) -> f32 {
+  let total = f32(histTotal());
+  if (total <= 0.0) {
+    return 0.0;
+  }
+  let lo = f32(atomicLoad(&grid[cdfOff() + bin]));
+  let hi = f32(atomicLoad(&grid[cdfOff() + bin + 1u]));
+  return ((hi - lo) / total) * (f32(HIST_BINS) / (4.0 * PI));
+}
+
+fn sampleHistBin(u: f32) -> u32 {
+  let pickAt = u32(u * f32(histTotal()));
+  var lo = 0u;
+  var hi = HIST_BINS;
+  loop {
+    if (lo + 1u >= hi) {
+      break;
+    }
+    let mid = (lo + hi) / 2u;
+    if (atomicLoad(&grid[cdfOff() + mid]) <= pickAt) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
 fn gridHash(ix: i32, iy: i32, iz: i32) -> u32 {
   let h = (u32(ix) * 73856093u) ^ (u32(iy) * 19349663u) ^ (u32(iz) * 83492791u);
   return h % U.gridCells;
@@ -1395,6 +1467,11 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
 fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> vec3f {
   var sum = vec3f(0.0);
   var m = 0.0;
+  // 放出方向の学習用。サンプラの列を乱さないよう、rand() ではなく
+  // 位置とフレーム番号から作った別のハッシュを使う
+  var creditBin = -1.0;
+  var seen = 0u;
+  let seed = pcg(bitcast<u32>(hit.p.x) ^ bitcast<u32>(hit.p.z) ^ U.frameIndex);
   let r2 = r * r;
   let c = gridCoord(hit.p);
   for (var dz = -1; dz <= 1; dz = dz + 1) {
@@ -1416,9 +1493,25 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
           // bsdfEval は f * cos を返すので、余弦で割って裸の BRDF に戻す
           sum = sum + (bsdfEval(hit, rayDir, wi) / cosI) * photons[pi * 3u + 2u].xyz;
           m = m + 1.0;
+
+          // 使われた光子の放出方向を 1 個だけ選んで覚えておく (貯留サンプリング)。
+          // ここで毎回 atomicAdd すると 1 画素あたり数百回になり、512 個の
+          // アドレスに集中して桁違いに遅くなる。1 回の集光につき 1 個で足りる
+          let bin = photons[pi * 3u + 1u].w;
+          if (bin >= 0.0) {
+            seen = seen + 1u;
+            if (pcg(u32(m) * 2654435761u + seed) % seen == 0u) {
+              creditBin = bin;
+            }
+          }
         }
       }
     }
+  }
+  // 記録は間引いてよい。ヒストグラムは何フレームも貯め続けるので、
+  // 1 フレームで密に集める必要はない
+  if (creditBin >= 0.0 && f32(seed >> 22u) < CREDIT_RATE * 1024.0) {
+    atomicAdd(&grid[histOff() + u32(creditBin)], 1u);
   }
   *found = m;
   return sum;
@@ -1514,6 +1607,27 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
 /// グリッドの個数カウンタを 0 に戻す
 @compute @workgroup_size(64, 1, 1)
 fn clearGrid(@builtin(global_invocation_id) gid: vec3u) {
+  // 累積をやり直すときは学習した分布も捨てる。カメラが動くと
+  // 「役に立つ方向」が変わるので、前の視点の学習は使えない
+  let reset = U.samplesBefore == 0u;
+  if (reset && gid.x < HIST_BINS) {
+    atomicStore(&grid[histOff() + gid.x], 0u);
+  }
+  if (gid.x == 0u) {
+    if (reset) {
+      for (var i = 0u; i <= HIST_BINS; i = i + 1u) {
+        atomicStore(&grid[cdfOff() + i], 0u);
+      }
+    } else {
+      // 頭からの累積和を作る。512 個なので 1 スレッドで舐めても問題ない
+      var acc = 0u;
+      for (var i = 0u; i < HIST_BINS; i = i + 1u) {
+        atomicStore(&grid[cdfOff() + i], acc);
+        acc = acc + atomicLoad(&grid[histOff() + i]);
+      }
+      atomicStore(&grid[cdfOff() + HIST_BINS], acc);
+    }
+  }
   if (gid.x >= U.gridCells) {
     return;
   }
@@ -1544,6 +1658,8 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
   let pick = min(u32(rand() * f32(ln)), ln - 1u);
   var power: vec3f;
   var ray: Ray;
+  /// この光子を放出した方向のビン。環境マップからの光子は学習の対象外なので -1
+  var emitBin = -1.0;
 
   if (pick >= U.lightCount) {
     // 環境マップ。CDF から方向を引き、外接球の外から中へ向けて撒く
@@ -1562,21 +1678,44 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     power = envColor(smp.xyz) * PI * U.sceneRadius * U.sceneRadius * f32(ln) / smp.w;
     ray = Ray(origin, dir);
   } else {
-    // 面光源。面上の点と余弦分布の方向をサンプルする
+    // 面光源。面上の点をとり、方向は「学習した分布」と「余弦分布」の
+    // 混合から引く。混ぜてあるので、学習が偏っても pdf が 0 の方向は
+    // できない = 不偏性が保たれる
     let light = quads[indices[pick]];
     let n = cross(light.u, light.v);
     let area = length(n);
-    var nrm = n / area;
-    // 発光面は両面なので、どちら側に出すかを選んで重みを倍にする
-    if (rand() < 0.5) {
-      nrm = -nrm;
-    }
+    let nrm = n / area;
     let origin = light.q + light.u * rand() + light.v * rand();
-    let dir = normalize(onb(nrm) * cosineHemisphere(vec2f(rand(), rand())));
-    // 出力 = 放射輝度 * 面積 * PI * (選択確率の逆数) * (表裏の選択で 2 倍)。
+
+    let learned = histTotal() > 0u;
+    var dir: vec3f;
+    if (learned && rand() < GUIDE_MIX) {
+      dir = binToDir(sampleHistBin(rand()), vec2f(rand(), rand()));
+    } else {
+      // 発光面は両面なので、どちら側に出すかを選ぶ
+      var side = nrm;
+      if (rand() < 0.5) {
+        side = -side;
+      }
+      dir = normalize(onb(side) * cosineHemisphere(vec2f(rand(), rand())));
+    }
+    let cosE = abs(dot(dir, nrm));
+    if (cosE <= 1e-6) {
+      return;
+    }
+    // 余弦側の pdf は表裏の選択を含めて 0.5 * cos / PI
+    var pdf = 0.5 * cosE / PI;
+    if (learned) {
+      pdf = (1.0 - GUIDE_MIX) * pdf + GUIDE_MIX * histPdf(dirToBin(dir));
+    }
+    if (pdf <= 0.0) {
+      return;
+    }
+    emitBin = f32(dirToBin(dir));
+    // 出力 = 放射輝度 * 面積 * cos * (選択確率の逆数) / pdf。
     // 撒いた総数で割るのは present 側なので、ここでは割らない
-    power = light.mat.emission * area * PI * f32(ln) * 2.0;
-    ray = Ray(origin + nrm * 1e-4, dir);
+    power = light.mat.emission * area * f32(ln) * cosE / pdf;
+    ray = Ray(origin + dir * 1e-4, dir);
   }
 
   // 格納先はスレッドごとに固定枠を取る。単一アドレスへの atomicAdd で
@@ -1596,7 +1735,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       let slot = gid.x * MAX_DEPOSITS + localSlot;
       localSlot = localSlot + 1u;
       photons[slot * 3u + 0u] = vec4f(hit.p, 1.0);
-      photons[slot * 3u + 1u] = vec4f(ray.dir, 0.0);
+      photons[slot * 3u + 1u] = vec4f(ray.dir, emitBin);
       photons[slot * 3u + 2u] = vec4f(power, 0.0);
       // 使われなかった枠は grid に載らないので、古い内容が参照されることはない
       depositPhoton(slot, hit.p);
