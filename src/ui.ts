@@ -374,7 +374,7 @@ export function createUi(options: UiOptions): UiHandle {
     adaptive: true,
     paused: false,
     vcm: false,
-    guide: false,
+    guide: true,
   };
 
   const panel = document.createElement("div");
