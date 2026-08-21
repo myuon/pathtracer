@@ -195,6 +195,13 @@ const GRID_CAP: u32 = 96u;
 /// 食うので、余裕を見つつ小さくしておく
 const BVH_STACK: u32 = 24u;
 
+/// 光源側の経路頂点 1 個が使うスロット数 (vec4f 単位)。
+/// [0] 位置 + dVCM / [1] 入射方向 + dVC / [2] 経路の重み + 放出方向のビン
+/// [3] 法線 + 材質の種類 / [4] アルベド + 粗さ
+/// 後半 2 つは VCM の接続 (camera 側の頂点とつなぐ) で光源側の BSDF を
+/// 評価するために要る。SPPM の集光だけなら [0..2] しか使わない
+const VTX_SLOTS: u32 = 5u;
+
 /// 光子 1 本が堆積できる回数の上限。白い部屋では光子が 3〜5 回跳ねるので、
 /// 2 回で打ち切ると間接光がごっそり欠ける。水面越しの集光はさらに跳ねるため、
 /// 6 -> 10 でノイズが 3.26 -> 1.23 まで落ちた
@@ -1511,23 +1518,23 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
         let cnt = min(atomicLoad(&grid[cell]), GRID_CAP);
         for (var k = 0u; k < cnt; k = k + 1u) {
           let pi = atomicLoad(&grid[U.gridCells + cell * GRID_CAP + k]);
-          let d = photons[pi * 3u + 0u].xyz - hit.p;
+          let d = photons[pi * VTX_SLOTS + 0u].xyz - hit.p;
           if (dot(d, d) > r2) {
             continue;
           }
-          let wi = -photons[pi * 3u + 1u].xyz;
+          let wi = -photons[pi * VTX_SLOTS + 1u].xyz;
           let cosI = dot(hit.normal, wi);
           if (cosI <= 1e-4) {
             continue;
           }
           // bsdfEval は f * cos を返すので、余弦で割って裸の BRDF に戻す
-          sum = sum + (bsdfEval(hit, rayDir, wi) / cosI) * photons[pi * 3u + 2u].xyz;
+          sum = sum + (bsdfEval(hit, rayDir, wi) / cosI) * photons[pi * VTX_SLOTS + 2u].xyz;
           m = m + 1.0;
 
           // 使われた光子の放出方向を 1 個だけ選んで覚えておく (貯留サンプリング)。
           // ここで毎回 atomicAdd すると 1 画素あたり数百回になり、512 個の
           // アドレスに集中して桁違いに遅くなる。1 回の集光につき 1 個で足りる
-          let bin = photons[pi * 3u + 1u].w;
+          let bin = photons[pi * VTX_SLOTS + 2u].w;
           if (bin >= 0.0) {
             seen = seen + 1u;
             if (pcg(u32(m) * 2654435761u + seed) % seen == 0u) {
@@ -1690,6 +1697,9 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
   var ray: Ray;
   /// この光子を放出した方向のビン。環境マップからの光子は学習の対象外なので -1
   var emitBin = -1.0;
+  /// VCM の MIS 用の量。環境マップからの光子には未対応なので 0 のまま
+  var dVCM = 0.0;
+  var dVC = 0.0;
 
   if (pick >= U.lightCount) {
     // 環境マップ。CDF から方向を引き、外接球の外から中へ向けて撒く
@@ -1742,6 +1752,11 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       return;
     }
     emitBin = f32(dirToBin(dir));
+    // VCM の MIS 用の量。dVCM は「この頂点を NEE で作る確率 / 光源側から
+    // たどって作る確率」、dVC は接続戦略の重みを組み立てるための累積。
+    // どちらも pdf の比なので単位は無次元
+    dVCM = 1.0 / pdf;
+    dVC = cosE * area * f32(ln) / pdf;
     // 出力 = 放射輝度 * 面積 * cos * (選択確率の逆数) / pdf。
     // 撒いた総数で割るのは present 側なので、ここでは割らない
     power = light.mat.emission * area * f32(ln) * cosE / pdf;
@@ -1760,13 +1775,22 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     let kind = hit.mat.kind;
     let gatherable = kind == MAT_LAMBERT || kind == MAT_GGX;
 
+    // 面積についての pdf に直す補正。距離の 2 乗で割り、入射余弦で割る
+    let cosIn = abs(dot(hit.normal, ray.dir));
+    if (cosIn > 1e-6) {
+      dVCM = dVCM * hit.t * hit.t / cosIn;
+      dVC = dVC / cosIn;
+    }
+
     // 直接光はカメラ側の NEE が担当しているので、1 回以上散乱した後だけ堆積させる
     if (gatherable && bounces >= 1u && localSlot < MAX_DEPOSITS) {
       let slot = gid.x * MAX_DEPOSITS + localSlot;
       localSlot = localSlot + 1u;
-      photons[slot * 3u + 0u] = vec4f(hit.p, 1.0);
-      photons[slot * 3u + 1u] = vec4f(ray.dir, emitBin);
-      photons[slot * 3u + 2u] = vec4f(power, 0.0);
+      photons[slot * VTX_SLOTS + 0u] = vec4f(hit.p, dVCM);
+      photons[slot * VTX_SLOTS + 1u] = vec4f(ray.dir, dVC);
+      photons[slot * VTX_SLOTS + 2u] = vec4f(power, emitBin);
+      photons[slot * VTX_SLOTS + 3u] = vec4f(hit.normal, f32(kind));
+      photons[slot * VTX_SLOTS + 4u] = vec4f(hit.mat.albedo, hit.mat.roughness);
       // 使われなかった枠は grid に載らないので、古い内容が参照されることはない
       depositPhoton(slot, hit.p);
     }
@@ -1776,6 +1800,18 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered)) {
       return;
     }
+
+    // VCM の漸化式。pF は今サンプルした方向の pdf、pR は逆向きに
+    // たどったときの pdf。接続戦略では光源側の経路を逆にたどるので、
+    // 逆向きの pdf が要る
+    let pF = bsdfPdfFor(hit, ray.dir, scattered.dir);
+    if (pF > 0.0) {
+      let pR = bsdfPdfFor(hit, -scattered.dir, -ray.dir);
+      let cosOut = abs(dot(hit.normal, scattered.dir));
+      dVC = (cosOut / pF) * (dVC * pR + dVCM);
+      dVCM = 1.0 / pF;
+    }
+
     power = power * attenuation;
     ray = scattered;
     bounces = bounces + 1u;
