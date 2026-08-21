@@ -1093,6 +1093,9 @@ fn sampleDirectLight(
   rayDir: vec3f,
   u: vec2f,
   misOut: ptr<function, f32>,
+  useVcm: bool,
+  dVCMc: f32,
+  dVCc: f32,
 ) -> vec3f {
   let n = lightSelectCount();
   if (n == 0u) {
@@ -1153,7 +1156,16 @@ fn sampleDirectLight(
 
   // MIS。BSDF サンプリングでも作りやすい方向ほど寄与を下げる
   var weight = 1.0;
-  if (U.mis != 0u) {
+  if (useVcm) {
+    // 接続戦略も同じ経路を作れるので、3 戦略で和が 1 になる形にする。
+    // power heuristic の 2 戦略版と混ぜると和が 1 を超えて二重計上になる
+    let cosToLight = abs(dot(hit.normal, wi));
+    let emissionPdfW = emissionPdfDir(ln / area, -wi) / (area * f32(n));
+    let wLight = bsdfPdfFor(hit, rayDir, wi) / pL;
+    let wCamera = emissionPdfW * cosToLight / (pL * cosLight)
+      * (dVCMc + dVCc * bsdfPdfFor(hit, -wi, -rayDir));
+    weight = 1.0 / (wLight + 1.0 + wCamera);
+  } else if (U.mis != 0u) {
     weight = misWeight(pL, bsdfPdfFor(hit, rayDir, wi));
   }
   *misOut = weight;
@@ -1353,7 +1365,8 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
           if (useNee) {
             var mw = 1.0;
             radiance = radiance + throughput
-              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
+              * sampleDirectLight(mhit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw,
+          useVcm, dVCMc, dVCc);
             if (depth == 0u) {
               (*aov).misWeight = mw;
             }
@@ -1366,7 +1379,10 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
           (*aov).bounces = f32(depth + 1u);
 
           // ロシアンルーレット (4 バウンス目以降)
-          if (depth >= 3u) {
+          // VCM のときはロシアンルーレットを使わない。打ち切る確率を pdf に
+    // 入れないと戦略ごとに前提がずれて偏る。逆向きの pdf にも入れる必要が
+    // あって厄介なので、経路長の上限だけで打ち切る
+    if (!useVcm && depth >= 3u) {
             let q = max(throughput.r, max(throughput.g, throughput.b));
             if (rand() > q) {
               break;
@@ -1408,7 +1424,14 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
 
     // 光源に当たったときの放射。NEE と重複するぶんを MIS 重みで削る
     var weight = 1.0;
-    if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
+    if (useVcm && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
+      // 3 戦略版。dVCMc が 0 のカメラ 1 頂点目では重み 1 になり、
+      // 「カメラから光源が直接見えている」場合に正しく全部拾える
+      let nl = f32(lightSelectCount());
+      let directPdfA = 1.0 / (hit.lightArea * nl);
+      let emissionPdfW = emissionPdfDir(hit.normal, -ray.dir) / (hit.lightArea * nl);
+      weight = 1.0 / (1.0 + directPdfA * dVCMc + emissionPdfW * dVCc);
+    } else if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
       if (U.mis != 0u) {
         // この方向を光源サンプリングで作る場合の pdf。sampleDirectLight と同じ式
         let cosLight = max(abs(dot(hit.normal, ray.dir)), 1e-6);
@@ -1425,7 +1448,8 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     if (useNee && isDiffuseLike(hit.mat)) {
       var mw = 1.0;
       radiance = radiance + throughput
-        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw);
+        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw,
+          useVcm, dVCMc, dVCc);
       if (depth == 0u) {
         (*aov).misWeight = mw;
       }
@@ -1479,7 +1503,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     ray = scattered;
 
     // ロシアンルーレット (4 バウンス目以降)
-    if (depth >= 3u) {
+    if (!useVcm && depth >= 3u) {
       let q = max(throughput.r, max(throughput.g, throughput.b));
       if (rand() > q) {
         break;
@@ -1643,7 +1667,7 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
       if (useNee) {
         var mw = 1.0;
         radiance = radiance + throughput
-          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw);
+          * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw, false, 0.0, 0.0);
 
         // MIS のもう一方の戦略。ここで経路を打ち切ってしまうと BSDF
         // サンプリング側の寄与が丸ごと消えるので、直接光のぶんだけ
@@ -1730,6 +1754,18 @@ fn lightVertexAlive(base: u32) -> bool {
 /// 候補として引く光源側の頂点の数。影レイを撃たずに評価するので安い
 /// 候補として引く光源側の頂点の数。影レイを撃たずに評価するので安い
 const RIS_CANDIDATES: u32 = 8u;
+
+/// 光子を撒くときに使っている放出方向の pdf (立体角について)。
+/// VCM の MIS 重みでは「この方向を光源側からたどって作る確率」として要る。
+/// photonMain の混合分布とここは必ず同じ式にすること
+fn emissionPdfDir(nrm: vec3f, d: vec3f) -> f32 {
+  let cosE = abs(dot(d, nrm));
+  var pdf = 0.5 * cosE / PI;
+  if (histTotal() > 0u) {
+    pdf = (1.0 - GUIDE_MIX) * pdf + GUIDE_MIX * histPdf(dirToBin(d));
+  }
+  return pdf;
+}
 
 fn luminanceOf(c: vec3f) -> f32 {
   return dot(c, vec3f(0.2126, 0.7152, 0.0722));
@@ -1995,8 +2031,11 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       dVC = dVC / cosIn;
     }
 
-    // 直接光はカメラ側の NEE が担当しているので、1 回以上散乱した後だけ堆積させる
-    if (gatherable && bounces >= 1u && localSlot < MAX_DEPOSITS) {
+    // SPPM では直接光はカメラ側の NEE が担当するので、1 回以上散乱した後だけ
+    // 堆積させる。VCM の接続では逆で、光源が最初に当たった面の頂点こそ要る。
+    // そこへつなぐ経路は NEE では作れないので、外すと丸ごと欠ける
+    let minBounce = select(1u, 0u, U.vcm != 0u);
+    if (gatherable && bounces >= minBounce && localSlot < MAX_DEPOSITS) {
       let slot = gid.x * MAX_DEPOSITS + localSlot;
       localSlot = localSlot + 1u;
       photons[slot * VTX_SLOTS + 0u] = vec4f(hit.p, dVCM);
@@ -2033,7 +2072,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     bounces = bounces + 1u;
 
     // ロシアンルーレット
-    if (depth >= 2u) {
+    if (U.vcm == 0u && depth >= 2u) {
       let q = min(max(power.r, max(power.g, power.b)), 1.0);
       if (rand() > q) {
         return;
