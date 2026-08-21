@@ -1830,11 +1830,11 @@ fn connectToLightVertex(
 
   // RIS の重み。これで「全部の枠を足したもの」の不偏推定になる
   let risW = (sumP / f32(RIS_CANDIDATES)) * f32(slots) / bestP;
-  // 光子の本数で 2 回割る。1 回目は power が光源の全光束を運んでいるぶん
-  // (経路 1 本あたりの重みに直す)、2 回目は光源側の経路 N 本について
-  // 平均を取るぶん。ここを 1 回にしていて二重計上していた
+  // 光子の本数で割る。power は光束ではなく BDPT の経路スループット α
+  // そのものになっている (alpha_2 = alpha_1 * cosE / pdf = 放出時の power)
+  // ので、変換は要らず、光源側の経路 N 本の平均を取るぶんだけ割ればよい
   let n = f32(max(U.photonCount, 1u));
-  let out = contrib * mis * risW / (n * n);
+  let out = contrib * mis * risW / n;
   (*stat).z = (*stat).z + luminanceOf(out);
   return out;
 }
