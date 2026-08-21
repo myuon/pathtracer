@@ -37,7 +37,8 @@ struct Uniforms {
   prevCamV: vec3f,
   reproject: u32,
   prevCamW: vec3f,
-  _pad: u32,
+  /// デノイザをかけるか
+  denoise: u32,
   /// 0 なら通常描画、それ以外は中間量を疑似カラーで出す
   debugMode: u32,
   /// 乱数の種をフレーム番号ではなく累積サンプル数から作る (A/B を再現可能にする)
@@ -665,6 +666,25 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
   }
 
   return found;
+}
+
+fn octEncode(n: vec3f) -> vec2f {
+  let p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
+  if (n.z >= 0.0) { return p; }
+  return (1.0 - abs(p.yx)) * vec2f(select(-1.0, 1.0, p.x >= 0.0), select(-1.0, 1.0, p.y >= 0.0));
+}
+
+/// デノイザ用の手がかり。画素の中心を通るレイを1本だけ撃って、最初に
+/// 当たった面の法線と距離を返す。フィルタがこれを見て、別の面や
+/// 別の奥行きへにじむのを防ぐ
+fn guideFor(px: f32, py: f32) -> vec3f {  // (oct.x, oct.y, distance)
+  let ray = makeRay(px, py, vec2f(0.5, 0.5));
+  var hit: Hit;
+  if (hitScene(ray, 1e-4, 1e30, &hit)) {
+    let oct = octEncode(hit.normal);
+    return vec3f(oct.x, oct.y, hit.t);
+  }
+  return vec3f(0.0, 0.0, 1e30);
 }
 
 /// 影レイ用。最初の 1 個で打ち切るので hitScene より速い。
@@ -1459,7 +1479,17 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
 
   histWrite[o] = vec4f(direct + d, count + 1.0);
   histWrite[o + 2u] = vec4f(flux, nAcc);
-  histWrite[o + 3u] = vec4f(radius, 0.0, 0.0, 0.0);
+
+  // デノイザの手がかり (法線・距離) は画素中心のレイで取り直す。
+  // jitter 済みの px, py をそのまま使うとサブピクセルごとにガイドが
+  // 揺れてフィルタの重みが安定しない
+  var guide = vec3f(0.0, 0.0, 0.0);
+  if (U.denoise != 0u) {
+    let pxC = (f32(gid.x) + 0.5) / f32(U.width) * 2.0 - 1.0;
+    let pyC = 1.0 - (f32(gid.y) + 0.5) / f32(U.height) * 2.0;
+    guide = guideFor(pxC, pyC);
+  }
+  histWrite[o + 3u] = vec4f(radius, guide.x, guide.y, guide.z);
 }
 
 // -------------------------------------------------------------- SPPM ギャザー
@@ -1827,4 +1857,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
   histWrite[o] = vec4f(prevSum + sum, prevCount + f32(U.sppPerFrame));
   histWrite[o + 1u] = firstHit;
+
+  // デノイザの手がかり。SPPM が有効なら sppmMain が書き直すが、
+  // SPPM off + denoise on のときは main だけが通るのでここでも書いておく。
+  // x (SPPM の半径) は自分の管轄外なので既存の値を壊さないよう読んでから書く
+  if (U.denoise != 0u) {
+    let pxC = (f32(gid.x) + 0.5) / f32(U.width) * 2.0 - 1.0;
+    let pyC = 1.0 - (f32(gid.y) + 0.5) / f32(U.height) * 2.0;
+    let g = guideFor(pxC, pyC);
+    histWrite[o + 3u] = vec4f(histWrite[o + 3u].x, g.x, g.y, g.z);
+  } else {
+    histWrite[o + 3u] = vec4f(histWrite[o + 3u].x, 0.0, 0.0, 0.0);
+  }
 }

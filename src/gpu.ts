@@ -113,6 +113,8 @@ export interface FrameParams {
   fog: boolean;
   /** SPPM を使う */
   sppm: boolean;
+  /** アルベド/法線ガイド付き a-trous デノイザをかける */
+  denoise: boolean;
   /** 1 反復あたりに撒く光子数の倍率 (1 以下) */
   photonScale: number;
   /** 計算を止める。表示は保つ */
@@ -407,6 +409,7 @@ export class Renderer {
     f.set(q.camV, 44);
     u[47] = p.reproject && this.prevCam ? 1 : 0;
     f.set(q.camW, 48);
+    u[51] = p.denoise ? 1 : 0;
     u[52] = p.debugMode;
     u[53] = p.fixedSeed ? 1 : 0;
     const fog = this.fog;

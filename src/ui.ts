@@ -31,6 +31,8 @@ export interface RenderSettings {
   fog: boolean;
   /** SPPM を使う */
   sppm: boolean;
+  /** アルベド/法線ガイド付き a-trous デノイザをかける */
+  denoise: boolean;
   /** 1 フレームの GPU 時間が目標に収まるよう spp を自動調整する */
   adaptive: boolean;
   /** 計算を止める。表示は保つ */
@@ -362,6 +364,7 @@ export function createUi(options: UiOptions): UiHandle {
     fixedSeed: false,
     fog: true,
     sppm: true,
+    denoise: false,
     adaptive: true,
     paused: false,
   };
@@ -573,6 +576,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const denoiseRow = createToggleRow({
+    label: "denoise (a-trous)",
+    value: settings.denoise,
+    onChange: (v) => {
+      settings.denoise = v;
+      notifyChange();
+    },
+  });
+
   const pauseRow = createToggleRow({
     label: "pause (space)",
     value: settings.paused,
@@ -622,6 +634,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(reprojectRow);
   body.appendChild(fogRow);
   body.appendChild(sppmRow);
+  body.appendChild(denoiseRow);
   body.appendChild(pauseRow);
   body.appendChild(adaptiveRow);
   body.appendChild(fixedSeedRow);
