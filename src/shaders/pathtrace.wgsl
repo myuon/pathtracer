@@ -1337,7 +1337,22 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   // 初期値が 0 なのは「光源側の経路をカメラに直接つなぐ」戦略 (light tracing)
   // を実装していないため。使っていない戦略は重みから外す
   let useVcm = U.vcm != 0u && U.photonCount > 0u;
+  // カメラ側 dVCM の初期値。「光源側の経路の本数 / カメラの立体角 pdf」で、
+  // カメラの pdf は 1 / (画素が張る面積 * cos^3)。
+  //
+  // ここを 0 にしていたのが merging を入れたときの +2.30% の原因だった。
+  // 「light tracing を実装していないから、その戦略の項は外してよい」と
+  // 考えたが、この項は戦略の有無だけでなく、光源側と camera 側の量を
+  // 同じ尺度に揃える役目も持っている。merging の正規化が光源側の経路の
+  // 本数で割っているので、そこと辻褄が合わなくなる。
+  // 接続だけのときは影響が出ず (+0.62%)、merging を入れて初めて露呈した
   var dVCMc = 0.0;
+  if (useVcm) {
+    let pixArea = 4.0 * U.tanHalfFov * U.tanHalfFov * U.aspect
+      / (f32(U.width) * f32(U.height));
+    let cosT = max(abs(dot(primary.dir, normalize(U.camW))), 1e-6);
+    dVCMc = f32(U.photonCount) * pixArea * cosT * cosT * cosT;
+  }
   var dVCc = 0.0;
   var dVMc = 0.0;
 
@@ -1758,19 +1773,12 @@ fn lightVertexAlive(base: u32) -> bool {
   return u32(v - kind * 65536.0) == (U.frameIndex % 65536u);
 }
 
-/// merging を MIS に統合するか。**まだ正しくない** ので既定は false。
+/// merging を MIS に統合するか。正しく動くようになったが、接続のみの構成の
+/// 15 倍遅い (267 ms 対 3893 ms) ので既定は false。等時間では接続のみが勝つ。
 ///
-/// 切り分けの結果 (cornell, 真値 68.24):
-///   merging + NEE + 発光 (接続なし)  66.660  -2.31%  埋めるべき隙間 1.577
-///   接続も入れる                     69.789  +2.30%  接続が入れた量 3.129
-/// つまり merging の重みは NEE を正しく下げていて、隙間もその通り空く。
-/// ところが接続がその約 2 倍を入れてしまう。eta を 0 にして merging を
-/// 戦略から外すと接続は正しくなる (+0.62%) ので、**eta が入ったときの
-/// 接続の重みだけが狂っている**。
-/// 反復数を変えても差が変わらない (200 spp で +7.80%, 900 spp で +7.78%)
-/// ので、半径由来のバイアスではなく MIS の式の誤り。
-const VCM_MERGE: bool = false;
-
+///   cornell  PT 比 +0.72%   (修正前 +2.30%)
+///   ajar     SPPM 比 +2.80% (約 300 spp 時点。収束不足の可能性あり)
+///
 /// 半径の縮み方。0 と 1 の間なら、反復とともに半径は 0 に、累積光子数は
 /// 無限に増える。SPPM と VCM で同じ値を使う
 const ALPHA: f32 = 0.7;
