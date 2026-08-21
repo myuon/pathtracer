@@ -278,6 +278,97 @@ function buildCornellScene(): Scene {
 
 
 /**
+ * 半開きの扉のコーネルボックス (ajar door)。
+ * 奥の壁に戸口を切り、その裏の小部屋にだけ光源を置く。扉はほんの少しだけ
+ * 開いていて、部屋の中はその細い隙間から漏れた光だけで照らされる。
+ * 部屋の中の面から光源への影レイ (NEE) はほぼ全部が扉に遮られ、BSDF
+ * サンプリングも隙間を偶然通る確率が低いのでパストレーシングは猛烈に
+ * ノイズが乗る。逆に SPPM は光源から撒いた光子が隙間を通って部屋に
+ * 入れるので有利になるはず。この対比を見るためのシーン
+ */
+function buildAjarDoorScene(): Scene {
+  const S = 5.55;
+  const white = lambert([0.73, 0.73, 0.73]);
+  const red = lambert([0.65, 0.05, 0.05]);
+  const green = lambert([0.12, 0.45, 0.15]);
+
+  // 画像の左右について: このシーンのカメラ設定では +x が画面の左に来る
+  // (緑の壁が画面左)。戸口は画面の右に開けたいので、蝶番を x が大きい側に
+  // 置き、扉は x=0 の方へ伸ばす
+  const hingeX = 4.35;
+  const lintelY = 4.2;
+  /** 扉の幅。戸口 (4.35) よりわずかに狭いだけにして、隙間を細く保つ */
+  const doorW = 4.28;
+
+  // 扉の裏の小部屋の奥行き
+  const backDepth = 1.8;
+  const backZ = S + backDepth;
+
+  const quads: Quad[] = [
+    // 左右の壁 (主室)
+    { q: [S, 0, 0], u: [0, S, 0], v: [0, 0, S], material: green },
+    { q: [0, 0, 0], u: [0, S, 0], v: [0, 0, S], material: red },
+    // 床・天井 (主室。天井には面光源を置かない。光源は扉の裏だけ)
+    { q: [0, 0, 0], u: [S, 0, 0], v: [0, 0, S], material: white },
+    { q: [S, S, S], u: [-S, 0, 0], v: [0, 0, -S], material: white },
+
+    // 奥の壁を戸口の分だけ 2 枚の quad に割る
+    // (a) 蝶番の柱になる全高部分
+    { q: [hingeX, 0, S], u: [S - hingeX, 0, 0], v: [0, S, 0], material: white },
+    // (b) 戸口の上、鴨居の部分
+    {
+      q: [0, lintelY, S],
+      u: [hingeX, 0, 0],
+      v: [0, S - lintelY, 0],
+      material: white,
+    },
+
+    // 扉本体。厚さ 0.08 の板を戸口の端 (x=hingeX) を蝶番にしてわずかに回す。
+    // 幅を戸口とほぼ同じにしてあるので、閉じていれば隙間はごくわずか。
+    // 8 度ほど開くと蝶番から遠い自由端 (x=0 側) だけ隙間が広がる、という
+    // くさび形の開き方になる。扉は小部屋の側 (+z) へ開く
+    ...place(box([-doorW, 0, 0], [0, lintelY, 0.08], white), 8, [hingeX, 0, S]),
+
+    // 扉の裏の小部屋。主室と同じ x, y の範囲でそのまま奥へ延長し、
+    // 光が漏れないようきっちり閉じる
+    { q: [S, 0, S], u: [0, S, 0], v: [0, 0, backDepth], material: white }, // 右壁
+    { q: [0, 0, S], u: [0, S, 0], v: [0, 0, backDepth], material: white }, // 左壁
+    { q: [0, 0, S], u: [S, 0, 0], v: [0, 0, backDepth], material: white }, // 床
+    { q: [0, S, S], u: [S, 0, 0], v: [0, 0, backDepth], material: white }, // 天井
+    { q: [0, 0, backZ], u: [S, 0, 0], v: [0, S, 0], material: white }, // 一番奥の壁
+
+    // 光源。小部屋のいちばん奥、扉の自由端に近い側に置く。
+    // カメラから隙間越しに光源本体が直接見えない位置にすること
+    {
+      q: [0.35, 1.0, S + 1.7],
+      u: [1.6, 0, 0],
+      v: [0, 2.5, 0],
+      material: emissive([55, 46, 32]),
+    },
+
+    // 背の高い箱と低い箱 (cornell と同じ配置)
+    ...place(box([0, 0, 0], [1.65, 3.3, 1.65], white), 15, [2.65, 0, 2.95]),
+    ...place(box([0, 0, 0], [1.65, 1.65, 1.65], white), -18, [1.3, 0, 0.65]),
+  ];
+
+  return {
+    spheres: [],
+    quads,
+    triangles: [],
+    env: ENV.black,
+    camera: {
+      target: [S / 2, S / 2, S / 2],
+      distance: 10.8,
+      yaw: -Math.PI * 0.5,
+      pitch: 0,
+      fovDeg: 40,
+      aperture: 0,
+    },
+  };
+}
+
+
+/**
  * Veach の MIS テストシーン。
  * 鋭さの違う 4 枚の光沢プレートと、大きさの違う 4 個の面光源を並べる。
  * 「鋭いローブ x 大きい光源」は光源サンプリングが苦手、
@@ -954,6 +1045,7 @@ export const SCENES: SceneEntry[] = [
   { id: "indirect", name: "indirect only (hard)", build: buildIndirectScene },
   { id: "enclosed", name: "enclosed light (brutal)", build: buildEnclosedScene },
   { id: "maze", name: "baffle maze (BDPT test)", build: buildMazeScene },
+  { id: "ajar", name: "ajar door (SPPM test)", build: buildAjarDoorScene },
   { id: "water", name: "water caustics", build: buildWaterScene },
   { id: "submerged", name: "submerged cornell", build: buildSubmergedScene },
 ];
