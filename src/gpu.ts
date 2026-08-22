@@ -117,6 +117,8 @@ export interface FrameParams {
   vcm: boolean;
   /// 空間 x 方向の分布を学習して BSDF サンプリングを寄せる
   guide: boolean;
+  /// 収束した画素のサンプリングを止める
+  adaptivePixels: boolean;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
   denoise: boolean;
   /** 1 反復あたりに撒く光子数の倍率 (1 以下) */
@@ -438,6 +440,7 @@ export class Renderer {
     f[75] = this.sceneRadius;
     u[76] = p.vcm ? 1 : 0;
     u[77] = p.guide ? 1 : 0;
+    u[78] = p.adaptivePixels ? 1 : 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 

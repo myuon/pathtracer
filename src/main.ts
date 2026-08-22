@@ -206,6 +206,7 @@ async function main() {
       sppm: ui.settings.sppm && !fast,
       vcm: ui.settings.vcm && !fast,
       guide: ui.settings.guide,
+      adaptivePixels: ui.settings.adaptivePixels && !fast,
       denoise: ui.settings.denoise,
       photonScale,
       paused: ui.settings.paused,

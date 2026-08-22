@@ -71,6 +71,8 @@ struct Uniforms {
   vcm: u32,
   /// 空間 x 方向の分布を学習して BSDF サンプリングを寄せるか
   guide: u32,
+  /// 収束した画素のサンプリングを止めるか
+  adaptivePixels: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -251,6 +253,9 @@ fn statOff() -> u32 {
 // 「この辺りにいるときは、どの方向から光が来るか」を学習して、BSDF
 // サンプリングをそちらへ寄せる。BSDF は「面がどの方向へ光を返しやすいか」
 // しか知らないので、光源が狭い方向にしかないシーンでは当てが外れ続ける
+/// 適応サンプリングを打ち切る相対標準誤差。これを下回った画素は撃たない
+const ADAPTIVE_TOL: f32 = 0.004;
+
 /// 空間の分割数 (1 辺)
 const GUIDE_DIM: u32 = 16u;
 const GUIDE_VOX: u32 = 4096u;
@@ -2494,9 +2499,32 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   rngState = pcg(pixel * 9781u + seedBase * 6271u + 1u);
   pixelSeed = pcg(pixel * 26699u + 1u);
 
+  // 適応サンプリング。既に十分収束した画素は今フレームは撃たない。
+  // 空いた時間はフレームレートとして返ってくるので、荒れている画素の
+  // サンプル数が伸びる。画素ごとのサンプル数で割るのは present 側が
+  // 元からやっているので、これで偏りは出ない
+  var thisSpp = U.sppPerFrame;
+  let oAcc = pixel * 4u;
+  if (U.adaptivePixels != 0u && U.sppm == 0u && U.debugMode == 0u
+    && U.samplesBefore > 0u) {
+    let acc = histWrite[oAcc];
+    let n = acc.w;
+    if (n >= 64.0) {
+      let mean = luminanceOf(acc.rgb) / n;
+      // 2 乗和から分散を出し、平均に対する相対標準誤差で判定する
+      let m2 = histWrite[oAcc + 2u].x / n;
+      let varL = max(m2 - mean * mean, 0.0);
+      let relErr = sqrt(varL / n) / max(mean, 1e-4);
+      if (relErr < ADAPTIVE_TOL) {
+        thisSpp = 0u;
+      }
+    }
+  }
+
   var sum = vec3f(0.0);
+  var sumSq = 0.0;
   var firstHit = vec4f(0.0);
-  for (var s = 0u; s < U.sppPerFrame; s = s + 1u) {
+  for (var s = 0u; s < thisSpp; s = s + 1u) {
     // 累積サンプル番号で低食い違い列を引く
     sampleIdx = U.samplesBefore + s;
     let jitter = sample2d(0u, true);
@@ -2507,6 +2535,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let radiance = trace(makeRay(px, py, sample2d(1u, true)), &fh, &aov);
     if (U.debugMode == 0u) {
       sum = sum + radiance;
+      let l = luminanceOf(radiance);
+      sumSq = sumSq + l * l;
     } else {
       sum = sum + aovColor(aov);
     }
@@ -2547,7 +2577,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     prevCount = hc.w;
   }
 
-  histWrite[o] = vec4f(prevSum + sum, prevCount + f32(U.sppPerFrame));
+  histWrite[o] = vec4f(prevSum + sum, prevCount + f32(thisSpp));
+  if (U.sppm == 0u) {
+    // 適応サンプリングの判定に使う 2 乗和。SPPM ではこの枠を使うので触らない
+    let prevSq = select(0.0, histWrite[o + 2u].x, U.samplesBefore > 0u);
+    histWrite[o + 2u] = vec4f(prevSq + sumSq, 0.0, 0.0, 0.0);
+  }
   histWrite[o + 1u] = firstHit;
 
   // デノイザの手がかり。SPPM が有効なら sppmMain が書き直すが、
