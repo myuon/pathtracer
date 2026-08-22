@@ -1046,6 +1046,16 @@ fn isEmissive(m: Material) -> bool {
   return m.emission.r > 0.0 || m.emission.g > 0.0 || m.emission.b > 0.0;
 }
 
+/// SPPM / VCM で光子を集められる面か。
+///
+/// 鏡面に近い GGX を対象にすると、BRDF がほぼデルタなので半径内の光子の
+/// ほとんどが寄与 0、一部だけ巨大という分布になり、分散もバイアスも大きい。
+/// 誘電体と同じく通り抜けて次を探すべき。**堆積側と集光側で必ず同じ判定を
+/// 使うこと** (食い違うと片方だけ光子が入って偏る)
+fn gatherableMat(m: Material) -> bool {
+  return m.kind == MAT_LAMBERT || (m.kind == MAT_GGX && m.roughness > 0.3);
+}
+
 fn isDiffuseLike(m: Material) -> bool {
   return m.kind == MAT_LAMBERT || m.kind == MAT_GGX || m.kind == MAT_PHASE
     || (m.kind == MAT_DIELECTRIC && m.roughness > 0.02);
@@ -2061,7 +2071,7 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
     }
     radiance = radiance + throughput * hit.mat.emission * we;
 
-    if (hit.mat.kind == MAT_LAMBERT || hit.mat.kind == MAT_GGX) {
+    if (gatherableMat(hit.mat)) {
       if (useNee) {
         var mw = 1.0;
         var mdir = vec3f(0.0);
@@ -2098,15 +2108,30 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
       return radiance;
     }
 
-    // ギャザーできない面 (誘電体) は通り抜けて、次を探す。
-    // ここでは NEE を行わないので、次の頂点の放射は MIS で削ってはいけない。
-    // bsdfPdf は負のまま = 重み 1 で BSDF サンプリング側が受け持つ
+    // 集光できない面は通り抜けて次を探す。ただし pdf を評価できる面
+    // (光沢の GGX など) では NEE は有効なので行う。誘電体だけは影レイが
+    // 必ずガラス自身に遮られるので飛ばさない。
+    // NEE を行った場合は次の頂点の放射を MIS で削る必要があるので、
+    // bsdfPdf を残す。行わなかった場合は負のままにして重み 1 で受け持つ
+    let neeHere = useNee && isDiffuseLike(hit.mat) && hit.mat.kind != MAT_DIELECTRIC;
+    if (neeHere) {
+      var mw2 = 1.0;
+      var md2 = vec3f(0.0);
+      radiance = radiance + throughput
+        * sampleDirectLight(hit, ray.dir, vec2f(rand(), rand()), &mw2, &md2, false, 0.0, 0.0);
+    }
+
     var attenuation: vec3f;
     var scattered: Ray;
     if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered)) {
       return radiance;
     }
-    bsdfPdf = -1.0;
+    if (neeHere) {
+      let pv = bsdfPdfFor(hit, ray.dir, scattered.dir);
+      bsdfPdf = select(-1.0, max(pv, 1e-8), pv > 0.0);
+    } else {
+      bsdfPdf = -1.0;
+    }
     throughput = throughput * attenuation;
     ray = scattered;
   }
@@ -2554,7 +2579,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       return;
     }
     let kind = hit.mat.kind;
-    let gatherable = kind == MAT_LAMBERT || kind == MAT_GGX;
+    let gatherable = gatherableMat(hit.mat);
 
     // 面積についての pdf に直す補正。距離の 2 乗で割り、入射余弦で割る
     let cosIn = abs(dot(hit.normal, ray.dir));
