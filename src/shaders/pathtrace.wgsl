@@ -1040,6 +1040,12 @@ fn sampleGgxVndf(ve: vec3f, a: f32, u1: f32, u2: f32) -> vec3f {
 /// 光源サンプリングできるのは pdf を評価できるマテリアルだけ。
 /// 誘電体は粗さがある場合のみ対象にする (ほぼ鏡面だと pdf が極端に大きく、
 /// 影レイを飛ばしても寄与がほぼ 0 で無駄になるため)
+/// 発光しているか。hit.lightArea は発光していない quad でも正の値を持つので
+/// 判定に使えない。使うと壁に当たるたびに立体角の計算 (acos を 4 回) が走る
+fn isEmissive(m: Material) -> bool {
+  return m.emission.r > 0.0 || m.emission.g > 0.0 || m.emission.b > 0.0;
+}
+
 fn isDiffuseLike(m: Material) -> bool {
   return m.kind == MAT_LAMBERT || m.kind == MAT_GGX || m.kind == MAT_PHASE
     || (m.kind == MAT_DIELECTRIC && m.roughness > 0.02);
@@ -1725,14 +1731,14 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
 
     // 光源に当たったときの放射。NEE と重複するぶんを MIS 重みで削る
     var weight = 1.0;
-    if (useVcm && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
+    if (useVcm && bsdfPdf > 0.0 && isEmissive(hit.mat)) {
       // 3 戦略版。dVCMc が 0 のカメラ 1 頂点目では重み 1 になり、
       // 「カメラから光源が直接見えている」場合に正しく全部拾える
       let nl = f32(lightSelectCount());
       let directPdfA = 1.0 / (hit.lightArea * nl);
       let emissionPdfW = emissionPdfDir(hit.normal, -ray.dir) / (hit.lightArea * nl);
       weight = 1.0 / (1.0 + directPdfA * dVCMc + emissionPdfW * dVCc);
-    } else if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
+    } else if (useNee && bsdfPdf > 0.0 && isEmissive(hit.mat)) {
       if (U.mis != 0u) {
         // この方向を光源サンプリングで作る場合の pdf。sampleDirectLight と同じ式
         let cosLight = abs(dot(hit.normal, ray.dir));
@@ -2044,7 +2050,7 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
     }
 
     var we = 1.0;
-    if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
+    if (useNee && bsdfPdf > 0.0 && isEmissive(hit.mat)) {
       if (U.mis != 0u) {
         let cosLight = abs(dot(hit.normal, ray.dir));
         we = misWeight(bsdfPdf,
@@ -2073,7 +2079,7 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
           if (pv > 0.0) {
             var h2: Hit;
             if (hitScene(sc, 1e-3, 1e30, &h2)) {
-              if (h2.lightArea > 0.0) {
+              if (isEmissive(h2.mat)) {
                 let cosL = max(abs(dot(h2.normal, sc.dir)), 1e-6);
                 let pL = neePdfW(h2.lightQuad, sc.origin, h2.t, cosL, h2.lightArea);
                 radiance = radiance + throughput * att * h2.mat.emission
@@ -2681,7 +2687,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       let sx = (dot(d, U.prevCamU) / (z * U.prevTanHalfFov * U.prevAspect) * 0.5 + 0.5) * f32(U.width);
       let sy = (0.5 - dot(d, U.prevCamV) / (z * U.prevTanHalfFov) * 0.5) * f32(U.height);
       if (sx >= 0.0 && sy >= 0.0 && sx < f32(U.width) && sy < f32(U.height)) {
-        let pp = (u32(sy) * U.width + u32(sx)) * 2u;
+        // 1 画素あたり 4 要素。ここが 2 のままだと別の画素を読んでしまう
+        let pp = (u32(sy) * U.width + u32(sx)) * 4u;
         let hp = histRead[pp + 1u];
         // 同じ面を見ているかを世界座標で確かめる (遮蔽が外れた画素を弾く)
         if (hp.w > 0.5 && distance(hp.xyz, firstHit.xyz) < 0.01 * z) {
