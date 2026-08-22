@@ -645,10 +645,13 @@ struct Hit {
   mat: Material,
   /// NEE でサンプルできる面光源ならその面積、できないなら 0。MIS 重みの計算に使う
   lightArea: f32,
+  /// 面光源だったときの quad の番号。立体角サンプリングの pdf を
+  /// 後から計算し直すのに要る
+  lightQuad: u32,
 };
 
 /// outward は正規化済みの外向き法線
-fn fillHit(hit: ptr<function, Hit>, ray: Ray, t: f32, outward: vec3f, mat: Material, lightArea: f32) {
+fn fillHit(hit: ptr<function, Hit>, ray: Ray, t: f32, outward: vec3f, mat: Material, lightArea: f32, lightQuad: u32) {
   let front = dot(ray.dir, outward) < 0.0;
   (*hit).t = t;
   (*hit).p = ray.origin + t * ray.dir;
@@ -656,6 +659,7 @@ fn fillHit(hit: ptr<function, Hit>, ray: Ray, t: f32, outward: vec3f, mat: Mater
   (*hit).frontFace = front;
   (*hit).mat = mat;
   (*hit).lightArea = lightArea;
+  (*hit).lightQuad = lightQuad;
 }
 
 fn aabbHit(bmin: vec3f, bmax: vec3f, o: vec3f, invD: vec3f, tMin: f32, tMax: f32) -> bool {
@@ -723,7 +727,7 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
             // ここまで来たら法線とマテリアルも読む
             let tri = triangles[idx];
             let sm = normalize(tri.n0 * (1.0 - bu - bv) + tri.n1 * bu + tri.n2 * bv);
-            fillHit(hit, ray, t, sm, tri.mat, 0.0);
+            fillHit(hit, ray, t, sm, tri.mat, 0.0, 0u);
           } else if (kind == 0u) {
             let sph = spheres[idx];
             let oc = ray.origin - sph.center;
@@ -744,7 +748,7 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
             closest = t;
             found = true;
             let p = ray.origin + t * ray.dir;
-            fillHit(hit, ray, t, (p - sph.center) / sph.radius, sph.mat, 0.0);
+            fillHit(hit, ray, t, (p - sph.center) / sph.radius, sph.mat, 0.0, 0u);
           } else {
             let qu = quads[idx].u;
             let qv2 = quads[idx].v;
@@ -769,7 +773,7 @@ fn hitScene(ray: Ray, tMin: f32, tMax: f32, hit: ptr<function, Hit>) -> bool {
             found = true;
             // cross(u, v) の長さがそのまま quad の面積になる
             let ln = length(nrm);
-            fillHit(hit, ray, t, nrm / ln, quads[idx].mat, ln);
+            fillHit(hit, ray, t, nrm / ln, quads[idx].mat, ln, idx);
           }
         }
       }
@@ -1223,6 +1227,82 @@ fn misWeight(pA: f32, pB: f32) -> f32 {
 
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
 /// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
+/// 矩形を立体角について一様にサンプルするための下ごしらえ (Urena et al. 2013)。
+/// 面上を一様に引く素朴な方法は、光源が大きく近いほど分散が増える。
+/// 立体角で引けばその依存が消える
+struct SphQuad {
+  o: vec3f, xa: vec3f, ya: vec3f, za: vec3f,
+  z0: f32, z0sq: f32,
+  x0: f32, y0: f32, y0sq: f32,
+  x1: f32, y1: f32, y1sq: f32,
+  b0: f32, b1: f32, b0sq: f32, k: f32,
+  solid: f32,
+};
+
+fn sphQuadInit(sPos: vec3f, ex: vec3f, ey: vec3f, o: vec3f) -> SphQuad {
+  var q: SphQuad;
+  q.o = o;
+  let exl = length(ex);
+  let eyl = length(ey);
+  q.xa = ex / exl;
+  q.ya = ey / eyl;
+  q.za = cross(q.xa, q.ya);
+  let d = sPos - o;
+  q.z0 = dot(d, q.za);
+  if (q.z0 > 0.0) {
+    q.za = -q.za;
+    q.z0 = -q.z0;
+  }
+  q.z0sq = q.z0 * q.z0;
+  q.x0 = dot(d, q.xa);
+  q.y0 = dot(d, q.ya);
+  q.x1 = q.x0 + exl;
+  q.y1 = q.y0 + eyl;
+  q.y0sq = q.y0 * q.y0;
+  q.y1sq = q.y1 * q.y1;
+  let v00 = vec3f(q.x0, q.y0, q.z0);
+  let v01 = vec3f(q.x0, q.y1, q.z0);
+  let v10 = vec3f(q.x1, q.y0, q.z0);
+  let v11 = vec3f(q.x1, q.y1, q.z0);
+  let n0 = normalize(cross(v00, v10));
+  let n1 = normalize(cross(v10, v11));
+  let n2 = normalize(cross(v11, v01));
+  let n3 = normalize(cross(v01, v00));
+  let g0 = acos(clamp(-dot(n0, n1), -1.0, 1.0));
+  let g1 = acos(clamp(-dot(n1, n2), -1.0, 1.0));
+  let g2 = acos(clamp(-dot(n2, n3), -1.0, 1.0));
+  let g3 = acos(clamp(-dot(n3, n0), -1.0, 1.0));
+  q.b0 = n0.z;
+  q.b1 = n2.z;
+  q.b0sq = q.b0 * q.b0;
+  q.k = 2.0 * PI - g2 - g3;
+  q.solid = g0 + g1 - q.k;
+  return q;
+}
+
+fn sphQuadSample(q: SphQuad, u: f32, v: f32) -> vec3f {
+  let au = u * q.solid + q.k;
+  let su = sin(au);
+  let fu = (cos(au) * q.b0 - q.b1) / select(su, 1e-7, abs(su) < 1e-7);
+  var cu = 1.0 / sqrt(fu * fu + q.b0sq) * select(-1.0, 1.0, fu > 0.0);
+  cu = clamp(cu, -1.0, 1.0);
+  var xu = -(cu * q.z0) / max(sqrt(1.0 - cu * cu), 1e-7);
+  xu = clamp(xu, q.x0, q.x1);
+  let d2 = xu * xu + q.z0sq;
+  let h0 = q.y0 / sqrt(d2 + q.y0sq);
+  let h1 = q.y1 / sqrt(d2 + q.y1sq);
+  let hv = h0 + v * (h1 - h0);
+  let hv2 = hv * hv;
+  let yv = select(q.y1, (hv * sqrt(d2)) / sqrt(max(1.0 - hv2, 1e-7)), hv2 < 1.0 - 1e-6);
+  return q.o + xu * q.xa + yv * q.ya + q.z0 * q.za;
+}
+
+/// 立体角サンプリングを使うか。VCM の MIS は面積測度の項を持っていて
+/// そちらの差し替えが要るので、VCM のときは従来どおり面上で引く
+fn useSolidAngle() -> bool {
+  return U.vcm == 0u;
+}
+
 fn sampleDirectLight(
   hit: Hit,
   rayDir: vec3f,
@@ -1266,8 +1346,13 @@ fn sampleDirectLight(
 
   let light = quads[indices[pick]];
 
-  // 光源上の一様サンプル
-  let onLight = light.q + light.u * u.x + light.v * u.y;
+  // 光源をサンプルする。立体角について一様に引けるならそちらを使う
+  let sq = sphQuadInit(light.q, light.u, light.v, hit.p);
+  let useSA = useSolidAngle() && sq.solid > 1e-5;
+  var onLight = light.q + light.u * u.x + light.v * u.y;
+  if (useSA) {
+    onLight = sphQuadSample(sq, u.x, u.y);
+  }
   let toLight = onLight - hit.p;
   let dist2 = dot(toLight, toLight);
   let dist = sqrt(dist2);
@@ -1288,8 +1373,12 @@ fn sampleDirectLight(
   }
   let trq = fogTransmittance(hit.p, wi, dist);
 
-  // 面積についての pdf 1 / (lightCount * area) を立体角に変換したもの
-  let pL = dist2 / (cosLight * area * f32(n));
+  // 立体角で引いたなら pdf はそのまま 1 / (光源の選択数 * 立体角)。
+  // 面上で引いたときは面積の pdf を立体角に変換する
+  var pL = dist2 / (cosLight * area * f32(n));
+  if (useSA) {
+    pL = 1.0 / (sq.solid * f32(n));
+  }
 
   // MIS。BSDF サンプリングでも作りやすい方向ほど寄与を下げる
   var weight = 1.0;
@@ -1626,7 +1715,16 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
       if (U.mis != 0u) {
         // この方向を光源サンプリングで作る場合の pdf。sampleDirectLight と同じ式
         let cosLight = max(abs(dot(hit.normal, ray.dir)), 1e-6);
-        let pL = hit.t * hit.t / (cosLight * hit.lightArea * f32(lightSelectCount()));
+        // NEE 側の pdf。立体角で引いているならその形に合わせないと
+        // 重みの和が 1 にならない
+        var pL = hit.t * hit.t / (cosLight * hit.lightArea * f32(lightSelectCount()));
+        if (useSolidAngle()) {
+          let lq = quads[hit.lightQuad];
+          let sq2 = sphQuadInit(lq.q, lq.u, lq.v, ray.origin);
+          if (sq2.solid > 1e-5) {
+            pL = 1.0 / (sq2.solid * f32(lightSelectCount()));
+          }
+        }
         weight = misWeight(bsdfPdf, pL);
       } else {
         // MIS なしなら NEE 側に完全に任せる (二重計上の防止)
