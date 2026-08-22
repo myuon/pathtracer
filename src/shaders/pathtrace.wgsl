@@ -73,6 +73,10 @@ struct Uniforms {
   guide: u32,
   /// 収束した画素のサンプリングを止めるか
   adaptivePixels: u32,
+  /// 乱数と低食い違い列のスクランブルに混ぜる塩。
+  /// 計測 (bench) で参照画像と検証画像に別の値を入れ、両者が同じ点列を
+  /// 共有しないようにするためのもの。描画では 0 のまま
+  salt: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -102,7 +106,18 @@ const ENV_MIN_WEIGHT: f32 = 1e-6;
 
 const PI: f32 = 3.14159265;
 /// このバウンス数までは低食い違い列に次元を割り当てる。
-/// 深いバウンスまで広げると経路ごとの次元のずれで逆に悪化するため 1 に留める
+/// 深いバウンスまで広げると経路ごとの次元のずれで逆に悪化するため 1 に留める。
+///
+/// bench/run.mjs で 12 シーン / 1024 spp を測り直した結果 (relMSE の幾何平均、
+/// 1 より小さいほど悪い):
+///   QMC_DEPTH  2 -> 0.832x   4 -> 0.778x
+/// つまり深く伸ばすほど単調に悪くなる。スクランブルを XOR から
+/// Owen (Burley 2020 のハッシュ版) に替えても傾向は同じで
+/// (Owen@4 / Owen@1 = 0.99x / 0.60x / 0.71x)、Owen 自体も depth 1 で
+/// XOR に大きく負けた (veach で 32x、indirect で 1.74x 悪い)。
+/// サンプラは GPU 上で層化を直接測って両者とも完全に層化できていることを
+/// 確認済みなので、これは実装の不具合ではなく、経路ごとに次元の意味が
+/// ずれることによる本質的な限界。ここは触らないのが正解
 const QMC_DEPTH: u32 = 1u;
 const INV_PI: f32 = 0.31830988;
 
@@ -1927,8 +1942,8 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
   }
   let pixel = gid.y * U.width + gid.x;
   let o = pixel * 4u;
-  rngState = pcg(pixel * 9781u + U.frameIndex * 6271u + 1u);
-  pixelSeed = pcg(pixel * 26699u + 1u);
+  rngState = pcg(pixel + pcg(U.frameIndex * 6271u + U.salt * 0x9e3779b9u + 1u));
+  pixelSeed = pcg(pixel * 26699u + U.salt * 0x85ebca6bu + 1u);
   sampleIdx = U.samplesBefore;
 
   // ping-pong は使わず、同じバッファを読み書きして状態を持ち越す
@@ -2713,8 +2728,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let pixel = gid.y * U.width + gid.x;
   // 固定 seed では累積サンプル数から種を作るので、同条件なら毎回同じ絵になる
   let seedBase = select(U.frameIndex, U.samplesBefore, U.fixedSeed != 0u);
-  rngState = pcg(pixel * 9781u + seedBase * 6271u + 1u);
-  pixelSeed = pcg(pixel * 26699u + 1u);
+  // 画素とフレームを線形に混ぜてから 1 回ハッシュすると、
+  // pixel * 9781 と seedBase * 6271 がぶつかる組み合わせで別の画素・
+  // 別のフレームが同じ種を引く。入れ子にして潰す
+  rngState = pcg(pixel + pcg(seedBase * 6271u + U.salt * 0x9e3779b9u + 1u));
+  pixelSeed = pcg(pixel * 26699u + U.salt * 0x85ebca6bu + 1u);
 
   // 適応サンプリング。既に十分収束した画素は今フレームは撃たない。
   // 空いた時間はフレームレートとして返ってくるので、荒れている画素の

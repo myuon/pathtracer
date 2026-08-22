@@ -56,7 +56,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
 }
 
 /** WGSL 側の struct Uniforms と一致させること */
-const UNIFORM_SIZE = 320;
+const UNIFORM_SIZE = 336;
 
 /**
  * 履歴バッファの 1 画素あたりのバイト数。
@@ -131,6 +131,8 @@ export interface FrameParams {
   photonScale: number;
   /** 計算を止める。表示は保つ */
   paused: boolean;
+  /** 乱数のスクランブルに混ぜる塩。計測用で、描画では 0 */
+  salt: number;
 }
 
 export class Renderer {
@@ -160,6 +162,10 @@ export class Renderer {
   private computeBindGroups: GPUBindGroup[] = [];
   private presentBindGroups: GPUBindGroup[] = [];
   private parity = 0;
+  /** 直近の render() が書いた履歴バッファの添字。読み戻し (bench) で使う */
+  private lastWrite = 0;
+  /** 直近の render() が SPPM だったか。読み戻しの合成式が変わる */
+  private lastSppm = false;
   /** 再投影に使う 1 フレーム前のカメラ */
   private prevCam: FrameParams | null = null;
 
@@ -378,8 +384,9 @@ export class Renderer {
     this.accumPixels = pixels;
     const make = (label: string) =>
       this.device.createBuffer({
+        // COPY_SRC は計測 (bench) の読み戻し用。描画では使わない
         size: pixels * HIST_BYTES_PER_PIXEL,
-        usage: GPUBufferUsage.STORAGE,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
         label,
       });
     this.histBuffers = [make("hist0"), make("hist1")];
@@ -451,7 +458,53 @@ export class Renderer {
     u[76] = p.vcm ? 1 : 0;
     u[77] = p.guide ? 1 : 0;
     u[78] = p.adaptivePixels ? 1 : 0;
+    u[80] = p.salt;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
+  }
+
+  /**
+   * 累積バッファを読み戻し、present と同じ式で HDR 値 (画素あたり RGB) を返す。
+   * 計測 (bench) 専用。描画のホットパスからは呼ばない
+   */
+  async readHdr(width: number, height: number): Promise<Float32Array> {
+    if (!this.histBuffers) throw new Error("累積バッファがまだない");
+    const pixels = width * height;
+    const bytes = pixels * HIST_BYTES_PER_PIXEL;
+    const staging = this.device.createBuffer({
+      size: bytes,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      label: "bench readback",
+    });
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.histBuffers[this.lastWrite], 0, staging, 0, bytes);
+    this.device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const src = new Float32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+
+    // 1 画素 = vec4f 4 個 = f32 16 個
+    const out = new Float32Array(pixels * 3);
+    const norm = 1 / (Math.PI * Math.max(this.photonsEmitted, 1));
+    for (let i = 0; i < pixels; i++) {
+      const o = i * 16;
+      const n = Math.max(src[o + 3], 1);
+      let r = src[o] / n;
+      let g = src[o + 1] / n;
+      let b = src[o + 2] / n;
+      if (this.lastSppm) {
+        // 間接光は「集めたフラックス / (pi r^2 * これまでに撒いた光子数)」
+        const rad = Math.max(src[o + 12], 1e-5);
+        const k = norm / (rad * rad);
+        r += src[o + 8] * k;
+        g += src[o + 9] * k;
+        b += src[o + 10] * k;
+      }
+      out[i * 3] = r;
+      out[i * 3 + 1] = g;
+      out[i * 3 + 2] = b;
+    }
+    return out;
   }
 
   render(p: FrameParams) {
@@ -529,6 +582,8 @@ export class Renderer {
     pass.end();
 
     this.device.queue.submit([encoder.finish()]);
+    this.lastWrite = write;
+    this.lastSppm = sppm;
     if (sppm && !p.paused) this.photonsEmitted += this.photonsThisFrame;
     if (!p.paused) {
       this.prevCam = p;

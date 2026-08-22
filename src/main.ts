@@ -1,3 +1,4 @@
+import { runBench } from "./bench";
 import { attachCameraControls, OrbitCamera } from "./camera";
 import { initGpu, Renderer, WebGpuUnsupportedError } from "./gpu";
 import { buildSceneById, DEFAULT_SCENE_ID, SCENES } from "./scene";
@@ -8,6 +9,13 @@ const SETTLE_MS = 150;
 
 async function main() {
   const canvas = document.getElementById("canvas") as HTMLCanvasElement;
+
+  // 計測モード。UI も rAF ループも通さず、決めた予算ぶん回して結果を置く
+  if (new URLSearchParams(location.search).has("bench")) {
+    await runBench(canvas);
+    return;
+  }
+
   const gpu = await initGpu(canvas);
 
   const initialScene = buildSceneById(DEFAULT_SCENE_ID);
@@ -210,6 +218,7 @@ async function main() {
       denoise: ui.settings.denoise,
       photonScale,
       paused: ui.settings.paused,
+      salt: 0,
     });
 
     // GPU が終わるまで次を投入しない。ついでに 1 spp あたりの時間を測る
