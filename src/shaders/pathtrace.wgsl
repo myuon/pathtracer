@@ -1303,6 +1303,24 @@ fn useSolidAngle() -> bool {
   return U.vcm == 0u;
 }
 
+/// NEE でこの方向をサンプルする確率 (立体角について)。
+///
+/// **BSDF サンプリングで光源に当たったときの MIS 重みは必ずこれを使うこと。**
+/// sampleDirectLight のサンプリング方法と食い違うと、重みの和が 1 にならず
+/// 偏る。以前は呼び出し側で式を直接書いていて、立体角サンプリングを
+/// 入れたときに traceSppm 側の 2 か所を更新し忘れていた
+fn neePdfW(lightQuad: u32, viewFrom: vec3f, dist: f32, cosLight: f32, area: f32) -> f32 {
+  let n = f32(lightSelectCount());
+  if (useSolidAngle()) {
+    let lq = quads[lightQuad];
+    let sq = sphQuadInit(lq.q, lq.u, lq.v, viewFrom);
+    if (sq.solid > 1e-5) {
+      return 1.0 / (sq.solid * n);
+    }
+  }
+  return dist * dist / (max(cosLight, 1e-6) * area * n);
+}
+
 fn sampleDirectLight(
   hit: Hit,
   rayDir: vec3f,
@@ -1717,17 +1735,8 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     } else if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
       if (U.mis != 0u) {
         // この方向を光源サンプリングで作る場合の pdf。sampleDirectLight と同じ式
-        let cosLight = max(abs(dot(hit.normal, ray.dir)), 1e-6);
-        // NEE 側の pdf。立体角で引いているならその形に合わせないと
-        // 重みの和が 1 にならない
-        var pL = hit.t * hit.t / (cosLight * hit.lightArea * f32(lightSelectCount()));
-        if (useSolidAngle()) {
-          let lq = quads[hit.lightQuad];
-          let sq2 = sphQuadInit(lq.q, lq.u, lq.v, ray.origin);
-          if (sq2.solid > 1e-5) {
-            pL = 1.0 / (sq2.solid * f32(lightSelectCount()));
-          }
-        }
+        let cosLight = abs(dot(hit.normal, ray.dir));
+        let pL = neePdfW(hit.lightQuad, ray.origin, hit.t, cosLight, hit.lightArea);
         weight = misWeight(bsdfPdf, pL);
       } else {
         // MIS なしなら NEE 側に完全に任せる (二重計上の防止)
@@ -2037,8 +2046,9 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
     var we = 1.0;
     if (useNee && bsdfPdf > 0.0 && hit.lightArea > 0.0) {
       if (U.mis != 0u) {
-        let cosLight = max(abs(dot(hit.normal, ray.dir)), 1e-6);
-        we = misWeight(bsdfPdf, hit.t * hit.t / (cosLight * hit.lightArea * f32(lightSelectCount())));
+        let cosLight = abs(dot(hit.normal, ray.dir));
+        we = misWeight(bsdfPdf,
+          neePdfW(hit.lightQuad, ray.origin, hit.t, cosLight, hit.lightArea));
       } else {
         we = 0.0;
       }
@@ -2065,7 +2075,7 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
             if (hitScene(sc, 1e-3, 1e30, &h2)) {
               if (h2.lightArea > 0.0) {
                 let cosL = max(abs(dot(h2.normal, sc.dir)), 1e-6);
-                let pL = h2.t * h2.t / (cosL * h2.lightArea * f32(lightSelectCount()));
+                let pL = neePdfW(h2.lightQuad, sc.origin, h2.t, cosL, h2.lightArea);
                 radiance = radiance + throughput * att * h2.mat.emission
                   * select(0.0, misWeight(pv, pL), U.mis != 0u);
               }

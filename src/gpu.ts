@@ -459,9 +459,13 @@ export class Renderer {
     // パストレースに落とすほうがましなので、見込みで切り分ける
     const envPhotons =
       this.envWidth > 1 && p.envIs && this.sceneRadius < this.camDistance * 20;
-    const sppm = p.sppm && (this.lightCount > 0 || envPhotons);
+    // 参加媒質があるときは SPPM / VCM を使わない。traceSppm も photonMain も
+    // 媒質を扱っていないので、直接光だけ減衰して散乱光が入らない絵になる
+    // (shaft で PT 比 -35%)。正しくやるには体積光子マッピングが要る
+    const fogOn = p.fog && this.fog !== undefined;
+    const sppm = p.sppm && !fogOn && (this.lightCount > 0 || envPhotons);
     // VCM の接続は SPPM とは独立に使える。どちらも光源側の経路を撒く必要がある
-    const vcm = p.vcm && !sppm && this.lightCount > 0;
+    const vcm = p.vcm && !sppm && !fogOn && this.lightCount > 0;
     const q: FrameParams =
       sppm === p.sppm && vcm === p.vcm ? p : { ...p, sppm, vcm };
     // SPPM は画素ごとの状態を持ち越す必要があるので ping-pong を止める
