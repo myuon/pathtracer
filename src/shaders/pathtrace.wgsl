@@ -1768,11 +1768,15 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
       && guideHasData(guideVoxel(hit.p));
     if (guideHere) {
       let vox = guideVoxel(hit.p);
+      // 低食い違い列を通す。ここを rand() にしていると、ガイドを有効に
+      // した瞬間に 1 バウンス目の層化が失われる (ガイドの利得と相殺していた)
+      let gu = sample2d(3u + depth * 2u, depth < QMC_DEPTH);
       var wi: vec3f;
       if (rand() < GUIDE_MIX_C) {
-        wi = guideSample(vox, rand(), vec2f(rand(), rand()));
+        // ビンの選択に層化した次元を割り当てる。ビン内は素の乱数で足りる
+        wi = guideSample(vox, gu.x, vec2f(gu.y, rand()));
       } else {
-        wi = normalize(onb(hit.normal) * cosineHemisphere(vec2f(rand(), rand())));
+        wi = normalize(onb(hit.normal) * cosineHemisphere(gu));
       }
       let cosI = dot(hit.normal, wi);
       // 面の裏に出た方向はここで打ち切る。scatter() に差し戻すと、
