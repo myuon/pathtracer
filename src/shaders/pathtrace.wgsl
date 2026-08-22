@@ -519,6 +519,29 @@ fn sample2d(d: u32, useQmc: bool) -> vec2f {
 /// 一度でも NaN が累積バッファに入ると、以後その画素は何サンプル積んでも
 /// NaN のままで二度と戻らない。実際 spheres の 1 画素 (123, 124) が
 /// 32768 spp の参照画像で死んでいた。落とすぶんの偏りは 10 万分の 1 程度
+/// firefly の抑制。画素のこれまでの平均輝度 x FIREFLY_K x sqrt(サンプル数)
+/// を超えたサンプルは、そこまで押し下げてから積む。0 で無効。
+///
+/// 閾値をサンプル数の平方根に比例させるのが肝。1 本の外れ値が N サンプルの
+/// 推定値を動かす量は L / N で、通常のばらつきは sigma / sqrt(N) なので、
+/// 「悪さをする外れ値」の境目は L ~ sigma * sqrt(N) にある。ここを固定値に
+/// すると spp をいくら積んでも押し下げが残り、明るい集光が暗いまま
+/// 収束しなくなる。
+///
+/// 係数は bench/run.mjs で振って決めた。全 12 シーン / 1024 spp では
+/// K = 64 で relMSE の幾何平均が 1.52x、効率も 1.51x、しかも 12 シーン
+/// すべてで悪化なし (最小 1.01x)。
+///
+/// K = 16 の方が低 spp では強いが、収束先がずれるので採らない
+/// (cornell/enclosed/maze/ajar/water/glass の 6 シーンで比較):
+///            1024 spp   4096 spp   1024->4096 の誤差の減り
+///   K = 16     1.43x      1.07x     1.5 〜 3.2 (無効時は 1.8 〜 3.5)
+///   K = 64     1.23x      1.08x     1.8 〜 3.2
+/// K = 16 は 4096 spp で water 0.82x / enclosed 0.98x と無効時に負ける。
+/// 押し下げの偏りが変動の減りを食い潰している。K = 64 はどちらの予算でも
+/// 1.00x を下回らない
+const FIREFLY_K: f32 = 64.0;
+
 fn accumulable(c: vec3f) -> bool {
   return c.x >= 0.0 && c.y >= 0.0 && c.z >= 0.0
     && c.x < 1e30 && c.y < 1e30 && c.z < 1e30;
@@ -2814,6 +2837,20 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
+  // この画素がこれまでに出している平均輝度。firefly の閾値と、
+  // ADRRS の「目指している値」の両方に使う
+  var pixelMean = 0.0;
+  var fireflyThr = 0.0;
+  if (U.samplesBefore > 0u && U.debugMode == 0u) {
+    let hc = select(histRead[oAcc], histWrite[oAcc], U.sppm != 0u);
+    if (hc.w > 0.0) {
+      pixelMean = luminanceOf(hc.rgb) / hc.w;
+      if (FIREFLY_K > 0.0) {
+        fireflyThr = pixelMean * FIREFLY_K * sqrt(hc.w);
+      }
+    }
+  }
+
   var sum = vec3f(0.0);
   var sumSq = 0.0;
   var firstHit = vec4f(0.0);
@@ -2828,9 +2865,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let radiance = trace(makeRay(px, py, sample2d(1u, true)), &fh, &aov);
     if (U.debugMode == 0u) {
       if (accumulable(radiance)) {
-        sum = sum + radiance;
-        let l = luminanceOf(radiance);
-        sumSq = sumSq + l * l;
+        var r = radiance;
+        let l = luminanceOf(r);
+        if (fireflyThr > 0.0 && l > fireflyThr) {
+          // 色は保ったまま輝度だけ閾値へ落とす
+          r = r * (fireflyThr / l);
+        }
+        sum = sum + r;
+        let lc = luminanceOf(r);
+        sumSq = sumSq + lc * lc;
       }
     } else {
       sum = sum + aovColor(aov);
