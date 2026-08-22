@@ -513,6 +513,17 @@ fn sample2d(d: u32, useQmc: bool) -> vec2f {
   return vec2f(rand(), rand());
 }
 
+/// 累積に入れてよい値か。NaN との比較は必ず false になるので、
+/// これで NaN も Inf もまとめて弾ける。
+///
+/// 一度でも NaN が累積バッファに入ると、以後その画素は何サンプル積んでも
+/// NaN のままで二度と戻らない。実際 spheres の 1 画素 (123, 124) が
+/// 32768 spp の参照画像で死んでいた。落とすぶんの偏りは 10 万分の 1 程度
+fn accumulable(c: vec3f) -> bool {
+  return c.x >= 0.0 && c.y >= 0.0 && c.z >= 0.0
+    && c.x < 1e30 && c.y < 1e30 && c.z < 1e30;
+}
+
 /// コサイン重み付き半球サンプリング (pdf = cos / PI)
 fn cosineHemisphere(u: vec2f) -> vec3f {
   let r = sqrt(u.x);
@@ -2012,8 +2023,8 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
     nAcc = nAcc + ALPHA * m;
   }
 
-  histWrite[o] = vec4f(direct + d, count + 1.0);
-  histWrite[o + 2u] = vec4f(flux, nAcc);
+  histWrite[o] = vec4f(direct + select(vec3f(0.0), d, accumulable(d)), count + 1.0);
+  histWrite[o + 2u] = vec4f(select(vec3f(0.0), flux, accumulable(flux)), nAcc);
 
   // デノイザの手がかり (法線・距離) は画素中心のレイで取り直す。
   // jitter 済みの px, py をそのまま使うとサブピクセルごとにガイドが
@@ -2816,9 +2827,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     var aov = Aov(vec3f(0.0), vec3f(0.0), 0.0, 0.0, 0.0, 0.0, vec3f(0.0));
     let radiance = trace(makeRay(px, py, sample2d(1u, true)), &fh, &aov);
     if (U.debugMode == 0u) {
-      sum = sum + radiance;
-      let l = luminanceOf(radiance);
-      sumSq = sumSq + l * l;
+      if (accumulable(radiance)) {
+        sum = sum + radiance;
+        let l = luminanceOf(radiance);
+        sumSq = sumSq + l * l;
+      }
     } else {
       sum = sum + aovColor(aov);
     }
