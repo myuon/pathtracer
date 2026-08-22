@@ -204,9 +204,10 @@ export class Renderer {
     // [セルごとの個数][セルごとの光子インデックス][書き込んだ光子の総数]
     this.gridBuffer = this.device.createBuffer({
       // 後ろにヒストグラムと CDF を間借りさせている。ストレージバッファの
-      // 本数が上限に張り付いていて、専用のバッファを増やせないため
+      // 本数が上限に張り付いていて、専用のバッファを増やせないため。
+      // COPY_DST はシーン切り替えで丸ごと消すため (clearBuffer が要求する)
       size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 8 + GUIDE_VOX * GUIDE_BINS + GUIDE_VOX * (GUIDE_BINS + 1)) * 4,
-      usage: GPUBufferUsage.STORAGE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       label: "grid",
     });
 
@@ -324,6 +325,18 @@ export class Renderer {
     merged.set(refIdx, this.lightCount);
     this.indexBuffer?.destroy();
     this.indexBuffer = this.uploadGeometry(merged.buffer as ArrayBuffer, "indices");
+
+    // 学習した分布はシーンに固有なので、切り替えたら捨てる。
+    //
+    // clearGrid の reset は samplesBefore == 0 で立つが、これはカメラを
+    // 動かしたときにも立つ。放射輝度の分布は視点に依らないので、カメラ
+    // 移動で捨てるのは損。一方でガイド格子は sceneCenter / sceneRadius で
+    // 正規化した座標に載っているため、シーンが変われば同じ添字が別の場所を
+    // 指してしまう。ここでしか消せない
+    const clear = this.device.createCommandEncoder();
+    clear.clearBuffer(this.gridBuffer);
+    this.device.queue.submit([clear.finish()]);
+    this.photonsEmitted = 0;
 
     this.rebuildBindGroups();
   }
