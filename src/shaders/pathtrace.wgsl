@@ -2531,14 +2531,51 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       return;
     }
     let dir = -smp.xyz;
-    // 進行方向に垂直な、半径 sceneRadius の円板上の一様点
+    // 進行方向に垂直な円板から始点を引く。
+    //
+    // 外接球を覆う円板から一様に引くと、地面が巨大なシーン (spheres は
+    // 半径 1000 の地面球のせいで外接球が 1732) では注目領域に届く光子が
+    // 7.5e-5 しかなく使い物にならない。そこでカメラが見ているあたりを
+    // 覆う小さい円板との混合から引く。選んだ確率で割るので不偏のまま
     let basis = onb(dir);
-    let rr = U.sceneRadius * sqrt(rand());
-    let aa = rand() * 2.0 * PI;
-    let origin = U.sceneCenter - dir * U.sceneRadius
-      + basis[0] * (rr * cos(aa)) + basis[1] * (rr * sin(aa));
-    // 円板の面積 pi r^2 が方向あたりの投影面積になる
-    power = envColor(smp.xyz) * PI * U.sceneRadius * U.sceneRadius * f32(ln) / smp.w;
+    let planeC = U.sceneCenter - dir * U.sceneRadius;
+    let focus = U.camPos + U.camW * U.focusDist;
+    let fRel = focus - planeC;
+    let fx = dot(fRel, basis[0]);
+    let fy = dot(fRel, basis[1]);
+    let rBig = U.sceneRadius;
+    let rSmall = max(U.focusDist * 1.5, rBig * 1e-3);
+
+    var px = 0.0;
+    var py = 0.0;
+    if (rand() < 0.5) {
+      let rr = rBig * sqrt(rand());
+      let aa = rand() * 2.0 * PI;
+      px = rr * cos(aa);
+      py = rr * sin(aa);
+    } else {
+      let rr = rSmall * sqrt(rand());
+      let aa = rand() * 2.0 * PI;
+      px = fx + rr * cos(aa);
+      py = fy + rr * sin(aa);
+    }
+
+    // 面積についての混合 pdf。その点を覆っている円板のぶんだけ足す
+    var pdfPos = 0.0;
+    if (px * px + py * py <= rBig * rBig) {
+      pdfPos = pdfPos + 0.5 / (PI * rBig * rBig);
+    }
+    let dx = px - fx;
+    let dy = py - fy;
+    if (dx * dx + dy * dy <= rSmall * rSmall) {
+      pdfPos = pdfPos + 0.5 / (PI * rSmall * rSmall);
+    }
+    if (pdfPos <= 0.0) {
+      return;
+    }
+
+    let origin = planeC + basis[0] * px + basis[1] * py;
+    power = envColor(smp.xyz) * f32(ln) / (smp.w * pdfPos);
     ray = Ray(origin, dir);
   } else {
     // 面光源。面上の点をとり、方向は「学習した分布」と「余弦分布」の

@@ -150,7 +150,6 @@ export class Renderer {
   private radius0 = 0.05;
   private sceneCenter: [number, number, number] = [0, 0, 0];
   private sceneRadius = 1;
-  private camDistance = 1;
   private photonsEmitted = 0;
   private photonsThisFrame = PHOTON_COUNT;
   private readonly presentPipeline: GPURenderPipeline;
@@ -292,9 +291,15 @@ export class Renderer {
 
     const bvh = buildBvh(scene.spheres, scene.quads, scene.triangles);
     this.bvhNodeCount = bvh.nodeCount;
-    // シーンの対角長の 1% を光子ギャザーの初期半径にする
+    // 光子ギャザーの初期半径。シーンの対角長の 1.2% を基準にするが、
+    // 画面に写る範囲の 2 倍で頭打ちにする。spheres のように地面が
+    // 半径 1000 の球だと対角長が 3464 になり、半径 41.6 という
+    // 見えている球 (半径 1) より桁違いに大きい値になってしまうため
     const d = bvh.bounds.max.map((v, i) => v - bvh.bounds.min[i]);
-    this.radius0 = Math.max(1e-3, Math.hypot(d[0], d[1], d[2]) * 0.012);
+    const diag = Math.hypot(d[0], d[1], d[2]);
+    const viewExtent =
+      2 * scene.camera.distance * Math.tan((scene.camera.fovDeg * Math.PI) / 360);
+    this.radius0 = Math.max(1e-3, Math.min(diag, viewExtent * 2) * 0.012);
     // 環境マップから光子を撒くときの外接球
     this.sceneCenter = bvh.bounds.min.map((v, i) => (v + bvh.bounds.max[i]) / 2) as [
       number,
@@ -302,7 +307,6 @@ export class Renderer {
       number,
     ];
     this.sceneRadius = Math.max(1e-3, Math.hypot(d[0], d[1], d[2]) / 2);
-    this.camDistance = scene.camera.distance;
     this.bvhBuffer?.destroy();
     this.bvhBuffer = this.uploadGeometry(bvh.nodes, "bvh");
 
@@ -455,13 +459,10 @@ export class Renderer {
     // 光子は面光源と環境マップから撒く。環境マップは NEE が直接光を
     // 受け持っている前提なので、env importance sampling が要る。
     //
-    // 環境マップの光子はシーンの外接球の外から撒くので、巨大なプリミティブが
-    // あると円板が広がりすぎて、見えている範囲にほとんど届かなくなる
-    // (spheres シーンは半径 1000 の地面球のせいで外接球が 1732 になり、
-    //  有効なのは 7.5e-5 しかない)。そういうシーンは黙って暗く出るより
-    // パストレースに落とすほうがましなので、見込みで切り分ける
-    const envPhotons =
-      this.envWidth > 1 && p.envIs && this.sceneRadius < this.camDistance * 20;
+    // 環境マップから光子を撒けるか。始点のサンプリングを注目領域へ寄せた
+    // ので、外接球が大きいシーンでも成立する (以前は spheres のように
+    // 地面球が巨大だと有効な光子が 7.5e-5 しかなく、切り分けが必要だった)
+    const envPhotons = this.envWidth > 1 && p.envIs;
     // 参加媒質があるときは SPPM / VCM を使わない。traceSppm も photonMain も
     // 媒質を扱っていないので、直接光だけ減衰して散乱光が入らない絵になる
     // (shaft で PT 比 -35%)。正しくやるには体積光子マッピングが要る
