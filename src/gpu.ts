@@ -77,6 +77,9 @@ const GRID_CELLS = 1 << 18;
 const GRID_CAP = 96;
 /** 光子の放出方向を学習するヒストグラムのビン数。WGSL 側と一致させること */
 const HIST_BINS = 512;
+/** 学習分布の解像度。WGSL 側の GUIDE_DIM / GUIDE_TH / GUIDE_PH と一致させること */
+const GUIDE_VOX = 16 * 16 * 16;
+const GUIDE_BINS = 16 * 16;
 /** 光子 1 本が堆積できる回数。WGSL 側の MAX_DEPOSITS と一致させること */
 const MAX_DEPOSITS = 10;
 
@@ -194,7 +197,7 @@ export class Renderer {
     this.gridBuffer = this.device.createBuffer({
       // 後ろにヒストグラムと CDF を間借りさせている。ストレージバッファの
       // 本数が上限に張り付いていて、専用のバッファを増やせないため
-      size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 8 + 4096 * 64 + 4096 * 65) * 4,
+      size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 8 + GUIDE_VOX * GUIDE_BINS + GUIDE_VOX * (GUIDE_BINS + 1)) * 4,
       usage: GPUBufferUsage.STORAGE,
       label: "grid",
     });

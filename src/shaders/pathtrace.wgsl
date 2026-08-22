@@ -259,10 +259,16 @@ const ADAPTIVE_TOL: f32 = 0.004;
 /// 空間の分割数 (1 辺)
 const GUIDE_DIM: u32 = 16u;
 const GUIDE_VOX: u32 = 4096u;
-/// 方向の分割数。cos(theta) と phi で等立体角に切る
-const GUIDE_TH: u32 = 8u;
-const GUIDE_PH: u32 = 8u;
-const GUIDE_BINS: u32 = 64u;
+/// 方向の分割数。cos(theta) と phi で等立体角に切る。
+/// 解像度は実測で決めた。空間を細かくしても効かず (16^3 と 32^3 で
+/// glass 1.78x 対 1.76x)、方向だけが効く。ただし細かすぎると 1 ビンあたりの
+/// データが薄まって学習した分布自体がノイジーになる
+///   64 方向  glass 1.78x
+///   256 方向 glass 2.37x  <- ここが最適
+///   1024 方向 glass 1.50x
+const GUIDE_TH: u32 = 16u;
+const GUIDE_PH: u32 = 16u;
+const GUIDE_BINS: u32 = 256u;
 /// 学習した分布を使う確率。残りは今までどおり BSDF から引く。
 /// 混ぜておかないと pdf が 0 の方向ができて破綻する
 const GUIDE_MIX_C: f32 = 0.5;
