@@ -304,37 +304,56 @@ fn guideVoxel(p: vec3f) -> u32 {
   return (c.z * GUIDE_DIM + c.y) * GUIDE_DIM + c.x;
 }
 
-fn guideBin(d: vec3f) -> u32 {
-  let it = min(u32((d.y * 0.5 + 0.5) * f32(GUIDE_TH)), GUIDE_TH - 1u);
-  let ip = min(u32((atan2(d.z, d.x) / (2.0 * PI) + 0.5) * f32(GUIDE_PH)), GUIDE_PH - 1u);
+/// 世界座標の方向を、面の法線を +z とする局所座標へ
+fn toLocal(basis: mat3x3f, d: vec3f) -> vec3f {
+  return vec3f(dot(d, basis[0]), dot(d, basis[1]), dot(d, basis[2]));
+}
+
+/// 局所座標の方向 -> ビン。cos(theta) を [0, 1] で等分し phi も等分するので、
+/// 1 ビンが等立体角 (2pi / GUIDE_BINS) になる。
+///
+/// 分布を「世界座標の全球」ではなく「面の法線まわりの半球」で持つのが肝。
+/// 全球で持つと、面の裏へ出る方向にも学習した確率が乗る。そこは BSDF が
+/// 0 なので経路を打ち切るしかなく、混合比 0.5 なら全サンプルの 1/4 が
+/// その場で死ぬ。実測でも混合比を上げるほど単調に悪化していた
+/// (0.25 -> 0.887x / 0.5 -> 0.848x / 0.75 -> 0.714x)。
+/// 半球で持てば無駄はゼロになり、同じビン数で方向の分解能も 2 倍になる
+fn guideBinLocal(l: vec3f) -> u32 {
+  let it = min(u32(clamp(l.z, 0.0, 1.0) * f32(GUIDE_TH)), GUIDE_TH - 1u);
+  let ip = min(u32((atan2(l.y, l.x) / (2.0 * PI) + 0.5) * f32(GUIDE_PH)), GUIDE_PH - 1u);
   return it * GUIDE_PH + ip;
 }
 
-fn guideBinDir(bin: u32, u: vec2f) -> vec3f {
-  let cosT = ((f32(bin / GUIDE_PH) + u.x) / f32(GUIDE_TH)) * 2.0 - 1.0;
+/// ビンの中を一様に引く (局所座標)
+fn guideBinDirLocal(bin: u32, u: vec2f) -> vec3f {
+  let cosT = (f32(bin / GUIDE_PH) + u.x) / f32(GUIDE_TH);
   let phi = ((f32(bin % GUIDE_PH) + u.y) / f32(GUIDE_PH) - 0.5) * 2.0 * PI;
   let sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
-  return vec3f(sinT * cos(phi), cosT, sinT * sin(phi));
+  return vec3f(sinT * cos(phi), sinT * sin(phi), cosT);
 }
 
-/// 立体角についての pdf。1 ビンの立体角は 4pi / GUIDE_BINS
-fn guidePdf(vox: u32, d: vec3f) -> f32 {
+/// 立体角についての pdf。1 ビンの立体角は 2pi / GUIDE_BINS
+fn guidePdfLocal(vox: u32, l: vec3f) -> f32 {
+  if (l.z <= 0.0) {
+    return 0.0;
+  }
   let base = guideCdfOff() + vox * (GUIDE_BINS + 1u);
   let total = f32(atomicLoad(&grid[base + GUIDE_BINS]));
   if (total <= 0.0) {
     return 0.0;
   }
-  let b = guideBin(d);
+  let b = guideBinLocal(l);
   let lo = f32(atomicLoad(&grid[base + b]));
   let hi = f32(atomicLoad(&grid[base + b + 1u]));
-  return ((hi - lo) / total) * (f32(GUIDE_BINS) / (4.0 * PI));
+  return ((hi - lo) / total) * (f32(GUIDE_BINS) / (2.0 * PI));
 }
 
 fn guideHasData(vox: u32) -> bool {
   return atomicLoad(&grid[guideCdfOff() + vox * (GUIDE_BINS + 1u) + GUIDE_BINS]) > 0u;
 }
 
-fn guideSample(vox: u32, u: f32, uv: vec2f) -> vec3f {
+/// 学習した分布から局所座標の方向を 1 つ引く
+fn guideSampleLocal(vox: u32, u: f32, uv: vec2f) -> vec3f {
   let base = guideCdfOff() + vox * (GUIDE_BINS + 1u);
   let pickAt = u32(u * f32(atomicLoad(&grid[base + GUIDE_BINS])));
   var lo = 0u;
@@ -350,7 +369,7 @@ fn guideSample(vox: u32, u: f32, uv: vec2f) -> vec3f {
       hi = mid;
     }
   }
-  return guideBinDir(lo, uv);
+  return guideBinDirLocal(lo, uv);
 }
 
 /// 学習値の上限。これを超えたら全ビンを半分にする。
@@ -358,12 +377,13 @@ fn guideSample(vox: u32, u: f32, uv: vec2f) -> vec3f {
 /// 悪化する (誤差が spp とともに拡大するという妙な挙動になる)
 const GUIDE_CAP: u32 = 1u << 28u;
 
-/// 光が来た方向を記録する。1 回の記録が大きくなりすぎないよう抑える
-fn guideRecord(p: vec3f, d: vec3f, lum: f32) {
-  if (lum <= 0.0) {
+/// 光が来た方向を記録する。方向は面の法線を +z とする局所座標で渡すこと。
+/// 1 回の記録が大きくなりすぎないよう抑える
+fn guideRecord(p: vec3f, l: vec3f, lum: f32) {
+  if (lum <= 0.0 || l.z <= 0.0) {
     return;
   }
-  atomicAdd(&grid[guideOff() + guideVoxel(p) * GUIDE_BINS + guideBin(d)],
+  atomicAdd(&grid[guideOff() + guideVoxel(p) * GUIDE_BINS + guideBinLocal(l)],
     u32(clamp(lum * 8.0, 0.0, 4096.0)) + 1u);
 }
 
@@ -1268,7 +1288,8 @@ fn samplingPdf(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
   if (!guideHasData(vox)) {
     return pb;
   }
-  return (1.0 - GUIDE_MIX_C) * pb + GUIDE_MIX_C * guidePdf(vox, wi);
+  return (1.0 - GUIDE_MIX_C) * pb
+    + GUIDE_MIX_C * guidePdfLocal(vox, toLocal(onb(hit.normal), wi));
 }
 
 fn misWeight(pA: f32, pB: f32) -> f32 {
@@ -1689,8 +1710,12 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   // 学習するだけで冗長になり、分散が減らない
   var gN = 0u;
   var gPos = array<vec3f, GUIDE_REC>();
+  /// 面の法線を +z とする局所座標での方向
   var gDir = array<vec3f, GUIDE_REC>();
+  /// 散乱後のスループットの輝度
   var gThr = array<f32, GUIDE_REC>();
+  /// その方向をサンプルした立体角 pdf。ガイディングは L / pdf を貯めるので要る
+  var gPdf = array<f32, GUIDE_REC>();
   var gRad = array<f32, GUIDE_REC>();
 
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
@@ -1839,20 +1864,21 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
       // 低食い違い列を通す。ここを rand() にしていると、ガイドを有効に
       // した瞬間に 1 バウンス目の層化が失われる (ガイドの利得と相殺していた)
       let gu = sample2d(3u + depth * 2u, depth < QMC_DEPTH);
-      var wi: vec3f;
+      let gb = onb(hit.normal);
+      var wl: vec3f;
       if (rand() < GUIDE_MIX_C) {
         // ビンの選択に層化した次元を割り当てる。ビン内は素の乱数で足りる
-        wi = guideSample(vox, gu.x, vec2f(gu.y, rand()));
+        wl = guideSampleLocal(vox, gu.x, vec2f(gu.y, rand()));
       } else {
-        wi = normalize(onb(hit.normal) * cosineHemisphere(gu));
+        wl = cosineHemisphere(gu);
       }
+      let wi = normalize(gb * wl);
       let cosI = dot(hit.normal, wi);
-      // 面の裏に出た方向はここで打ち切る。scatter() に差し戻すと、
-      // 実際にサンプルした分布が混合分布と違うものになって偏る
+      // 分布が半球に閉じているのでここへは落ちないはずだが、数値誤差の保険
       if (cosI <= 1e-6) {
         break;
       }
-      let pd = (1.0 - GUIDE_MIX_C) * cosI * INV_PI + GUIDE_MIX_C * guidePdf(vox, wi);
+      let pd = (1.0 - GUIDE_MIX_C) * cosI * INV_PI + GUIDE_MIX_C * guidePdfLocal(vox, wl);
       if (pd <= 0.0) {
         break;
       }
@@ -1906,8 +1932,11 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     // 経路が終わってから (最終値 - ここまでの値) / スループット で出る
     if (useGuide && gN < GUIDE_REC && hit.mat.kind == MAT_LAMBERT) {
       gPos[gN] = hit.p;
-      gDir[gN] = scattered.dir;
+      // 局所座標に移してから覚える。法線を持ち回らずに済む
+      gDir[gN] = toLocal(onb(hit.normal), scattered.dir);
       gThr[gN] = max(luminanceOf(throughput), 1e-6);
+      // MAT_LAMBERT はデルタ分布ではないので bsdfPdf は必ず正
+      gPdf[gN] = max(bsdfPdf, 1e-6);
       gRad[gN] = luminanceOf(radiance);
       gN = gN + 1u;
     }
@@ -1929,7 +1958,12 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   if (useGuide) {
     let lf = luminanceOf(radiance);
     for (var i = 0u; i < gN; i = i + 1u) {
-      guideRecord(gPos[i], gDir[i], max(lf - gRad[i], 0.0) / gThr[i]);
+      // ガイディングが欲しいのは「ビンの立体角で積分した放射輝度」なので
+      // pdf で割る。割らずに L のまま貯めると、方向は混合分布 p_mix から
+      // 引いているため学習されるのは L ではなく p_mix * L になる。
+      // 法線近傍が過大評価されるうえ、一度多く撒いた方向がさらに増える
+      // 正のフィードバックが掛かる
+      guideRecord(gPos[i], gDir[i], max(lf - gRad[i], 0.0) / (gThr[i] * gPdf[i]));
     }
   }
   return radiance;
@@ -2470,8 +2504,21 @@ fn clearGrid(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x < 7u) {
     atomicStore(&grid[statOff() + gid.x], 0u);
   }
-  // ガイディングの CDF をボクセルごとに作る。1 スレッドが 64 個舐めるだけ
-  if (gid.x < GUIDE_VOX) {
+  // ガイディングの CDF をボクセルごとに作り直す。
+  //
+  // 毎フレームやると高い。4096 ボクセル x 256 ビンを 1 スレッド 1 ボクセルで
+  // 舐めるので、走るのは 64 ワークグループだけ。並列度が出ないまま
+  // 100 万回の atomic を回すことになり、ガイドを有効にしたときの
+  // 時間増 (実測 +25%) の大半がここだった。
+  //
+  // 累積サンプル数が 2 倍になったときだけ作り直す。学習量が倍にならない
+  // うちは分布もたいして変わらないので、これで十分追従する
+  // (Muller 2017 の反復ごとに予算を倍にしていく構成と同じ考え方)。
+  // 作り直しの回数は spp に対して対数でしか増えない
+  let sBefore = U.samplesBefore;
+  let sAfter = sBefore + U.sppPerFrame;
+  let rebuild = sBefore == 0u || firstLeadingBit(sAfter) != firstLeadingBit(sBefore);
+  if (rebuild && gid.x < GUIDE_VOX) {
     let hb = guideOff() + gid.x * GUIDE_BINS;
     let cb = guideCdfOff() + gid.x * (GUIDE_BINS + 1u);
     var acc = 0u;

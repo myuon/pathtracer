@@ -375,7 +375,13 @@ export function createUi(options: UiOptions): UiHandle {
     adaptive: true,
     paused: false,
     vcm: false,
-    guide: true,
+    // 既定は off。等 spp / 等時間のどちらで測っても差し引きマイナスだった。
+    // bench/run.mjs で 320x240 / 12 バウンス / 1024 spp、効率 (relMSE x 秒) の
+    // 対 PT 倍率は 0.86x (水面の集光だけ 1.56x で、そこだけは効く)。
+    // 学習の式は直したが、一様な 16^3 ボクセル x 256 方向という分解能では
+    // 「狭い隙間の向こうに光源がある」を表現しきれていない。
+    // なお SPPM が有効なときは sppmMain が走るので、この設定は効かない
+    guide: false,
     adaptivePixels: false,
   };
 
