@@ -99,6 +99,7 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
     vcm: flag(q, "vcm", false),
     guide: flag(q, "guide", false),
     adaptivePixels: flag(q, "adaptive", false),
+    ears: flag(q, "ears", false),
     // 参照画像と検証画像で別の値にして、同じ点列を共有しないようにする
     salt: Math.round(num(q, "salt", 0)),
     denoise: flag(q, "denoise", false),

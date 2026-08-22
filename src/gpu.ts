@@ -125,14 +125,16 @@ export interface FrameParams {
   guide: boolean;
   /// 収束した画素のサンプリングを止める
   adaptivePixels: boolean;
+  /// ロシアンルーレットの生存確率を、この先期待される放射輝度から決める (ADRRS)
+  ears: boolean;
+  /// 乱数のスクランブルに混ぜる塩。計測用で、描画では 0
+  salt: number;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
   denoise: boolean;
   /** 1 反復あたりに撒く光子数の倍率 (1 以下) */
   photonScale: number;
   /** 計算を止める。表示は保つ */
   paused: boolean;
-  /** 乱数のスクランブルに混ぜる塩。計測用で、描画では 0 */
-  salt: number;
 }
 
 export class Renderer {
@@ -206,7 +208,8 @@ export class Renderer {
       // 後ろにヒストグラムと CDF を間借りさせている。ストレージバッファの
       // 本数が上限に張り付いていて、専用のバッファを増やせないため。
       // COPY_DST はシーン切り替えで丸ごと消すため (clearBuffer が要求する)
-      size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 8 + GUIDE_VOX * GUIDE_BINS + GUIDE_VOX * (GUIDE_BINS + 1)) * 4,
+      // 末尾の GUIDE_VOX * 2 は ADRRS の放射輝度キャッシュ (和と記録数)
+      size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 8 + GUIDE_VOX * GUIDE_BINS + GUIDE_VOX * (GUIDE_BINS + 1) + GUIDE_VOX * 2) * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       label: "grid",
     });
@@ -471,6 +474,7 @@ export class Renderer {
     u[76] = p.vcm ? 1 : 0;
     u[77] = p.guide ? 1 : 0;
     u[78] = p.adaptivePixels ? 1 : 0;
+    u[79] = p.ears ? 1 : 0;
     u[80] = p.salt;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
