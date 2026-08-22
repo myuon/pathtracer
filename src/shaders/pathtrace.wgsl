@@ -1014,6 +1014,20 @@ fn ggxG1(nDotX: f32, a: f32) -> f32 {
   return 2.0 * nDotX / (nDotX + sqrt(a2 + (1.0 - a2) * nDotX * nDotX));
 }
 
+/// Smith の遮蔽・陰影項 (両側、高さ相関型)。
+/// G1(v) * G1(l) の分離型は遮蔽を過大評価して粗い面が暗くなる。
+/// **eval と scatter の重みは必ずこれで揃えること** (pdf は G1(v) のままで
+/// 変わらないので MIS には影響しない)
+fn ggxG2(cosO: f32, cosI: f32, a: f32) -> f32 {
+  if (cosO <= 0.0 || cosI <= 0.0) {
+    return 0.0;
+  }
+  let a2 = a * a;
+  let lo = cosI * sqrt(a2 + (1.0 - a2) * cosO * cosO);
+  let li = cosO * sqrt(a2 + (1.0 - a2) * cosI * cosI);
+  return 2.0 * cosO * cosI / max(lo + li, 1e-9);
+}
+
 fn fresnelSchlick(cosTheta: f32, f0: vec3f) -> vec3f {
   return f0 + (vec3f(1.0) - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
@@ -1126,7 +1140,7 @@ fn dielectricEvalCos(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
   let cosO = dot(hit.normal, v);
   let cosI = dot(hit.normal, wi);
   let d = ggxD(dot(hit.normal, t.h), a);
-  let g2 = ggxG1(cosO, a) * ggxG1(abs(cosI), a);
+  let g2 = ggxG2(cosO, abs(cosI), a);
   if (!t.isReflect) {
     // 透過方向は直線の影レイが必ずガラス自身に遮られるので、光源サンプリングの
     // 担当外にする。BSDF サンプリング側が重み 1 で受け持つ
@@ -1177,7 +1191,7 @@ fn bsdfEval(hit: Hit, rayDir: vec3f, wi: vec3f) -> vec3f {
     }
     let h = normalize(v + wi);
     let a = ggxAlpha(hit.mat.roughness);
-    let g2 = ggxG1(nDotV, a) * ggxG1(cosI, a);
+    let g2 = ggxG2(nDotV, cosI, a);
     let f = fresnelSchlick(max(dot(v, h), 0.0), hit.mat.albedo);
     // BRDF * cos(theta_i) = D * G2 * F / (4 * nDotV) (cos は約分されている)
     return f * (ggxD(dot(hit.normal, h), a) * g2 / (4.0 * nDotV));
@@ -1487,8 +1501,10 @@ fn scatter(
       // 面の裏に潜ったサンプルは捨てる
       return false;
     }
-    // f * cos / pdf を整理すると F * G2 / G1(v) = F * G1(l)
-    *attenuation = fresnelSchlick(max(dot(v, h), 0.0), m.albedo) * ggxG1(cosI, a);
+    // f * cos / pdf = F * G2 / G1(v)。eval 側と同じ G2 を使うこと
+    let nDotV = dot(hit.normal, v);
+    *attenuation = fresnelSchlick(max(dot(v, h), 0.0), m.albedo)
+      * (ggxG2(nDotV, cosI, a) / max(ggxG1(nDotV, a), 1e-6));
     *scattered = Ray(hit.p + hit.normal * 1e-4, dir);
     return true;
   }
@@ -1529,7 +1545,9 @@ fn scatter(
   // Fresnel は反射/屈折の確率的な選択で消化済みなので、残る重みは G2 / G1(v) = G1(l)
   var weight = vec3f(1.0);
   if (m.roughness > 0.0) {
-    weight = vec3f(ggxG1(abs(dot(hit.normal, dir)), a));
+    let cO = dot(hit.normal, -ray.dir);
+    let cI = abs(dot(hit.normal, dir));
+    weight = vec3f(ggxG2(cO, cI, a) / max(ggxG1(cO, a), 1e-6));
   }
   // 内側から当たったなら、その区間ぶんだけ媒質を通ってきている (Beer-Lambert)
   if (!hit.frontFace) {
