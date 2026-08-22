@@ -1190,6 +1190,8 @@ fn bsdfPdfFor(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
 /// BSDF サンプリング戦略の pdf。ガイディングを使っているときは混合分布の
 /// pdf を返す。MIS の重みはここと trace 側で必ず同じ式を使うこと。
 /// 片方だけ差し替えると重みの和が 1 にならず偏る
+/// (VCM の MIS もこれを使うこと。BSDF の pdf のままにすると、ガイディングと
+///  併用したときに戦略ごとの前提がずれて偏る)
 fn samplingPdf(hit: Hit, rayDir: vec3f, wi: vec3f) -> f32 {
   let pb = bsdfPdfFor(hit, rayDir, wi);
   if (U.guide == 0u || hit.mat.kind != MAT_LAMBERT) {
@@ -1285,9 +1287,9 @@ fn sampleDirectLight(
     // power heuristic の 2 戦略版と混ぜると和が 1 を超えて二重計上になる
     let cosToLight = abs(dot(hit.normal, wi));
     let emissionPdfW = emissionPdfDir(ln / area, -wi) / (area * f32(n));
-    let wLight = bsdfPdfFor(hit, rayDir, wi) / pL;
+    let wLight = samplingPdf(hit, rayDir, wi) / pL;
     let wCamera = emissionPdfW * cosToLight / (pL * cosLight)
-      * (etaVcm() + dVCMc + dVCc * bsdfPdfFor(hit, -wi, -rayDir));
+      * (etaVcm() + dVCMc + dVCc * samplingPdf(hit, -wi, -rayDir));
     weight = 1.0 / (wLight + 1.0 + wCamera);
   } else if (U.mis != 0u) {
     weight = misWeight(pL, samplingPdf(hit, rayDir, wi));
@@ -1493,7 +1495,11 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   // 本数で割っているので、そこと辻褄が合わなくなる。
   // 接続だけのときは影響が出ず (+0.62%)、merging を入れて初めて露呈した
   var dVCMc = 0.0;
-  if (useVcm) {
+  // merging を使うときだけ入れる。この項は light tracing の戦略ぶんであると
+  // 同時に、光源側と camera 側の量を同じ尺度に揃える役目も持っている。
+  // その尺度合わせが必要なのは merging の正規化が光源側の経路の本数で
+  // 割っているからで、接続だけの構成では逆に入れると偏る (-6.6%)
+  if (useVcm && VCM_MERGE) {
     let pixArea = 4.0 * U.tanHalfFov * U.tanHalfFov * U.aspect
       / (f32(U.width) * f32(U.height));
     let cosT = max(abs(dot(primary.dir, normalize(U.camW))), 1e-6);
@@ -1698,9 +1704,9 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
 
     // VCM の漸化式。光源側とまったく同じ形
     if (useVcm) {
-      let pF = bsdfPdfFor(hit, ray.dir, scattered.dir);
+      let pF = samplingPdf(hit, ray.dir, scattered.dir);
       if (pF > 0.0) {
-        let pR = bsdfPdfFor(hit, -scattered.dir, -ray.dir);
+        let pR = samplingPdf(hit, -scattered.dir, -ray.dir);
         let cosOut = abs(dot(hit.normal, scattered.dir));
         let eta = etaVcm();
         dVCc = (cosOut / pF) * (dVCc * pR + dVCMc + eta);
@@ -2230,8 +2236,8 @@ fn connectToLightVertex(
   // emissionPdfW は光子を撒くときに使っている混合分布の pdf と同じもの
   let lIn = photons[bestBase + 1u].xyz;
   let dist2 = dist * dist;
-  let camPdfW = bsdfPdfFor(hit, rayDir, dir);
-  let camRevPdfW = bsdfPdfFor(hit, -dir, -rayDir);
+  let camPdfW = samplingPdf(hit, rayDir, dir);
+  let camRevPdfW = samplingPdf(hit, -dir, -rayDir);
   let lightPdfW = bsdfPdfFor(lv, lIn, -dir);
   let lightRevPdfW = bsdfPdfFor(lv, dir, -lIn);
   let eta = etaVcm();
