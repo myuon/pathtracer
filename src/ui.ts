@@ -34,6 +34,8 @@ export interface RenderSettings {
   vcm: boolean;
   guide: boolean;
   adaptivePixels: boolean;
+  /// ロシアンルーレットの生存確率を、この先期待される放射輝度から決める
+  ears: boolean;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
   denoise: boolean;
   /** 1 フレームの GPU 時間が目標に収まるよう spp を自動調整する */
@@ -383,6 +385,14 @@ export function createUi(options: UiOptions): UiHandle {
     // なお SPPM が有効なときは sppmMain が走るので、この設定は効かない
     guide: false,
     adaptivePixels: false,
+    // 既定は off。差し引きはほぼ互角 (12 シーンの効率の幾何平均 0.98x、
+    // relMSE は 1.18x) だが、間接光が奥にあるシーンにだけ大きく効く。
+    // bench/run.mjs の 1024 spp で relMSE / 効率が
+    // indirect 1.87x / 1.33x、enclosed 1.77x / 1.34x、
+    // maze 1.51x / 1.10x、ajar 1.42x / 0.94x。
+    // 逆に簡単なシーンでは経路が伸びるぶん遅くなるだけなので既定では入れない。
+    // なお SPPM が有効なときは sppmMain が走るのでこの設定は効かない
+    ears: false,
   };
 
   const panel = document.createElement("div");
@@ -610,6 +620,15 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
+  const earsRow = createToggleRow({
+    label: "adaptive RR (ADRRS)",
+    value: settings.ears,
+    onChange: (v) => {
+      settings.ears = v;
+      notifyChange();
+    },
+  });
+
   const adaptivePixelsRow = createToggleRow({
     label: "adaptive sampling",
     value: settings.adaptivePixels,
@@ -680,6 +699,7 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(denoiseRow);
   body.appendChild(vcmRow);
   body.appendChild(guideRow);
+  body.appendChild(earsRow);
   body.appendChild(adaptivePixelsRow);
   body.appendChild(pauseRow);
   body.appendChild(adaptiveRow);

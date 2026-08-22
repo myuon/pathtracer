@@ -215,10 +215,11 @@ async function main() {
       vcm: ui.settings.vcm && !fast,
       guide: ui.settings.guide,
       adaptivePixels: ui.settings.adaptivePixels && !fast,
+      ears: ui.settings.ears,
+      salt: 0,
       denoise: ui.settings.denoise,
       photonScale,
       paused: ui.settings.paused,
-      salt: 0,
     });
 
     // GPU が終わるまで次を投入しない。ついでに 1 spp あたりの時間を測る

@@ -73,6 +73,8 @@ struct Uniforms {
   guide: u32,
   /// 収束した画素のサンプリングを止めるか
   adaptivePixels: u32,
+  /// ロシアンルーレットの生存確率を、この先期待される放射輝度から決めるか
+  ears: u32,
   /// 乱数と低食い違い列のスクランブルに混ぜる塩。
   /// 計測 (bench) で参照画像と検証画像に別の値を入れ、両者が同じ点列を
   /// 共有しないようにするためのもの。描画では 0 のまま
@@ -303,6 +305,70 @@ fn guideVoxel(p: vec3f) -> u32 {
   let c = clamp(vec3u(t * f32(GUIDE_DIM)), vec3u(0u), vec3u(GUIDE_DIM - 1u));
   return (c.z * GUIDE_DIM + c.y) * GUIDE_DIM + c.x;
 }
+
+// ------------------------------------------------ 効率を考えたロシアンルーレット
+// 今のロシアンルーレットは生存確率をスループットだけで決めている。
+// これは「この先どれだけ光が返ってくるか」を一切見ていないので、
+// 明るい間接光が待っている経路を切り、真っ暗な方向へ無駄に伸ばす。
+//
+// ADRRS (Vorba & Krivanek 2016) は、その地点から先に期待される放射輝度を
+// 覚えておき、「この経路が画素の目標値にどれだけ届きそうか」で生存確率を
+// 決める。ガイディングと同じ 16^3 ボクセルに、方向を潰したスカラーの
+// 平均放射輝度だけを貯める
+/// 1 ボクセルあたりの記録数の上限。ここに達したら凍結する。
+/// u32 の足し込みが桁あふれするのを防ぐのと、十分溜まった推定値を
+/// これ以上動かす必要がないのと、両方の理由
+const EARS_CAP: u32 = 1u << 20u;
+/// 記録する値の固定小数の倍率と上限
+const EARS_SCALE: f32 = 16.0;
+const EARS_MAX: f32 = 65535.0;
+/// 生存確率の下限。推定が 0 に振れた場所で経路が全滅すると、そこには
+/// 二度とデータが溜まらず推定も直らない (自己強化して直らなくなる)
+const EARS_MIN_Q: f32 = 0.05;
+/// ロシアンルーレットを始めるバウンス。スループットだけで決めていた頃は
+/// 早く始めると効く経路まで切ってしまうので 3 に置いていたが、ADRRS は
+/// 「この先どれだけ返ってきそうか」を見られるので早く始められるはず
+const RR_START: u32 = 3u;
+
+/// [vox] = 放射輝度の和 (固定小数) / [GUIDE_VOX + vox] = 記録数
+///
+/// 同じディスパッチの中で他のスレッドが書いている途中の値を読むので、
+/// これを有効にすると固定 seed でも絵が完全には再現しなくなる
+/// (実測で relMSE が 0.5% 程度ぶれる。計測のばらつき 6% よりは十分小さい)。
+/// パスガイディングも同じ性質を持っている
+fn earsOff() -> u32 {
+  return guideCdfOff() + GUIDE_VOX * (GUIDE_BINS + 1u);
+}
+
+/// そのボクセルで期待される入射放射輝度。データがなければ負を返す
+fn earsMean(vox: u32) -> f32 {
+  let n = atomicLoad(&grid[earsOff() + GUIDE_VOX + vox]);
+  if (n == 0u) {
+    return -1.0;
+  }
+  return f32(atomicLoad(&grid[earsOff() + vox])) / (EARS_SCALE * f32(n));
+}
+
+fn earsRecord(p: vec3f, li: f32) {
+  let vox = guideVoxel(p);
+  if (atomicLoad(&grid[earsOff() + GUIDE_VOX + vox]) >= EARS_CAP) {
+    return;
+  }
+  atomicAdd(&grid[earsOff() + vox], u32(clamp(li * EARS_SCALE, 0.0, EARS_MAX)));
+  atomicAdd(&grid[earsOff() + GUIDE_VOX + vox], 1u);
+}
+
+/// ADRRS の生存確率。target はこの画素が目指している値 (これまでの平均)。
+/// 「今のスループット x この先期待される放射輝度」が目標値に対して
+/// どれだけの割合かで決める。1 を超えるなら必ず生き残らせる
+fn earsSurvival(thrLum: f32, vox: u32, aim: f32) -> f32 {
+  let e = earsMean(vox);
+  if (e < 0.0 || aim <= 0.0) {
+    return -1.0;
+  }
+  return clamp(thrLum * e / aim, 0.0, 1.0);
+}
+
 
 /// 世界座標の方向を、面の法線を +z とする局所座標へ
 fn toLocal(basis: mat3x3f, d: vec3f) -> vec3f {
@@ -1333,7 +1399,17 @@ fn misWeight(pA: f32, pB: f32) -> f32 {
 }
 
 /// 面光源を 1 つ一様に選んで 1 点サンプルし、放射照度を返す。
-/// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける
+/// BRDF (拡散なら albedo / PI) は呼び出し側で掛ける。
+///
+/// ここを RIS や ReSTIR で賢くする案は 計測の結果として見送った。
+/// 1 頂点あたりの光源サンプルを 1 本から 4 本に増やして「直接光の
+/// サンプリングを完璧にしたときの上限」を測ったところ、bench/run.mjs の
+/// 12 シーン / 1024 spp で relMSE の幾何平均が 1.07x にしかならなかった
+/// (一番効いた enclosed でも 1.25x)。影レイを 4 倍払っての 1.07x なので、
+/// 1 本のまま候補を選び直す RIS の取り分はそれ以下にしかならない。
+/// このリポジトリのシーンは光源が 1〜2 個で、しかも quad を立体角について
+/// 一様にサンプルしているため、既に取りこぼしが小さい。
+/// 残っている誤差は間接光の側にある
 /// 矩形を立体角について一様にサンプルするための下ごしらえ (Urena et al. 2013)。
 /// 面上を一様に引く素朴な方法は、光源が大きく近いほど分散が増える。
 /// 立体角で引けばその依存が消える
@@ -1701,7 +1777,7 @@ fn aovColor(a: Aov) -> vec3f {
 }
 
 // ---------------------------------------------------------------- trace
-fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) -> vec3f {
+fn trace(primary: Ray, pixelTarget: f32, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) -> vec3f {
   var ray = primary;
   var throughput = vec3f(1.0);
   var radiance = vec3f(0.0);
@@ -1737,6 +1813,9 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
   var dVCc = 0.0;
   var dVMc = 0.0;
   let useGuide = U.guide != 0u;
+  let useEars = U.ears != 0u;
+  // 経路の終わりに書き戻す仕組みはガイディングと ADRRS で共通
+  let useRec = useGuide || useEars;
   var mdir = vec3f(0.0);
   // ガイディングの教師データ。各頂点で「サンプルした方向から実際に
   // どれだけの放射輝度が返ってきたか」を、経路を最後までたどってから
@@ -1794,7 +1873,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
           // VCM のときはロシアンルーレットを使わない。打ち切る確率を pdf に
     // 入れないと戦略ごとに前提がずれて偏る。逆向きの pdf にも入れる必要が
     // あって厄介なので、経路長の上限だけで打ち切る
-    if (!useVcm && depth >= 3u) {
+    if (!useVcm && depth >= RR_START) {
             // 生存確率は 1 で頭打ちにする。1 を超えたまま割ると、経路は必ず
               // 生き残るのにスループットだけが減ってエネルギーを失う。
               // ガイディングは bsdfEval / pdf が 1 を超えやすいので踏みやすい
@@ -1964,7 +2043,7 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     throughput = throughput * attenuation;
     // この頂点でサンプルした方向を覚えておく。返ってきた放射輝度は
     // 経路が終わってから (最終値 - ここまでの値) / スループット で出る
-    if (useGuide && gN < GUIDE_REC && hit.mat.kind == MAT_LAMBERT) {
+    if (useRec && gN < GUIDE_REC && hit.mat.kind == MAT_LAMBERT) {
       gPos[gN] = hit.p;
       // 局所座標に移してから覚える。法線を持ち回らずに済む
       gDir[gN] = toLocal(onb(hit.normal), scattered.dir);
@@ -1977,11 +2056,27 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     ray = scattered;
 
     // ロシアンルーレット (4 バウンス目以降)
-    if (!useVcm && depth >= 3u) {
+    if (!useVcm && depth >= RR_START) {
       // 生存確率は 1 で頭打ちにする。1 を超えたまま割ると、経路は必ず
-              // 生き残るのにスループットだけが減ってエネルギーを失う。
-              // ガイディングは bsdfEval / pdf が 1 を超えやすいので踏みやすい
-              let q = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
+      // 生き残るのにスループットだけが減ってエネルギーを失う。
+      // ガイディングは bsdfEval / pdf が 1 を超えやすいので踏みやすい
+      var q = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
+      if (useEars) {
+        // 「この先どれだけ返ってきそうか」を見て決め直す。
+        // キャッシュが空のうちは従来どおりスループットだけで決める
+        let adr = earsSurvival(max(throughput.r, max(throughput.g, throughput.b)),
+          guideVoxel(hit.p), pixelTarget);
+        if (adr >= 0.0) {
+          // 生存確率を「上げる」方向にだけ使う。
+          //
+          // 下げる方向にも使うと、この先が暗いと推定した場所で経路を余計に
+          // 切ることになり、スループットだけで決めていた頃より荒れる。
+          // 実測でも spheres 0.94x / glass 0.82x と簡単なシーンで悪化した。
+          // 上げる方向だけなら、間接光が奥にあるシーンで経路を生かしつつ、
+          // それ以外では従来とまったく同じ挙動になる
+          q = max(q, max(adr, EARS_MIN_Q));
+        }
+      }
       if (rand() > q) {
         break;
       }
@@ -1989,15 +2084,23 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     }
   }
   // 覚えておいた各頂点に、その方向から返ってきた放射輝度を書き戻す
-  if (useGuide) {
+  if (useRec) {
     let lf = luminanceOf(radiance);
     for (var i = 0u; i < gN; i = i + 1u) {
-      // ガイディングが欲しいのは「ビンの立体角で積分した放射輝度」なので
-      // pdf で割る。割らずに L のまま貯めると、方向は混合分布 p_mix から
-      // 引いているため学習されるのは L ではなく p_mix * L になる。
-      // 法線近傍が過大評価されるうえ、一度多く撒いた方向がさらに増える
-      // 正のフィードバックが掛かる
-      guideRecord(gPos[i], gDir[i], max(lf - gRad[i], 0.0) / (gThr[i] * gPdf[i]));
+      // その方向から実際に返ってきた入射放射輝度の推定値
+      let li = max(lf - gRad[i], 0.0) / gThr[i];
+      if (useGuide) {
+        // ガイディングが欲しいのは「ビンの立体角で積分した放射輝度」なので
+        // pdf で割る。割らずに L のまま貯めると、方向は混合分布 p_mix から
+        // 引いているため学習されるのは L ではなく p_mix * L になる。
+        // 法線近傍が過大評価されるうえ、一度多く撒いた方向がさらに増える
+        // 正のフィードバックが掛かる
+        guideRecord(gPos[i], gDir[i], li / gPdf[i]);
+      }
+      if (useEars) {
+        // ADRRS が欲しいのは素の期待放射輝度なので、こちらは割らない
+        earsRecord(gPos[i], li);
+      }
     }
   }
   return radiance;
@@ -2862,7 +2965,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let py = 1.0 - (f32(gid.y) + jitter.y) / f32(U.height) * 2.0;
     var fh = vec4f(0.0);
     var aov = Aov(vec3f(0.0), vec3f(0.0), 0.0, 0.0, 0.0, 0.0, vec3f(0.0));
-    let radiance = trace(makeRay(px, py, sample2d(1u, true)), &fh, &aov);
+    let radiance = trace(makeRay(px, py, sample2d(1u, true)), pixelMean, &fh, &aov);
     if (U.debugMode == 0u) {
       if (accumulable(radiance)) {
         var r = radiance;
