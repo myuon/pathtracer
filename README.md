@@ -23,6 +23,18 @@ WebGPU 対応ブラウザ (Chrome / Edge 113+, Safari 26+) が必要です。非
 - スペースキーまたは pause トグルで計算を止められる。絵はそのまま残り、再開すると続きから積む
 - デバッグ用に法線・アルベド・深度・BSDF の pdf・MIS 重み・バウンス数を疑似カラー表示できる。固定 seed にすると同条件が完全に再現される
 
+## 計測
+
+`bench/run.mjs` で等時間 / 等 spp のノイズを自動で測れる。参照画像との
+RMSE / relMSE / ACES-RMSE を出すので、「◯◯を入れたら何倍良くなったか」を
+目視ではなく数字で決められる。使い方は [bench/README.md](bench/README.md)。
+
+```sh
+node bench/run.mjs ref --spp=32768 --sppf=32 --bounces=12   # 参照画像を焼く
+node bench/run.mjs run --scenes=cornell --ms=10000 \
+  --config "base:guide=0" --config "guide:guide=1"          # 等時間で比べる
+```
+
 ## 動かす
 
 ```sh
@@ -41,3 +53,5 @@ pnpm dev
 | `src/ui.ts` | 素の DOM のコントロールパネル |
 | `src/shaders/pathtrace.wgsl` | パストレース本体 |
 | `src/shaders/present.wgsl` | トーンマップ + フルスクリーン三角形 blit |
+| `src/bench.ts` | 計測モード (`?bench=1`)。決めた予算だけ回して HDR を返す |
+| `bench/run.mjs` | 計測ドライバ。Chrome を回して参照画像との誤差を出す |
