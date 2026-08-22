@@ -1662,7 +1662,10 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
     // 入れないと戦略ごとに前提がずれて偏る。逆向きの pdf にも入れる必要が
     // あって厄介なので、経路長の上限だけで打ち切る
     if (!useVcm && depth >= 3u) {
-            let q = max(throughput.r, max(throughput.g, throughput.b));
+            // 生存確率は 1 で頭打ちにする。1 を超えたまま割ると、経路は必ず
+              // 生き残るのにスループットだけが減ってエネルギーを失う。
+              // ガイディングは bsdfEval / pdf が 1 を超えやすいので踏みやすい
+              let q = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
             if (rand() > q) {
               break;
             }
@@ -1847,7 +1850,10 @@ fn trace(primary: Ray, firstHit: ptr<function, vec4f>, aov: ptr<function, Aov>) 
 
     // ロシアンルーレット (4 バウンス目以降)
     if (!useVcm && depth >= 3u) {
-      let q = max(throughput.r, max(throughput.g, throughput.b));
+      // 生存確率は 1 で頭打ちにする。1 を超えたまま割ると、経路は必ず
+              // 生き残るのにスループットだけが減ってエネルギーを失う。
+              // ガイディングは bsdfEval / pdf が 1 を超えやすいので踏みやすい
+              let q = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
       if (rand() > q) {
         break;
       }
