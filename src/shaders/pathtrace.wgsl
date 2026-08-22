@@ -548,12 +548,19 @@ fn envColor(dir: vec3f) -> vec3f {
 }
 
 /// この方向を環境マップからサンプルしたときの立体角 pdf。
-/// CDF は最近傍テクセルの区分定数なので、pdf も最近傍で引く
+/// 重みは alpha に入っている近傍 3x3 の最大輝度。色をバイリニアで引くので、
+/// 最近傍の輝度をそのまま使うと太陽の縁で pdf が足りずに斑点が出る
+fn envWeight(iu: u32, iv: u32) -> f32 {
+  let u = min(iu, U.envWidth - 1u);
+  let v = min(iv, U.envHeight - 1u);
+  return envData[(v * U.envWidth + u) * 4u + 3u];
+}
+
 fn envPdf(dir: vec3f) -> f32 {
   let uv = dirToUv(dir);
   let iu = min(u32(uv.x * f32(U.envWidth)), U.envWidth - 1u);
   let iv = min(u32(uv.y * f32(U.envHeight)), U.envHeight - 1u);
-  return max(envLuminance(envTexel(iu, iv)), ENV_MIN_WEIGHT) * U.envPdfScale;
+  return envWeight(iu, iv) * U.envPdfScale;
 }
 
 /// 正規化済み CDF の中から xi 以下の最大の区間を探す
@@ -600,7 +607,7 @@ fn sampleEnvDir(xi: vec2f) -> vec4f {
   let phi = (f32(iu) + du) / f32(U.envWidth) * 2.0 * PI;
   let sinT = sin(theta);
   let dir = vec3f(sinT * cos(phi), cos(theta), sinT * sin(phi));
-  let pdf = max(envLuminance(envTexel(iu, iv)), ENV_MIN_WEIGHT) * U.envPdfScale;
+  let pdf = envWeight(iu, iv) * U.envPdfScale;
   return vec4f(dir, pdf);
 }
 

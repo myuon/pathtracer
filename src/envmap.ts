@@ -76,15 +76,11 @@ export function buildSunSkyEnv(width = 512, height = 256): EnvMap {
   const condOffset = marginalOffset + height + 1;
   const data = new Float32Array(condOffset + height * (width + 1));
 
-  // 行ごとに条件付き CDF を積み、同時に行の総和を集める
-  const rowSums = new Float32Array(height);
+  // 1. テクセルの色を埋める
   for (let v = 0; v < height; v++) {
     const theta = ((v + 0.5) / height) * Math.PI;
     const sinTheta = Math.sin(theta);
     const cosTheta = Math.cos(theta);
-    const base = condOffset + v * (width + 1);
-    let acc = 0;
-    data[base] = 0;
     for (let u = 0; u < width; u++) {
       const phi = ((u + 0.5) / width) * Math.PI * 2;
       const dx = sinTheta * Math.cos(phi);
@@ -94,9 +90,42 @@ export function buildSunSkyEnv(width = 512, height = 256): EnvMap {
       data[o] = r;
       data[o + 1] = g;
       data[o + 2] = b;
-      data[o + 3] = 1;
+    }
+  }
+
+  // 2. サンプリングの重みを alpha に入れる。
+  //
+  // 色はバイリニア補間で引くのに pdf を最近傍テクセルから作ると、太陽の
+  // ような小さく極端に明るい領域の縁で「暗いテクセルの pdf を使いながら
+  // 補間で明るい値を拾う」ことになり、比が数百倍に跳ねて白い斑点になる。
+  // 近傍 3x3 の最大を重みにすれば、pdf が補間値を下回らなくなる。
+  // pdf は正であればどんな形でも不偏なので、これで偏りは出ない
+  const lum = (u: number, v: number) => {
+    const uu = ((u % width) + width) % width;
+    const vv = Math.min(Math.max(v, 0), height - 1);
+    const o = (vv * width + uu) * 4;
+    return luminance(data[o], data[o + 1], data[o + 2]);
+  };
+  for (let v = 0; v < height; v++) {
+    for (let u = 0; u < width; u++) {
+      let m = 0;
+      for (let dv = -1; dv <= 1; dv++) {
+        for (let du = -1; du <= 1; du++) m = Math.max(m, lum(u + du, v + dv));
+      }
+      data[(v * width + u) * 4 + 3] = Math.max(m, MIN_WEIGHT);
+    }
+  }
+
+  // 3. 行ごとに条件付き CDF を積み、同時に行の総和を集める
+  const rowSums = new Float32Array(height);
+  for (let v = 0; v < height; v++) {
+    const sinTheta = Math.sin(((v + 0.5) / height) * Math.PI);
+    const base = condOffset + v * (width + 1);
+    let acc = 0;
+    data[base] = 0;
+    for (let u = 0; u < width; u++) {
       // sin(theta) は lat-long のテクセルが張る立体角の補正
-      acc += Math.max(luminance(r, g, b), MIN_WEIGHT) * sinTheta;
+      acc += data[(v * width + u) * 4 + 3] * sinTheta;
       data[base + u + 1] = acc;
     }
     rowSums[v] = acc;
