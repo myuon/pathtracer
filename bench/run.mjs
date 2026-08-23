@@ -21,8 +21,26 @@ const CHROME =
   process.env.CHROME_PATH ??
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
-/** 参照画像を作るときの設定。バイアスのある SPPM は参照に使えない */
-const REF_CONFIG = "nee=1,mis=1,qmc=1,envIs=1,sppm=0,vcm=0,guide=0,denoise=0,adaptive=0";
+/** 参照画像を作るときの設定。基本は無バイアスなパストレース */
+const REF_CONFIG = "nee=1,mis=1,qmc=1,envIs=1,sppm=0,vcm=0,guide=0,denoise=0";
+
+/**
+ * パストレースが収束しないシーンだけ、別の推定量で焼く。
+ *
+ * submerged は小さな光源が波打つ水面の向こうにあり、PT はその経路を
+ * ほとんど引けない (平均輝度が 256 spp で 0.276、32768 spp でも 0.339 と
+ * 伸び続ける)。SPPM は 1024 spp で 0.45075、4096 spp で 0.45118 と止まり、
+ * しかも集光半径を 1/4 にしても 0.45107 で動かない = 残っている偏りは
+ * 無視できる。こちらを参照にする
+ */
+const REF_OVERRIDE = {
+  // SPPM は 1024 spp で止まるので、予算も PT ほど要らない
+  submerged: {
+    config: "nee=1,mis=1,qmc=1,envIs=1,sppm=1,vcm=0,guide=0,denoise=0",
+    spp: "4096",
+    sppf: "1",
+  },
+};
 
 const DEFAULT_SCENES = [
   "spheres", "cornell", "veach", "mesh", "glass", "shaft",
@@ -224,7 +242,11 @@ async function cmdRef() {
       // 検証側 (salt=1) と重ならない塩で、独立な実行を repeat 回まわして平均する
       const runs = [];
       for (let i = 0; i < repeat; i++) {
-        runs.push(await measure(browser, origin, scene, `${REF_CONFIG},salt=${1000 + i}`, { spp }));
+        const ov = REF_OVERRIDE[scene];
+        const cfg = ov ? ov.config : REF_CONFIG;
+        const budget = { spp: ov?.spp ?? spp };
+        const extra = ov?.sppf ? `,sppf=${ov.sppf}` : "";
+        runs.push(await measure(browser, origin, scene, `${cfg}${extra},salt=${1000 + i}`, budget));
       }
       const r = { ...runs[0], hdr: averageHdr(runs.map((x) => x.hdr)) };
       writeFileSync(refPath(scene), r.hdr);
@@ -233,9 +255,12 @@ async function cmdRef() {
       // その参照画像は収束しておらず、誤差の基準に使えない。
       // submerged は 32768 spp でもまだ +13%/4倍 で伸びていて、
       // 「SPPM が正しいのに参照が間違っている」状態になっていた
-      const quarter = await measure(browser, origin, scene, REF_CONFIG, {
-        spp: String(Math.max(1, Math.round(Number(spp) / 4))),
-      });
+      const ov2 = REF_OVERRIDE[scene];
+      const quarter = await measure(
+        browser, origin, scene,
+        (ov2 ? ov2.config : REF_CONFIG) + (ov2?.sppf ? `,sppf=${ov2.sppf}` : ""),
+        { spp: String(Math.max(1, Math.round(Number(ov2?.spp ?? spp) / 4))) },
+      );
       const drift = meanOf(r.hdr) / meanOf(quarter.hdr) - 1;
       if (Math.abs(drift) > 0.02) {
         note = `  <- 未収束 (1/4 予算から ${(drift * 100).toFixed(1)}% 動いている)`;
