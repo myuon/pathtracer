@@ -43,6 +43,7 @@ const { values, positionals } = parseArgs({
     headed: { type: "boolean", default: false },
     json: { type: "string" },
     dump: { type: "boolean", default: false },
+    present: { type: "boolean", default: false },
   },
 });
 
@@ -76,6 +77,8 @@ function buildUrl(origin, scene, params) {
   // 参照側の点列の先頭 N 点とそのまま一致してしまい、両者の誤差が
   // 打ち消し合って実際より良く見える (実測で 4%ほど下駄を履いていた)
   q.set("salt", mode === "ref" ? "0" : "1");
+  // 表示された絵 (トーンマップ + デノイザ通し) も返させる
+  if (values.present && mode !== "ref") q.set("present", "1");
   for (const kv of params.split(",")) {
     if (!kv) continue;
     const [k, v] = kv.split("=");
@@ -113,7 +116,11 @@ async function measure(browser, origin, scene, params, budget) {
         !l.includes("Failed to load resource"),
     );
     if (errs.length) throw new Error(`ページがエラーを出した:\n${errs.slice(0, 3).join("\n")}`);
-    return { ...r, hdr: Buffer.from(r.hdr, "base64") };
+    return {
+      ...r,
+      hdr: Buffer.from(r.hdr, "base64"),
+      ldr: r.ldr ? Buffer.from(r.ldr, "base64") : undefined,
+    };
   } catch (e) {
     throw new Error(`${scene} [${params}] の計測に失敗:\n${e.message}\n${logs.join("\n")}`);
   } finally {
@@ -239,6 +246,20 @@ async function cmdRun() {
         const img = toF32(r.hdr);
         if (img.length !== ref.length) throw new Error("参照画像とサイズが違う");
         const m = metrics(img, ref);
+        // 表示に出る絵での誤差。デノイザは present の中で効くので、
+        // 累積バッファを読むだけでは効果が測れない
+        if (r.ldr) {
+          let se = 0;
+          const px = ref.length / 3;
+          for (let i = 0; i < px; i++) {
+            for (let j = 0; j < 3; j++) {
+              const want = Math.round(aces(ref[i * 3 + j]) * 255);
+              const got = r.ldr[i * 4 + j];
+              se += (want - got) * (want - got);
+            }
+          }
+          m.ldrRmse = Math.sqrt(se / (px * 3));
+        }
         // 効率 = relMSE x 秒。等 spp で測っても等時間の優劣が出る指標。
         // 「10 秒でどこまで行くか」を直接測るより、フレーム数の刻みに
         // 影響されないぶん再現性が高い
@@ -256,6 +277,7 @@ async function cmdRun() {
             `relmse ${last.relmse.toExponential(3)}  trim ${last.trimmed.toExponential(3)}  ` +
             `med ${last.medRel.toExponential(3)}  aces ${last.acesRmse.toExponential(3)}  ` +
             `eff ${last.eff.toExponential(3)}` +
+            (last.ldrRmse !== undefined ? `  ldr ${last.ldrRmse.toFixed(3)}` : "") +
             (last.bad ? `  (壊れた成分 ${last.bad})` : ""),
         );
       }

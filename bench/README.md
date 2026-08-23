@@ -48,6 +48,18 @@ node bench/run.mjs run --scenes=cornell,glass --ms=10000 --bounces=12 \
 再現性が高い**。等時間だとフレーム数の刻みで結果が動くのに対し、等 spp なら
 サンプル列が固定 seed で完全に決まるため。
 
+## デノイザを測る
+
+デノイザは present のフラグメントシェーダの中で効くので、累積バッファを
+読むだけでは効果が測れない。`--present` を付けると、トーンマップと
+デノイズを通した後の絵 (sRGB 8bit) も読み戻し、参照画像を同じトーンマップに
+通したものとの RMSE (`ldr`、0〜255 スケール) を出す。
+
+```sh
+node bench/run.mjs run --scenes=cornell --spp=64 --present \
+  --config "off:denoise=0" --config "on:denoise=1"
+```
+
 ## 壊れている場所を探す
 
 `--dump` を付けると各設定の HDR を `bench/out/<scene>_<config>.f32` に

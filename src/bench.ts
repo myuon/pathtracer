@@ -23,6 +23,8 @@ export interface BenchResult {
   ms: number;
   /** Float32Array (画素あたり RGB) を base64 にしたもの */
   hdr: string;
+  /** present を通した sRGB 8bit (RGBA)。present=1 のときだけ入る */
+  ldr?: string;
 }
 
 function flag(q: URLSearchParams, key: string, dflt: boolean): boolean {
@@ -68,6 +70,8 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
   const b = camera.basis();
 
   const sppPerFrame = Math.max(1, Math.round(num(q, "sppf", 1)));
+  // 表示された絵 (トーンマップ + デノイザ通し) も返すか
+  const wantLdr = flag(q, "present", false);
   // 予算。spp を指定すればその spp まで、ms を指定すればその時間まで
   const targetSpp = q.has("spp") ? Math.round(num(q, "spp", 0)) : 0;
   const targetMs = q.has("ms") ? num(q, "ms", 0) : 0;
@@ -121,6 +125,8 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
       frameIndex: frames,
       sppPerFrame,
       samplesBefore: samples,
+      // 最後の 1 フレームだけ、表示された絵も写す
+      capture: wantLdr,
     });
     await gpu.device.queue.onSubmittedWorkDone();
     // SPPM は spp/frame に関係なく 1 フレーム 1 サンプルなので、
@@ -134,6 +140,7 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
   const ms = performance.now() - t0;
 
   const hdr = await renderer.readHdr(width, height);
+  const ldr = wantLdr ? await renderer.readPresented(width, height) : undefined;
   const result: BenchResult = {
     scene: sceneId,
     width,
@@ -142,6 +149,7 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
     frames,
     ms,
     hdr: toBase64(hdr.buffer),
+    ldr: ldr ? toBase64(ldr.buffer) : undefined,
   };
   (window as unknown as { __bench?: BenchResult }).__bench = result;
 }
