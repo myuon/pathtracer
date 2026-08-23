@@ -63,8 +63,11 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
   canvas.style.height = `${height}px`;
 
   const gpu = await initGpu(canvas);
+  // before= を渡すと、まずそのシーンを少し描いてから本命へ切り替える。
+  // setScene の後始末 (学習した分布の破棄など) が効いているかの検証用
+  const before = q.get("before");
   const scene = buildSceneById(sceneId);
-  const renderer = new Renderer(gpu, scene);
+  const renderer = new Renderer(gpu, before ? buildSceneById(before) : scene);
   const camera = new OrbitCamera();
   camera.applyPreset(scene.camera);
   const b = camera.basis();
@@ -110,6 +113,23 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
     photonScale: num(q, "photonScale", 1),
     paused: false,
   };
+
+  if (before) {
+    // 前のシーンを一通り描いて、学習した分布や光子グリッドを埋めておく
+    const b = new OrbitCamera();
+    b.applyPreset(buildSceneById(before).camera);
+    const bb = b.basis();
+    for (let i = 0; i < 24; i++) {
+      renderer.render({
+        ...base,
+        camPos: bb.position, camU: bb.u, camV: bb.v, camW: bb.w,
+        tanHalfFov: bb.tanHalfFov, focusDist: bb.focusDist, lensRadius: bb.lensRadius,
+        frameIndex: i, sppPerFrame: 1, samplesBefore: i,
+      });
+    }
+    await gpu.device.queue.onSubmittedWorkDone();
+    renderer.setScene(scene);
+  }
 
   // ウォームアップ。パイプラインの構築とシェーダのコンパイルを計測から外す。
   // この後 samplesBefore を 0 に戻すので、累積も光子の状態もやり直しになる
