@@ -50,7 +50,15 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
     throw new WebGpuUnsupportedError("webgpu コンテキストを取得できませんでした");
   }
   const format = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format, alphaMode: "opaque" });
+  // COPY_SRC は計測 (bench) で表示された絵をそのまま読み戻すため。
+  // デノイザは present のフラグメントシェーダで効くので、累積バッファを
+  // 読むだけでは検証できない
+  context.configure({
+    device,
+    format,
+    alphaMode: "opaque",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
 
   return { device, context, format, canvas };
 }
@@ -135,6 +143,8 @@ export interface FrameParams {
   photonScale: number;
   /** 計算を止める。表示は保つ */
   paused: boolean;
+  /** 表示された絵を読み戻せるように写す (計測用) */
+  capture?: boolean;
 }
 
 export class Renderer {
@@ -168,6 +178,9 @@ export class Renderer {
   private lastWrite = 0;
   /** 直近の render() が SPPM だったか。読み戻しの合成式が変わる */
   private lastSppm = false;
+  private captureBuffer: GPUBuffer | null = null;
+  private captureBytesPerRow = 0;
+  private readonly canvasFormat: GPUTextureFormat;
   /** 再投影に使う 1 フレーム前のカメラ */
   private prevCam: FrameParams | null = null;
 
@@ -190,6 +203,7 @@ export class Renderer {
   constructor(gpu: GpuContext, scene: Scene) {
     this.device = gpu.device;
     this.context = gpu.context;
+    this.canvasFormat = gpu.format;
 
     this.uniformBuffer = this.device.createBuffer({
       size: UNIFORM_SIZE,
@@ -532,6 +546,33 @@ export class Renderer {
    * 表示する spp が水増しされるうえ、低食い違い列の添字が飛び飛びになって
    * (0, 2, 4, ... と 1 つおきに引くことになり) 層化が崩れる
    */
+  /**
+   * 直前の render({ capture: true }) が写した絵を sRGB 8bit で返す。
+   * トーンマップとデノイザを通した後なので、表示に出るものそのもの
+   */
+  async readPresented(width: number, height: number): Promise<Uint8Array> {
+    if (!this.captureBuffer) throw new Error("capture していない");
+    await this.captureBuffer.mapAsync(GPUMapMode.READ);
+    const src = new Uint8Array(this.captureBuffer.getMappedRange().slice(0));
+    this.captureBuffer.unmap();
+    // 画面のフォーマットは環境で変わる (macOS の Chrome は bgra8unorm)。
+    // 呼び出し側が悩まなくていいよう、ここで必ず RGBA に揃える
+    const bgr = this.canvasFormat.startsWith("bgra");
+    const out = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y++) {
+      const row = y * this.captureBytesPerRow;
+      for (let x = 0; x < width; x++) {
+        const s0 = row + x * 4;
+        const d0 = (y * width + x) * 4;
+        out[d0] = bgr ? src[s0 + 2] : src[s0];
+        out[d0 + 1] = src[s0 + 1];
+        out[d0 + 2] = bgr ? src[s0] : src[s0 + 2];
+        out[d0 + 3] = 255;
+      }
+    }
+    return out;
+  }
+
   render(p: FrameParams): number {
     this.ensureAccum(p.width * p.height);
     // 光子は面光源と環境マップから撒く。環境マップは NEE が直接光を
@@ -591,6 +632,7 @@ export class Renderer {
       compute.end();
     }
 
+    const capture = p.capture === true;
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
@@ -605,6 +647,26 @@ export class Renderer {
     pass.setBindGroup(0, this.presentBindGroups[write]);
     pass.draw(3);
     pass.end();
+
+    if (capture) {
+      // トーンマップとデノイズを通した後の絵を、同じエンコーダのうちに写す
+      const bpr = Math.ceil((p.width * 4) / 256) * 256;
+      const need = bpr * p.height;
+      if (!this.captureBuffer || this.captureBuffer.size < need) {
+        this.captureBuffer?.destroy();
+        this.captureBuffer = this.device.createBuffer({
+          size: need,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          label: "bench capture",
+        });
+      }
+      this.captureBytesPerRow = bpr;
+      encoder.copyTextureToBuffer(
+        { texture: this.context.getCurrentTexture() },
+        { buffer: this.captureBuffer, bytesPerRow: bpr },
+        { width: p.width, height: p.height },
+      );
+    }
 
     this.device.queue.submit([encoder.finish()]);
     this.lastWrite = write;
