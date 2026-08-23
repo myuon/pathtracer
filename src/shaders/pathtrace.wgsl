@@ -225,6 +225,11 @@ const BVH_STACK: u32 = 24u;
 /// 評価するために要る。SPPM の集光だけなら [0..2] しか使わない
 const VTX_SLOTS: u32 = 6u;
 
+/// 光子側のロシアンルーレットを使うか
+const PHOTON_RR: bool = true;
+/// 光子のロシアンルーレットを始めるバウンス
+const PHOTON_RR_START: u32 = 2u;
+
 /// 光子を集めるときに「同じ面か」を判定する閾値。
 /// 法線の内積がこれを下回る光子は捨てる。曲面 (球) では 1 つの半径の中で
 /// 法線が振れるので、あまり厳しくすると拾えるはずの光子まで落ちる
@@ -2891,6 +2896,10 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
   // 割り当てると 26 万回が直列化してしまう
   var localSlot = 0u;
   var bounces = 0u;
+  /// 放射してからの相対的な減衰。ロシアンルーレットはこれで決める。
+  /// power は「放射照度 x 面積」の絶対値なので、そのまま生存確率にすると
+  /// 常に 1 を超えて打ち切りが一度も効かない (maze なら 7000 x 面積)
+  var relThr = 1.0;
   for (var depth = 0u; depth < U.maxBounces; depth = depth + 1u) {
     var hit: Hit;
     if (!hitScene(ray, 1e-3, 1e30, &hit)) {
@@ -2948,16 +2957,18 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     power = power * attenuation;
+    relThr = relThr * max(attenuation.r, max(attenuation.g, attenuation.b));
     ray = scattered;
     bounces = bounces + 1u;
 
     // ロシアンルーレット
-    if (U.vcm == 0u && depth >= 2u) {
-      let q = min(max(power.r, max(power.g, power.b)), 1.0);
+    if (PHOTON_RR && U.vcm == 0u && depth >= PHOTON_RR_START) {
+      let q = min(relThr, 1.0);
       if (rand() > q) {
         return;
       }
       power = power / max(q, 1e-4);
+      relThr = relThr / max(q, 1e-4);
     }
   }
 }
