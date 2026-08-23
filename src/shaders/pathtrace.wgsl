@@ -225,6 +225,14 @@ const BVH_STACK: u32 = 24u;
 /// 評価するために要る。SPPM の集光だけなら [0..2] しか使わない
 const VTX_SLOTS: u32 = 6u;
 
+/// 光子を集めるときに「同じ面か」を判定する閾値。
+/// 法線の内積がこれを下回る光子は捨てる。曲面 (球) では 1 つの半径の中で
+/// 法線が振れるので、あまり厳しくすると拾えるはずの光子まで落ちる
+const GATHER_COS: f32 = 0.9;
+/// 接平面からの距離の許容量 (半径に対する比)。向きが揃った平行な 2 面が
+/// 半径より近いときに漏れるのを止める
+const GATHER_PLANE: f32 = 0.3;
+
 /// 光子 1 本が堆積できる回数の上限。白い部屋では光子が 3〜5 回跳ねるので、
 /// 2 回で打ち切ると間接光がごっそり欠ける。水面越しの集光はさらに跳ねるため、
 /// 6 -> 10 でノイズが 3.26 -> 1.23 まで落ちた
@@ -2192,6 +2200,22 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
           let pi = atomicLoad(&grid[U.gridCells + cell * GRID_CAP + k]);
           let d = photons[pi * VTX_SLOTS + 0u].xyz - hit.p;
           if (dot(d, d) > r2) {
+            continue;
+          }
+          // 光子が「同じ面」に載っているかを確かめる。
+          //
+          // 距離だけで拾うと、半径の中に入っている別の面 (薄い衝立の裏側、
+          // 隅で直交する壁、光源を囲う箱の外側) の光子まで集めてしまう。
+          // 明るい面の光子が暗い面へ漏れるので、桁違いに明るくなる。
+          // maze と enclosed で衝立や箱の輪郭に沿って 500 倍・70 倍の
+          // 明るさが出ていたのはこれ。法線は光子を撒くときに書いてある
+          let pn = photons[pi * VTX_SLOTS + 3u].xyz;
+          if (dot(pn, hit.normal) < GATHER_COS) {
+            continue;
+          }
+          // 向きが揃っていても、平行な 2 面が半径より近いと漏れる。
+          // 接平面からの距離でも切る
+          if (abs(dot(d, hit.normal)) > GATHER_PLANE * r) {
             continue;
           }
           let wi = -photons[pi * VTX_SLOTS + 1u].xyz;
