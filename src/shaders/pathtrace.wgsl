@@ -2201,7 +2201,12 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // -------------------------------------------------------------- SPPM ギャザー
-/// 半径 r 以内の光子を集め、BRDF を掛けたフラックスの和と個数を返す
+/// 半径 r 以内の光子を集め、BRDF を掛けたフラックスの和と個数を返す。
+///
+/// 光子がセルのどの枠に入るかは atomicAdd の順で決まるので、同じ設定でも
+/// 走らせるたびに足す順番が変わる。浮動小数の加算は結合則を満たさないので、
+/// 固定 seed にしても SPPM の絵は完全には再現しない (実測で relMSE が
+/// 0.1 〜 0.8% ぶれる)。A/B を取るときはこの幅より小さい差を読まないこと
 fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> vec3f {
   var sum = vec3f(0.0);
   var m = 0.0;
