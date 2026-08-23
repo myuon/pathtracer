@@ -133,19 +133,39 @@ function aces(x) {
 /** 参照との誤差。値が壊れている画素は数だけ報告して除外する */
 function metrics(img, ref) {
   let se = 0, rel = 0, ase = 0, n = 0, bad = 0;
-  for (let i = 0; i < img.length; i++) {
-    const a = img[i], b = ref[i];
-    if (!Number.isFinite(a) || !Number.isFinite(b)) { bad++; continue; }
-    const d = a - b;
-    se += d * d;
-    rel += (d * d) / (b * b + 0.01);
-    const da = aces(a) - aces(b);
-    ase += da * da;
-    n++;
+  // 画素ごとの相対二乗誤差。裾に強く引きずられる relmse を補うため、
+  // 上位 1% を落としたものと中央値も出す
+  const per = [];
+  const px = img.length / 3;
+  for (let i = 0; i < px; i++) {
+    let pe = 0, pn = 0;
+    for (let j = 0; j < 3; j++) {
+      const a = img[i * 3 + j], b = ref[i * 3 + j];
+      if (!Number.isFinite(a) || !Number.isFinite(b)) { bad++; continue; }
+      const d = a - b;
+      se += d * d;
+      const r = (d * d) / (b * b + 0.01);
+      rel += r;
+      pe += r; pn++;
+      const da = aces(a) - aces(b);
+      ase += da * da;
+      n++;
+    }
+    if (pn) per.push(pe / pn);
   }
+  per.sort((a, b) => a - b);
+  const keep = Math.max(1, Math.floor(per.length * 0.99));
+  let trimSum = 0;
+  for (let i = 0; i < keep; i++) trimSum += per[i];
   return {
     rmse: Math.sqrt(se / n),
     relmse: rel / n,
+    // 上位 1% の画素を落とした relMSE。光沢面のシルエットに出る十数個の
+    // firefly が relMSE の半分以上を占めることがあり、素の relMSE では
+    // サンプラの良し悪しがまったく見えない
+    trimmed: trimSum / keep,
+    /// 画素ごとの相対二乗誤差の中央値。典型的な画素がどれだけ合っているか
+    medRel: per[Math.floor(per.length * 0.5)],
     acesRmse: Math.sqrt(ase / n),
     bad,
   };
@@ -233,8 +253,9 @@ async function cmdRun() {
         console.log(
           `${scene.padEnd(10)} ${c.name.padEnd(12)} ${String(last.spp).padStart(6)} spp ` +
             `${(last.ms / 1000).toFixed(1).padStart(6)}s  ` +
-            `rmse ${last.rmse.toExponential(3)}  relmse ${last.relmse.toExponential(3)}  ` +
-            `aces ${last.acesRmse.toExponential(3)}  eff ${last.eff.toExponential(3)}` +
+            `relmse ${last.relmse.toExponential(3)}  trim ${last.trimmed.toExponential(3)}  ` +
+            `med ${last.medRel.toExponential(3)}  aces ${last.acesRmse.toExponential(3)}  ` +
+            `eff ${last.eff.toExponential(3)}` +
             (last.bad ? `  (壊れた成分 ${last.bad})` : ""),
         );
       }
@@ -243,9 +264,11 @@ async function cmdRun() {
 
   // 先頭の設定を基準にした倍率。1 より大きいほど良い
   const names = configs.map((c) => c.name);
-  for (const key of ["relmse", "eff"]) {
+  for (const key of ["relmse", "trimmed", "medRel", "eff"]) {
     console.log(
-      `\n=== 基準 (${names[0]}) に対する ${key === "eff" ? "効率 (relMSE x 秒)" : "relMSE"} の倍率 ===`,
+      `\n=== 基準 (${names[0]}) に対する ${
+        { eff: "効率 (relMSE x 秒)", relmse: "relMSE", trimmed: "relMSE (上位 1% 除く)", medRel: "相対誤差の中央値" }[key]
+      } の倍率 ===`,
     );
     console.log(["scene".padEnd(10), ...names.map((n) => n.padStart(12))].join(""));
     const all = [];
