@@ -84,6 +84,25 @@ node bench/smoke.mjs      # または pnpm bench:smoke
 先にそのシーンを描いてから本命へ切り替えるので、学習した分布や光子グリッドが
 持ち越されていれば数値がずれる。
 
+## 比較画像を作る
+
+`bench/shot.mjs` はアプリを実際に起動して、同じ壁時計時間だけ回した絵を撮る。
+`bench/compose.mjs` はそれをラベル付きで横に並べる。別の版と比べたいときは
+`git worktree` でその版を用意して `--root` に渡す (`/tmp` は macOS だと
+symlink で vite が解決に失敗するのでホーム以下に置くこと)。
+
+```sh
+git worktree add ~/pt-old main
+ln -s "$PWD/node_modules" ~/pt-old/node_modules
+node bench/shot.mjs --root=~/pt-old --out=/tmp/a --scenes=maze,ajar --ms=180000
+node bench/shot.mjs --root=.       --out=/tmp/b --scenes=maze,ajar --ms=180000
+node bench/compose.mjs --a=/tmp/a --b=/tmp/b --scenes=maze,ajar --out=/tmp/c.png
+cwebp -lossless /tmp/c.png -o docs/xxx.webp
+```
+
+短い時間で撮ると「遅いが正しい」実装が不利に見える。実装の正しさを見たい
+ときは十分に積んでから撮ること。
+
 ## 定数の突き合わせ
 
 WGSL と TS の両方に同じ値を手で書いている定数がいくつかある
