@@ -221,7 +221,7 @@ const BVH_STACK: u32 = 24u;
 
 /// 光源側の経路頂点 1 個が使うスロット数 (vec4f 単位)。
 /// [0] 位置 + dVCM / [1] 入射方向 + dVC / [2] 経路の重み + 放出方向のビン
-/// [3] 法線 + 材質の種類 / [4] アルベド + 粗さ / [5] dVM
+/// [3] 法線 + 材質の種類 / [4] アルベド + 粗さ / [5] デルタ散乱を経たか
 /// 後半 2 つは VCM の接続 (camera 側の頂点とつなぐ) で光源側の BSDF を
 /// 評価するために要る。SPPM の集光だけなら [0..2] しか使わない
 const VTX_SLOTS: u32 = 6u;
@@ -1612,7 +1612,7 @@ fn sampleDirectLight(
     let emissionPdfW = emissionPdfDir(ln / area, -wi) / (area * f32(n));
     let wLight = samplingPdf(hit, rayDir, wi) / pL;
     let wCamera = emissionPdfW * cosToLight / (pL * cosLight)
-      * (etaVcm() + dVCMc + dVCc * samplingPdf(hit, -wi, -rayDir));
+      * (dVCMc + dVCc * samplingPdf(hit, -wi, -rayDir));
     weight = 1.0 / (wLight + 1.0 + wCamera);
   } else if (U.mis != 0u) {
     weight = misWeight(pL, samplingPdf(hit, rayDir, wi));
@@ -1843,14 +1843,7 @@ fn trace(primary: Ray, pixelTarget: f32, firstHit: ptr<function, vec4f>, aov: pt
   // 同時に、光源側と camera 側の量を同じ尺度に揃える役目も持っている。
   // その尺度合わせが必要なのは merging の正規化が光源側の経路の本数で
   // 割っているからで、接続だけの構成では逆に入れると偏る (-6.6%)
-  if (useVcm && VCM_MERGE) {
-    let pixArea = 4.0 * U.tanHalfFov * U.tanHalfFov * U.aspect
-      / (f32(U.width) * f32(U.height));
-    let cosT = max(abs(dot(primary.dir, normalize(U.camW))), 1e-6);
-    dVCMc = f32(U.photonCount) * pixArea * cosT * cosT * cosT;
-  }
   var dVCc = 0.0;
-  var dVMc = 0.0;
   let useGuide = U.guide != 0u;
   let useEars = U.ears != 0u;
   // 経路の終わりに書き戻す仕組みはガイディングと ADRRS で共通
@@ -1953,7 +1946,6 @@ fn trace(primary: Ray, pixelTarget: f32, firstHit: ptr<function, vec4f>, aov: pt
     if (useVcm && cosInC > 1e-6) {
       dVCMc = dVCMc * hit.t * hit.t / cosInC;
       dVCc = dVCc / cosInC;
-      dVMc = dVMc / cosInC;
     }
 
     // 光源に当たったときの放射。NEE と重複するぶんを MIS 重みで削る
@@ -1996,9 +1988,6 @@ fn trace(primary: Ray, pixelTarget: f32, firstHit: ptr<function, vec4f>, aov: pt
     if (useVcm && isDiffuseLike(hit.mat)) {
       var st = vec3f(0.0);
       radiance = radiance + throughput * connectToLightVertex(hit, ray.dir, dVCMc, dVCc, &st);
-      if (VCM_MERGE) {
-        radiance = radiance + throughput * mergeAtVertex(hit, ray.dir, dVCMc, dVCc, dVMc);
-      }
       if (depth == 0u) {
         (*aov).connStat = st;
       }
@@ -2067,16 +2056,13 @@ fn trace(primary: Ray, pixelTarget: f32, firstHit: ptr<function, vec4f>, aov: pt
       if (pF > 0.0) {
         let pR = samplingPdf(hit, -scattered.dir, -ray.dir);
         let cosOut = abs(dot(hit.normal, scattered.dir));
-        let eta = etaVcm();
-        dVCc = (cosOut / pF) * (dVCc * pR + dVCMc + eta);
-        dVMc = (cosOut / pF) * (dVMc * pR + dVCMc / eta + 1.0);
+        dVCc = (cosOut / pF) * (dVCc * pR + dVCMc);
         dVCMc = 1.0 / pF;
       } else {
         // デルタ的な散乱。光源側とまったく同じ扱いにする。
         // 全部 0 にすると MIS の重みが 1 に張り付いて過剰計上になる
         let cosOut = abs(dot(hit.normal, scattered.dir));
         dVCc = dVCc * cosOut;
-        dVMc = dVMc * cosOut;
         dVCMc = 0.0;
       }
     }
@@ -2494,7 +2480,7 @@ fn lightVertexHit(base: u32) -> Hit {
 const VCM_SKIP_SPECULAR: bool = true;
 
 fn lightVertexAlive(base: u32) -> bool {
-  if (VCM_SKIP_SPECULAR && photons[base + 5u].y > 0.5) {
+  if (VCM_SKIP_SPECULAR && photons[base + 5u].x > 0.5) {
     return false;
   }
   // 環境マップから撒いた光子は dVCM / dVC を計算していないので接続に使えない。
@@ -2509,19 +2495,6 @@ fn lightVertexAlive(base: u32) -> bool {
   let kind = floor(v / 65536.0);
   return u32(v - kind * 65536.0) == (U.frameIndex % 65536u);
 }
-
-/// merging を MIS に統合するか。正しく動くようになったが、接続のみの構成の
-/// 15 倍遅い (267 ms 対 3893 ms) ので既定は false。等時間では接続のみが勝つ。
-///
-///   cornell  PT 比 +0.72%   (修正前 +2.30%)
-///   ajar     SPPM 比 +2.80% (約 300 spp 時点。収束不足の可能性あり)
-///
-/// merging を MIS に統合するか。正しく動くようになったが、接続のみの構成の
-/// 15 倍遅い (267 ms 対 3893 ms) ので既定は false。等時間では接続のみが勝つ。
-///
-///   cornell  PT 比 +0.72%   (修正前 +2.30%)
-///   ajar     SPPM 比 +2.80% (約 300 spp 時点。収束不足の可能性あり)
-const VCM_MERGE: bool = false;
 
 /// VCM の接続は既定 off。偏りは無く効きも大きいが、SPPM の方が等時間で強い。
 ///
@@ -2543,24 +2516,6 @@ const VCM_MERGE: bool = false;
 /// 無限に増える。SPPM と VCM で同じ値を使う
 const ALPHA: f32 = 0.7;
 
-/// VCM の半径。SPPM の画素ごとの半径と違い、全体で 1 つの値を反復ごとに縮める
-fn vcmRadius() -> f32 {
-  let it = f32(U.samplesBefore) / f32(max(U.sppPerFrame, 1u)) + 1.0;
-  return U.radius0 * pow(max(it, 1.0), (ALPHA - 1.0) * 0.5);
-}
-
-/// merging の戦略 1 個が connection 何個ぶんに相当するかの比。
-/// 半径 r の円盤に光子が入る確率が pi r^2 * 本数 に比例することから来る
-fn etaVcm() -> f32 {
-  if (!VCM_MERGE) {
-    // merging を戦略として使わないなら、他の戦略の重みからも外す必要がある
-    return 0.0;
-  }
-  let r = vcmRadius();
-  return PI * r * r * f32(max(U.photonCount, 1u));
-}
-
-/// 候補として引く光源側の頂点の数。影レイを撃たずに評価するので安い
 /// 候補として引く光源側の頂点の数。影レイを撃たずに評価するので安い
 const RIS_CANDIDATES: u32 = 8u;
 
@@ -2632,64 +2587,6 @@ fn candidateScore(hit: Hit, rayDir: vec3f, base: u32) -> f32 {
 /// カメラ側の頂点で、半径内にある光源側の頂点を同一視して集める (merging)。
 /// 影レイが要らないので遮蔽に強い。半径ぶんのボケが乗るが、反復とともに
 /// 半径が縮むので消える
-fn mergeAtVertex(
-  hit: Hit,
-  rayDir: vec3f,
-  dVCMc: f32,
-  dVCc: f32,
-  dVMc: f32,
-) -> vec3f {
-  let r = vcmRadius();
-  let r2 = r * r;
-  let invEta = 1.0 / etaVcm();
-  var sum = vec3f(0.0);
-  let c = gridCoord(hit.p);
-  for (var dz = -1; dz <= 1; dz = dz + 1) {
-    for (var dy = -1; dy <= 1; dy = dy + 1) {
-      for (var dx = -1; dx <= 1; dx = dx + 1) {
-        let cell = gridHash(c.x + dx, c.y + dy, c.z + dz);
-        let cnt = min(atomicLoad(&grid[cell]), GRID_CAP);
-        for (var k = 0u; k < cnt; k = k + 1u) {
-          let pi = atomicLoad(&grid[U.gridCells + cell * GRID_CAP + k]);
-          let base = pi * VTX_SLOTS;
-          let d = photons[base + 0u].xyz - hit.p;
-          if (dot(d, d) > r2) {
-            continue;
-          }
-          // gatherPhotons と同じ「同じ面か」の判定。距離だけで拾うと
-          // 半径の中にある別の面の光子まで集めてしまう
-          if (dot(photons[base + 3u].xyz, hit.normal) < GATHER_COS) {
-            continue;
-          }
-          if (abs(dot(d, hit.normal)) > GATHER_PLANE * vcmRadius()) {
-            continue;
-          }
-          let wi = -photons[base + 1u].xyz;
-          let cosI = dot(hit.normal, wi);
-          if (cosI <= 1e-4) {
-            continue;
-          }
-          // bsdfEval は f * cos を返すので、余弦で割って裸の BSDF に戻す
-          let f = bsdfEval(hit, rayDir, wi) / cosI;
-          let pF = bsdfPdfFor(hit, rayDir, wi);
-          let pR = bsdfPdfFor(hit, -wi, -rayDir);
-          let wLight = photons[base + 0u].w * invEta + photons[base + 5u].x * pF;
-          let wCamera = dVCMc * invEta + dVMc * pR;
-          let mis = 1.0 / (wLight + 1.0 + wCamera);
-          sum = sum + f * photons[base + 2u].xyz * mis;
-        }
-      }
-    }
-  }
-  return sum / (PI * r2 * f32(max(U.photonCount, 1u)));
-}
-
-/// カメラ側の頂点 1 個を、光源側の経路の頂点 1 個とつなぐ。
-///
-/// 一様に 1 個引くだけだと、狭い隙間の向こうにしか光源がないシーンでは
-/// ほとんど当たらない。光源側の頂点の大半は扉の裏の小部屋にあって
-/// 部屋からは見えないため。そこで候補を何個か引いて、影レイを撃つ前の
-/// 安い評価で 1 個に絞る (RIS)。選んだ確率で割るので不偏のまま
 fn connectToLightVertex(
   hit: Hit,
   rayDir: vec3f,
@@ -2749,10 +2646,9 @@ fn connectToLightVertex(
   let camRevPdfW = samplingPdf(hit, -dir, -rayDir);
   let lightPdfW = bsdfPdfFor(lv, lIn, -dir);
   let lightRevPdfW = bsdfPdfFor(lv, dir, -lIn);
-  let eta = etaVcm();
   let wLight = camPdfW * cosLight / dist2
-    * (eta + photons[bestBase + 0u].w + photons[bestBase + 1u].w * lightRevPdfW);
-  let wCamera = lightPdfW * cosCam / dist2 * (eta + dVCMc + dVCc * camRevPdfW);
+    * (photons[bestBase + 0u].w + photons[bestBase + 1u].w * lightRevPdfW);
+  let wCamera = lightPdfW * cosCam / dist2 * (dVCMc + dVCc * camRevPdfW);
   let mis = 1.0 / (wLight + 1.0 + wCamera);
 
   // RIS の重み。これで「全部の枠を足したもの」の不偏推定になる
@@ -2873,7 +2769,6 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
   /// VCM の MIS 用の量。環境マップからの光子には未対応なので 0 のまま
   var dVCM = 0.0;
   var dVC = 0.0;
-  var dVM = 0.0;
 
   if (pick >= U.lightCount) {
     // 環境マップ。CDF から方向を引き、外接球の外から中へ向けて撒く
@@ -2968,7 +2863,6 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     // どちらも pdf の比なので単位は無次元
     dVCM = 1.0 / pdf;
     dVC = cosE * area * f32(ln) / pdf;
-    dVM = dVC / etaVcm();
     // 出力 = 放射輝度 * 面積 * cos * (選択確率の逆数) / pdf。
     // 撒いた総数で割るのは present 側なので、ここでは割らない
     power = light.mat.emission * area * f32(ln) * cosE / pdf;
@@ -2998,7 +2892,6 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     if (cosIn > 1e-6) {
       dVCM = dVCM * hit.t * hit.t / cosIn;
       dVC = dVC / cosIn;
-      dVM = dVM / cosIn;
     }
 
     // SPPM では直接光はカメラ側の NEE が担当するので、1 回以上散乱した後だけ
@@ -3017,7 +2910,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
         vec4f(hit.normal, f32(kind) * 65536.0 + f32(U.frameIndex % 65536u));
       photons[slot * VTX_SLOTS + 4u] = vec4f(hit.mat.albedo, hit.mat.roughness);
       photons[slot * VTX_SLOTS + 5u] =
-        vec4f(dVM, select(0.0, 1.0, hadSpecular), 0.0, 0.0);
+        vec4f(select(0.0, 1.0, hadSpecular), 0.0, 0.0, 0.0);
       // 使われなかった枠は grid に載らないので、古い内容が参照されることはない
       depositPhoton(slot, hit.p);
     }
@@ -3036,13 +2929,11 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
     if (pF > 0.0) {
       let pR = bsdfPdfFor(hit, -scattered.dir, -ray.dir);
       let cosOut = abs(dot(hit.normal, scattered.dir));
-      let eta = etaVcm();
-      dVC = (cosOut / pF) * (dVC * pR + dVCM + eta);
-      dVM = (cosOut / pF) * (dVM * pR + dVCM / eta + 1.0);
+      dVC = (cosOut / pF) * (dVC * pR + dVCM);
       dVCM = 1.0 / pF;
     } else {
       // デルタ的な散乱。方向を選ぶ確率が定義できないので dVCM は 0 にするが、
-      // dVC / dVM は「順方向と逆方向の pdf の比が 1」なので cos を掛けて
+      // dVC は「順方向と逆方向の pdf の比が 1」なので cos を掛けて
       // そのまま持ち越す (Georgiev らの VCM / SmallVCM と同じ扱い)。
       //
       // ここには else が無く、屈折前の値をそのまま持ち越していた。
@@ -3050,7 +2941,6 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       // 壊れた MIS 量を持ったまま堆積していた
       let cosOut = abs(dot(hit.normal, scattered.dir));
       dVC = dVC * cosOut;
-      dVM = dVM * cosOut;
       dVCM = 0.0;
       hadSpecular = true;
     }
