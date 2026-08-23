@@ -215,6 +215,7 @@ async function main() {
       vcm: ui.settings.vcm && !fast,
       guide: ui.settings.guide,
       ears: ui.settings.ears,
+      wavefront: ui.settings.wavefront,
       salt: 0,
       denoise: ui.settings.denoise,
       photonScale,

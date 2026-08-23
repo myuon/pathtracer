@@ -73,6 +73,9 @@ struct Uniforms {
   guide: u32,
   /// ロシアンルーレットの生存確率を、この先期待される放射輝度から決めるか
   ears: u32,
+  /// 経路を 1 バウンスずつ別のディスパッチに分け、生きている経路だけを
+  /// 詰め直して次へ渡すか (wavefront)
+  wavefront: u32,
   /// 乱数と低食い違い列のスクランブルに混ぜる塩。
   /// 計測 (bench) で参照画像と検証画像に別の値を入れ、両者が同じ点列を
   /// 共有しないようにするためのもの。描画では 0 のまま
@@ -2960,6 +2963,234 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       relThr = relThr / max(q, 1e-4);
     }
   }
+}
+
+// ---------------------------------------------------------------- wavefront
+// 経路を 1 バウンスずつ別のディスパッチに分け、生き残った経路だけを詰め直して
+// 次へ渡す。死んだ経路のぶんレーンが遊ぶのを防ぐのが狙い。
+//
+// 状態は photons バッファに、キューは grid バッファに間借りする。どちらも
+// SPPM / VCM 専用で、パストレースだけのときは完全に遊んでいる。storage
+// バッファはアダプタの上限 (10 本) を使い切っていて増やせない
+//
+// 1 経路の状態は vec4f 4 個:
+//   [0] 原点 + 乱数の状態 / [1] 方向 + 画素番号
+//   [2] スループット + 直前の pdf / [3] 放射輝度 + バウンス数
+const WF_SLOTS: u32 = 4u;
+
+/// 1 ディスパッチで進めるバウンス数。TS 側の WF_CHUNK と一致させること。
+///
+/// 1 にすると毎バウンス詰め直せるが、そのぶん起動と状態の読み書きの
+/// 固定費を払う。三角形の多いシーンではそちらが勝ってしまう
+const WF_CHUNK: u32 = 2u;
+
+/// grid の先頭の使い方:
+///   [0][1]   生存数のカウンタ
+///   [2..4]   キュー 0 を処理するときの間接ディスパッチの引数
+///   [5..7]   キュー 1 のぶん
+///   [8..]    キュー本体
+fn wfQueueOff(which: u32) -> u32 {
+  return 8u + which * (U.width * U.height);
+}
+
+fn wfSeed(pixel: u32) {
+  let seedBase = select(U.frameIndex, U.samplesBefore, U.fixedSeed != 0u);
+  rngState = pcg(pixel + pcg(seedBase * 6271u + U.salt * 0x9e3779b9u + 1u));
+  pixelSeed = pcg(pixel * 26699u + U.salt * 0x85ebca6bu + 1u);
+  sampleIdx = U.samplesBefore;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn wfInit(@builtin(global_invocation_id) gid: vec3u) {
+  let n = U.width * U.height;
+  if (gid.x == 0u) {
+    atomicStore(&grid[0], n);
+    atomicStore(&grid[1], 0u);
+  }
+  if (gid.x >= n) {
+    return;
+  }
+  let pixel = gid.x;
+  wfSeed(pixel);
+
+  let jitter = sample2d(0u, true);
+  let px = (f32(pixel % U.width) + jitter.x) / f32(U.width) * 2.0 - 1.0;
+  let py = 1.0 - (f32(pixel / U.width) + jitter.y) / f32(U.height) * 2.0;
+  let ray = makeRay(px, py, sample2d(1u, true));
+
+  let b = pixel * WF_SLOTS;
+  photons[b + 0u] = vec4f(ray.origin, bitcast<f32>(rngState));
+  photons[b + 1u] = vec4f(ray.dir, bitcast<f32>(pixel));
+  photons[b + 2u] = vec4f(1.0, 1.0, 1.0, -1.0);
+  photons[b + 3u] = vec4f(0.0, 0.0, 0.0, 0.0);
+  atomicStore(&grid[wfQueueOff(0u) + pixel], pixel);
+}
+
+/// WF_CHUNK バウンスぶん進める。src のキューから読み、生き残ったら dst へ詰める
+fn wfStep(gid: u32, src: u32, dst: u32) {
+  if (gid >= atomicLoad(&grid[src])) {
+    return;
+  }
+  let pixel = atomicLoad(&grid[wfQueueOff(src) + gid]);
+  let b = pixel * WF_SLOTS;
+  let s0 = photons[b + 0u];
+  let s1 = photons[b + 1u];
+  let s2 = photons[b + 2u];
+  let s3 = photons[b + 3u];
+
+  wfSeed(pixel);
+  rngState = bitcast<u32>(s0.w);
+  var ray = Ray(s0.xyz, s1.xyz);
+  var throughput = s2.xyz;
+  var bsdfPdf = s2.w;
+  var radiance = s3.xyz;
+  var depth = bitcast<u32>(s3.w);
+
+  let useNee = U.nee != 0u && lightSelectCount() > 0u;
+  let useEnvNee = U.nee != 0u && envIsActive();
+  var alive = true;
+
+  for (var c = 0u; c < WF_CHUNK; c = c + 1u) {
+    var hit: Hit;
+    if (!hitScene(ray, 1e-3, 1e30, &hit)) {
+      var w = 1.0;
+      if (useEnvNee && bsdfPdf > 0.0) {
+        w = select(0.0, misWeight(bsdfPdf, envPdf(ray.dir) / f32(lightSelectCount())), U.mis != 0u);
+      }
+      radiance = radiance + throughput * envColor(ray.dir) * w;
+      alive = false;
+      break;
+    }
+    if (depth == 0u) {
+      histWrite[pixel * 4u + 1u] = vec4f(hit.p, 1.0);
+    }
+
+    var weight = 1.0;
+    if (useNee && bsdfPdf > 0.0 && isEmissive(hit.mat)) {
+      if (U.mis != 0u) {
+        let pL = neePdfW(hit.lightQuad, ray.origin, hit.t, abs(dot(hit.normal, ray.dir)), hit.lightArea);
+        weight = misWeight(bsdfPdf, pL);
+      } else {
+        weight = 0.0;
+      }
+    }
+    radiance = radiance + throughput * hit.mat.emission * weight;
+
+    if (useNee && isDiffuseLike(hit.mat)) {
+      var mw = 1.0;
+      var md = vec3f(0.0);
+      radiance = radiance + throughput
+        * sampleDirectLight(hit, ray.dir, sample2d(2u + depth * 2u, depth < QMC_DEPTH), &mw, &md,
+          false, 0.0, 0.0);
+    }
+
+    var attenuation: vec3f;
+    var scattered: Ray;
+    if (!scatter(ray, hit, sample2d(3u + depth * 2u, depth < QMC_DEPTH), &attenuation, &scattered, true)) {
+      alive = false;
+      break;
+    }
+    if (isDiffuseLike(hit.mat)) {
+      let pv = bsdfPdfFor(hit, ray.dir, scattered.dir);
+      bsdfPdf = select(-1.0, max(pv, 1e-8), pv > 0.0);
+    } else {
+      bsdfPdf = -1.0;
+    }
+    throughput = throughput * attenuation;
+
+    // メガカーネルは「今終えたバウンスの深さ」で判定しているので合わせる
+    if (depth >= RR_START) {
+      let q = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
+      if (rand() > q) {
+        alive = false;
+        break;
+      }
+      throughput = throughput / max(q, 1e-4);
+    }
+
+    ray = scattered;
+    depth = depth + 1u;
+    if (depth >= U.maxBounces) {
+      alive = false;
+      break;
+    }
+  }
+
+  photons[b + 0u] = vec4f(ray.origin, bitcast<f32>(rngState));
+  photons[b + 1u] = vec4f(ray.dir, s1.w);
+  photons[b + 2u] = vec4f(throughput, bsdfPdf);
+  photons[b + 3u] = vec4f(radiance, bitcast<f32>(depth));
+  if (alive) {
+    let slot = atomicAdd(&grid[dst], 1u);
+    atomicStore(&grid[wfQueueOff(dst) + slot], pixel);
+  }
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn wfStepA(@builtin(global_invocation_id) gid: vec3u) { wfStep(gid.x, 0u, 1u); }
+
+@compute @workgroup_size(64, 1, 1)
+fn wfStepB(@builtin(global_invocation_id) gid: vec3u) { wfStep(gid.x, 1u, 0u); }
+
+/// 次に走らせるステップの起動数を、生きている経路の数から決める。
+/// あわせて、その次に書き込む側のカウンタを空にする。
+///
+/// これが無いと毎バウンス全画素ぶんのワークグループを起動することになり、
+/// 生存が数本になる深いバウンスでも起動の固定費を払い続ける。実測でも
+/// バウンス上限 12 では mesh が 0.75 倍と負けるのに、4 に絞ると 1.27 倍
+/// 勝つ、という形で効いていた
+fn wfArgs(src: u32, dst: u32) {
+  let live = atomicLoad(&grid[src]);
+  let base = 2u + src * 3u;
+  atomicStore(&grid[base + 0u], (live + 63u) / 64u);
+  atomicStore(&grid[base + 1u], 1u);
+  atomicStore(&grid[base + 2u], 1u);
+  atomicStore(&grid[dst], 0u);
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn wfArgsA(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x == 0u) { wfArgs(0u, 1u); }
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn wfArgsB(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x == 0u) { wfArgs(1u, 0u); }
+}
+
+/// 貯まった放射輝度を累積バッファへ書き出す
+@compute @workgroup_size(64, 1, 1)
+fn wfResolve(@builtin(global_invocation_id) gid: vec3u) {
+  let n = U.width * U.height;
+  if (gid.x >= n) {
+    return;
+  }
+  let pixel = gid.x;
+  let o = pixel * 4u;
+  let radiance = photons[pixel * WF_SLOTS + 3u].xyz;
+
+  var prevSum = vec3f(0.0);
+  var prevCount = 0.0;
+  if (U.samplesBefore > 0u) {
+    let hc = histRead[o];
+    prevSum = hc.rgb;
+    prevCount = hc.w;
+  }
+  var r = radiance;
+  if (accumulable(r)) {
+    if (FIREFLY_K > 0.0 && prevCount > 0.0) {
+      let thr = (luminanceOf(prevSum) / prevCount) * FIREFLY_K * sqrt(prevCount);
+      let l = luminanceOf(r);
+      if (thr > 0.0 && l > thr) {
+        r = r * (thr / l);
+      }
+    }
+  } else {
+    r = vec3f(0.0);
+  }
+  histWrite[o] = vec4f(prevSum + r, prevCount + 1.0);
+  histWrite[o + 2u] = vec4f(0.0, 0.0, 0.0, 0.0);
+  histWrite[o + 3u] = vec4f(0.0, 0.0, 0.0, 0.0);
 }
 
 @compute @workgroup_size(8, 8, 1)

@@ -77,6 +77,9 @@ const UNIFORM_SIZE = 336;
 const HIST_BYTES_PER_PIXEL = 64;
 const WORKGROUP = 8;
 
+/** wavefront の 1 ディスパッチで進めるバウンス数。WGSL 側と一致させること */
+const WF_CHUNK = 2;
+
 /** 1 反復あたりに撒く光子の数 */
 // 1 フレームに撒く光子数。SPPM は累積なので、ここを半分にしても
 // 同じ総光子数に達するフレーム数が倍になるだけ。1 セルあたりの詰まり具合が
@@ -160,6 +163,8 @@ export interface FrameParams {
   guide: boolean;
   /// ロシアンルーレットの生存確率を、この先期待される放射輝度から決める (ADRRS)
   ears: boolean;
+  /// 経路を 1 バウンスずつ別のディスパッチに分ける (wavefront)
+  wavefront: boolean;
   /// 乱数のスクランブルに混ぜる塩。計測用で、描画では 0
   salt: number;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
@@ -183,6 +188,8 @@ export class Renderer {
   private readonly sppmPipeline: GPUComputePipeline;
   private readonly photonPipeline: GPUComputePipeline;
   private readonly clearGridPipeline: GPUComputePipeline;
+  private readonly wfPipelines: Record<string, GPUComputePipeline>;
+
   private readonly computeLayout: GPUBindGroupLayout;
   private readonly photonBuffer: GPUBuffer;
   private readonly gridBuffer: GPUBuffer;
@@ -247,7 +254,7 @@ export class Renderer {
       // COPY_DST はシーン切り替えで丸ごと消すため (clearBuffer が要求する)
       // 末尾の GUIDE_VOX * 2 は ADRRS の放射輝度キャッシュ (和と記録数)
       size: (GRID_CELLS * (2 + GRID_CAP) + 1 + HIST_BINS * 2 + 1 + 8 + GUIDE_VOX * GUIDE_BINS + GUIDE_VOX * (GUIDE_BINS + 1) + GUIDE_VOX * 2) * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
       label: "grid",
     });
 
@@ -284,6 +291,10 @@ export class Renderer {
     this.sppmPipeline = mk("sppmMain");
     this.photonPipeline = mk("photonMain");
     this.clearGridPipeline = mk("clearGrid");
+    this.wfPipelines = {
+      init: mk("wfInit"), stepA: mk("wfStepA"), stepB: mk("wfStepB"),
+      argsA: mk("wfArgsA"), argsB: mk("wfArgsB"), resolve: mk("wfResolve"),
+    };
 
     const presentModule = this.device.createShaderModule({
       code: presentWgsl,
@@ -511,7 +522,8 @@ export class Renderer {
     u[76] = p.vcm ? 1 : 0;
     u[77] = p.guide ? 1 : 0;
     u[78] = p.ears ? 1 : 0;
-    u[79] = p.salt;
+    u[79] = p.wavefront ? 1 : 0;
+    u[80] = p.salt;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
@@ -611,8 +623,15 @@ export class Renderer {
     const sppm = p.sppm && !fogOn && (this.lightCount > 0 || envPhotons);
     // VCM の接続は SPPM とは独立に使える。どちらも光源側の経路を撒く必要がある
     const vcm = p.vcm && !sppm && !fogOn && this.lightCount > 0;
+    // wavefront は素のパストレース専用。状態を photons バッファに置くので、
+    // 画素数がその容量を超えるときも使えない
+    const wavefront =
+      p.wavefront && !sppm && !vcm && !fogOn && !p.guide && !p.ears &&
+      p.width * p.height * 4 <= PHOTON_COUNT * MAX_DEPOSITS * VTX_SLOTS;
     const q: FrameParams =
-      sppm === p.sppm && vcm === p.vcm ? p : { ...p, sppm, vcm };
+      sppm === p.sppm && vcm === p.vcm && wavefront === p.wavefront
+        ? p
+        : { ...p, sppm, vcm, wavefront };
     // SPPM は画素ごとの状態を持ち越す必要があるので ping-pong を止める
     const write = sppm ? 0 : this.parity;
     if ((sppm || vcm) && p.samplesBefore === 0) this.photonsEmitted = 0;
@@ -642,17 +661,41 @@ export class Renderer {
       compute.setPipeline(this.photonPipeline);
       compute.dispatchWorkgroups(Math.ceil(this.photonsThisFrame / 64));
     }
-    if (sppm) {
-      // カメラ側で集める (merging)
-      compute.setPipeline(this.sppmPipeline);
+    if (wavefront) {
+      // 1 バウンスずつ別のディスパッチに分け、生きている経路を詰め直す。
+      // バウンスの偶奇はエントリポイントを 2 つに分けて表す
+      const groups = Math.ceil((p.width * p.height) / 64);
+      // 1 ディスパッチで WF_CHUNK バウンス進めるので、その分だけ回す
+      const wfSteps = Math.ceil(p.maxBounces / WF_CHUNK);
+      const wf = this.wfPipelines;
+      compute.setPipeline(wf.init);
+      compute.dispatchWorkgroups(groups);
+      // 起動数は毎回全画素ぶん。生存数に合わせて間接ディスパッチにすると
+      // パスを閉じ直す必要があり (grid を storage として束縛したままでは
+      // 間接ディスパッチ元にできない)、そのコストの方が大きかった
+      // (1.17 倍 -> 0.79 倍)
+      for (let d = 0; d < wfSteps; d++) {
+        const even = d % 2 === 0;
+        compute.setPipeline(even ? wf.argsA : wf.argsB);
+        compute.dispatchWorkgroups(1);
+        compute.setPipeline(even ? wf.stepA : wf.stepB);
+        compute.dispatchWorkgroups(groups);
+      }
+      compute.setPipeline(wf.resolve);
+      compute.dispatchWorkgroups(groups);
     } else {
-      // 通常のパストレース。VCM のときは接続戦略が中で足される
-      compute.setPipeline(this.computePipeline);
+      if (sppm) {
+        // カメラ側で集める (merging)
+        compute.setPipeline(this.sppmPipeline);
+      } else {
+        // 通常のパストレース。VCM のときは接続戦略が中で足される
+        compute.setPipeline(this.computePipeline);
+      }
+      compute.dispatchWorkgroups(
+        Math.ceil(p.width / WORKGROUP),
+        Math.ceil(p.height / WORKGROUP),
+      );
     }
-    compute.dispatchWorkgroups(
-      Math.ceil(p.width / WORKGROUP),
-      Math.ceil(p.height / WORKGROUP),
-    );
       compute.end();
     }
 
