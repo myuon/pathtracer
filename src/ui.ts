@@ -612,7 +612,7 @@ export function createUi(options: UiOptions): UiHandle {
   });
 
   const guideRow = createToggleRow({
-    label: "path guiding",
+    label: "path guiding (SPPM off 時のみ)",
     value: settings.guide,
     onChange: (v) => {
       settings.guide = v;
@@ -621,7 +621,7 @@ export function createUi(options: UiOptions): UiHandle {
   });
 
   const earsRow = createToggleRow({
-    label: "adaptive RR (ADRRS)",
+    label: "adaptive RR / ADRRS (SPPM off 時のみ)",
     value: settings.ears,
     onChange: (v) => {
       settings.ears = v;
@@ -630,7 +630,7 @@ export function createUi(options: UiOptions): UiHandle {
   });
 
   const adaptivePixelsRow = createToggleRow({
-    label: "adaptive sampling",
+    label: "adaptive sampling (SPPM off 時のみ)",
     value: settings.adaptivePixels,
     onChange: (v) => {
       settings.adaptivePixels = v;
