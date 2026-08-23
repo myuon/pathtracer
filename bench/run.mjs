@@ -42,6 +42,7 @@ const { values, positionals } = parseArgs({
     sppf: { type: "string", default: "1" },
     headed: { type: "boolean", default: false },
     json: { type: "string" },
+    dump: { type: "boolean", default: false },
   },
 });
 
@@ -204,6 +205,11 @@ async function cmdRun() {
         // 影響されないぶん再現性が高い
         const eff = m.relmse * (r.ms / 1000);
         rows.push({ scene, config: c.name, spp: r.spp, ms: r.ms, eff, ...m });
+        // 調査用に HDR をそのまま落とす。どの画素が壊れているかを見るため
+        if (values.dump) {
+          mkdirSync(join(ROOT, "bench", "out"), { recursive: true });
+          writeFileSync(join(ROOT, "bench", "out", `${scene}_${c.name}.f32`), r.hdr);
+        }
         const last = rows[rows.length - 1];
         console.log(
           `${scene.padEnd(10)} ${c.name.padEnd(12)} ${String(last.spp).padStart(6)} spp ` +
