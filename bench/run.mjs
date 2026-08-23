@@ -44,6 +44,7 @@ const { values, positionals } = parseArgs({
     json: { type: "string" },
     dump: { type: "boolean", default: false },
     present: { type: "boolean", default: false },
+    repeat: { type: "string", default: "1" },
   },
 });
 
@@ -202,13 +203,30 @@ function meanOf(buf) {
   return s / f.length;
 }
 
+/** 独立な実行を平均する。裾の重いシーンでは参照そのものが firefly を拾うので */
+function averageHdr(bufs) {
+  const n = bufs.length;
+  if (n === 1) return bufs[0];
+  const acc = new Float64Array(toF32(bufs[0]).length);
+  for (const b of bufs) { const f = toF32(b); for (let i = 0; i < f.length; i++) acc[i] += f[i]; }
+  const out = new Float32Array(acc.length);
+  for (let i = 0; i < acc.length; i++) out[i] = acc[i] / n;
+  return Buffer.from(out.buffer);
+}
+
 async function cmdRef() {
   const spp = values.spp ?? "4096";
+  const repeat = Math.max(1, Number(values.repeat));
   mkdirSync(REF_DIR, { recursive: true });
   await withBrowser(async (browser, origin) => {
     for (const scene of scenes) {
       const t = Date.now();
-      const r = await measure(browser, origin, scene, REF_CONFIG, { spp });
+      // 検証側 (salt=1) と重ならない塩で、独立な実行を repeat 回まわして平均する
+      const runs = [];
+      for (let i = 0; i < repeat; i++) {
+        runs.push(await measure(browser, origin, scene, `${REF_CONFIG},salt=${1000 + i}`, { spp }));
+      }
+      const r = { ...runs[0], hdr: averageHdr(runs.map((x) => x.hdr)) };
       writeFileSync(refPath(scene), r.hdr);
       let note = "";
       // 収束の確認。予算の 1/4 と比べて平均輝度がまだ動いているなら、

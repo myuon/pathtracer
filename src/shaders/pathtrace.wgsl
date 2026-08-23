@@ -71,8 +71,6 @@ struct Uniforms {
   vcm: u32,
   /// 空間 x 方向の分布を学習して BSDF サンプリングを寄せるか
   guide: u32,
-  /// 収束した画素のサンプリングを止めるか
-  adaptivePixels: u32,
   /// ロシアンルーレットの生存確率を、この先期待される放射輝度から決めるか
   ears: u32,
   /// 乱数と低食い違い列のスクランブルに混ぜる塩。
@@ -300,8 +298,6 @@ fn statOff() -> u32 {
 // 「この辺りにいるときは、どの方向から光が来るか」を学習して、BSDF
 // サンプリングをそちらへ寄せる。BSDF は「面がどの方向へ光を返しやすいか」
 // しか知らないので、光源が狭い方向にしかないシーンでは当てが外れ続ける
-/// 適応サンプリングを打ち切る相対標準誤差。これを下回った画素は撃たない
-const ADAPTIVE_TOL: f32 = 0.004;
 
 /// 空間の分割数 (1 辺)
 const GUIDE_DIM: u32 = 16u;
@@ -3090,35 +3086,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   rngState = pcg(pixel + pcg(seedBase * 6271u + U.salt * 0x9e3779b9u + 1u));
   pixelSeed = pcg(pixel * 26699u + U.salt * 0x85ebca6bu + 1u);
 
-  // 適応サンプリング。既に十分収束した画素は今フレームは撃たない。
-  // 空いた時間はフレームレートとして返ってくるので、荒れている画素の
-  // サンプル数が伸びる。
-  //
-  // **これは偏る**。打ち切りの判定に、その画素自身のサンプルから作った
-  // 分散を使っているため、たまたま明るい経路をまだ引いていない画素が
-  // 「収束した」と誤判定されて撃たれなくなり、そのまま暗いところで
-  // 止まる (打ち切り則の偏り)。実測でも 8192 spp の平均輝度が
-  // cornell -0.70% / glass -0.57% / indirect -0.16% と暗い側にずれ、
-  // 上位 1% 除外の relMSE は spp を 4 倍にしても glass で 0.98 倍にしか
-  // 減らない (無効時は 1.49 倍)。等時間でも 4096 spp で 0.41 〜 0.86 倍と
-  // 負けるので既定は off
-  var thisSpp = U.sppPerFrame;
+  let thisSpp = U.sppPerFrame;
   let oAcc = pixel * 4u;
-  if (U.adaptivePixels != 0u && U.sppm == 0u && U.debugMode == 0u
-    && U.samplesBefore > 0u) {
-    let acc = histWrite[oAcc];
-    let n = acc.w;
-    if (n >= 64.0) {
-      let mean = luminanceOf(acc.rgb) / n;
-      // 2 乗和から分散を出し、平均に対する相対標準誤差で判定する
-      let m2 = histWrite[oAcc + 2u].x / n;
-      let varL = max(m2 - mean * mean, 0.0);
-      let relErr = sqrt(varL / n) / max(mean, 1e-4);
-      if (relErr < ADAPTIVE_TOL) {
-        thisSpp = 0u;
-      }
-    }
-  }
 
   // この画素がこれまでに出している平均輝度。firefly の閾値と、
   // ADRRS の「目指している値」の両方に使う

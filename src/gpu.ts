@@ -133,8 +133,6 @@ export interface FrameParams {
   vcm: boolean;
   /// 空間 x 方向の分布を学習して BSDF サンプリングを寄せる
   guide: boolean;
-  /// 収束した画素のサンプリングを止める
-  adaptivePixels: boolean;
   /// ロシアンルーレットの生存確率を、この先期待される放射輝度から決める (ADRRS)
   ears: boolean;
   /// 乱数のスクランブルに混ぜる塩。計測用で、描画では 0
@@ -487,9 +485,8 @@ export class Renderer {
     f[75] = this.sceneRadius;
     u[76] = p.vcm ? 1 : 0;
     u[77] = p.guide ? 1 : 0;
-    u[78] = p.adaptivePixels ? 1 : 0;
-    u[79] = p.ears ? 1 : 0;
-    u[80] = p.salt;
+    u[78] = p.ears ? 1 : 0;
+    u[79] = p.salt;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
   }
 
