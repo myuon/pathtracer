@@ -233,6 +233,20 @@ const PHOTON_RR: bool = true;
 /// 光子のロシアンルーレットを始めるバウンス
 const PHOTON_RR_START: u32 = 2u;
 
+/// 集めた光子が実際にその点から見えるかを影レイで確かめるか。
+///
+/// 厚みゼロの衝立を越えて「同じ壁の明るい側」から漏れてくるぶんは、
+/// 面の一致判定では弾けない (同じ面・同じ法線・同じ平面なので)。
+/// 影レイは集光半径ぶんしか伸びないので BVH の走査もすぐ終わり、
+/// 12 シーンの合計時間は 14.6s -> 21.1s (+45%) で済む。
+///
+/// 256 spp / 12 シーンの relMSE:
+///   maze     1.40e+1 -> 2.43e-1  (57 倍)。対 PT 効率も 0.042 -> 5.20
+///   indirect 5.96e-2 -> 1.99e-2  (3.0 倍)
+///   spheres  6.65e-3 -> 6.15e-3  (1.08 倍)
+///   残りは横ばい。悪化するシーンはない
+const GATHER_VISIBILITY: bool = true;
+
 /// 光子を集めるときに「同じ面か」を判定する閾値。
 /// 法線の内積がこれを下回る光子は捨てる。曲面 (球) では 1 つの半径の中で
 /// 法線が振れるので、あまり厳しくすると拾えるはずの光子まで落ちる
@@ -2275,6 +2289,21 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
           let cosI = dot(hit.normal, wi);
           if (cosI <= 1e-4) {
             continue;
+          }
+          // 実際にその光子が見えるかを確かめる。半径ぶんの短い影レイなので
+          // BVH の走査もすぐ終わる。
+          //
+          // 両端を法線方向へ逃がすのが肝。曲面 (球) では同じ面の 2 点を結ぶ
+          // 線分が内側を通るので、逃がさないと正当な光子まで自己遮蔽で
+          // 落ちる (spheres で 2 倍悪化した)。逃がす量は集光半径に比例させる
+          if (GATHER_VISIBILITY) {
+            let eps = max(1e-4, r * 0.04);
+            let o = hit.p + hit.normal * eps;
+            let seg = (photons[pi * VTX_SLOTS + 0u].xyz + pn * eps) - o;
+            let dist = length(seg);
+            if (dist > 1e-6 && occluded(o, seg / dist, dist - eps)) {
+              continue;
+            }
           }
           // bsdfEval は f * cos を返すので、余弦で割って裸の BRDF に戻す
           let c1 = (bsdfEval(hit, rayDir, wi) / cosI) * photons[pi * VTX_SLOTS + 2u].xyz;
