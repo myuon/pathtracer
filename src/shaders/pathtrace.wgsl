@@ -2210,8 +2210,10 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
 ///
 /// 光子がセルのどの枠に入るかは atomicAdd の順で決まるので、同じ設定でも
 /// 走らせるたびに足す順番が変わる。浮動小数の加算は結合則を満たさないので、
-/// 固定 seed にしても SPPM の絵は完全には再現しない (実測で relMSE が
-/// 0.1 〜 0.8% ぶれる)。A/B を取るときはこの幅より小さい差を読まないこと
+/// 固定 seed にしても SPPM の絵は完全には再現しない。同じコード・同じ設定を
+/// 2 回走らせて relMSE が最大 1.8% ぶれるのを実測している (enclosed)。
+/// A/B を取るときはこの幅より小さい差を読まないこと。
+/// パストレース側 (main) はビット単位で再現する
 fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> vec3f {
   var sum = vec3f(0.0);
   var m = 0.0;
@@ -2576,6 +2578,14 @@ fn mergeAtVertex(
           let base = pi * VTX_SLOTS;
           let d = photons[base + 0u].xyz - hit.p;
           if (dot(d, d) > r2) {
+            continue;
+          }
+          // gatherPhotons と同じ「同じ面か」の判定。距離だけで拾うと
+          // 半径の中にある別の面の光子まで集めてしまう
+          if (dot(photons[base + 3u].xyz, hit.normal) < GATHER_COS) {
+            continue;
+          }
+          if (abs(dot(d, hit.normal)) > GATHER_PLANE * vcmRadius()) {
             continue;
           }
           let wi = -photons[base + 1u].xyz;
