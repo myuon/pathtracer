@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "bench": "node bench/run.mjs run",
     "bench:ref": "node bench/run.mjs ref",
-    "bench:smoke": "node bench/smoke.mjs"
+    "bench:smoke": "node bench/smoke.mjs",
+    "bench:consts": "node bench/consts.mjs"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.60",

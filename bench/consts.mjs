@@ -1,0 +1,41 @@
+// WGSL と TS で手で揃えている定数がずれていないかを確かめる。
+// ずれても何も言わずに壊れる (バッファの大きさや索引の計算が狂う) ので、
+// 定数を触ったら必ず走らせること。pnpm bench:consts
+import fs from "node:fs";
+const w = fs.readFileSync("src/shaders/pathtrace.wgsl", "utf8");
+const t = fs.readFileSync("src/gpu.ts", "utf8");
+const num = (s) => {
+  if (s === null || s === undefined) return null;
+  const c = s.replace(/u\b/g, "").trim();
+  try { return Function(`"use strict";return (${c})`)(); } catch { return c; }
+};
+const wg = (n) => { const m = w.match(new RegExp(`^const ${n}\\s*:\\s*\\w+\\s*=\\s*([^;]+);`, "m")); return m ? m[1] : null; };
+const ts = (n) => { const m = t.match(new RegExp(`^const ${n}\\s*=\\s*([^;]+);`, "m")); return m ? m[1] : null; };
+
+const names = ["GRID_CAP", "MAX_DEPOSITS", "HIST_BINS", "GUIDE_VOX", "GUIDE_BINS", "VTX_SLOTS"];
+let ng = 0;
+console.log("WGSL と TS で一致させる必要がある定数:");
+for (const n of names) {
+  const a = num(wg(n)), b = num(ts(n));
+  if (a === null || b === null) { console.log(`  ${n.padEnd(13)} WGSL=${a} TS=${b}  (片方にしか無い)`); continue; }
+  const ok = a === b;
+  if (!ok) ng++;
+  console.log(`  ${n.padEnd(13)} WGSL=${String(a).padStart(8)}  TS=${String(b).padStart(8)}  ${ok ? "一致" : "★不一致★"}`);
+}
+// GRID_CELLS は WGSL 側では uniform 経由なので TS だけ
+console.log(`  GRID_CELLS    TS=${num(ts("GRID_CELLS"))} (WGSL は uniform 経由)`);
+
+// Uniforms struct のサイズが UNIFORM_SIZE に収まるか (std140 相当の切り上げ)
+const st = w.slice(w.indexOf("struct Uniforms"), w.indexOf("};", w.indexOf("struct Uniforms")));
+const fields = [...st.matchAll(/^\s+(\w+)\s*:\s*(u32|f32|vec3f)\s*,/gm)].map((m) => m[2]);
+let off = 0;
+for (const ty of fields) { if (ty === "vec3f") { off = Math.ceil(off / 4) * 4; off += 3; } else off += 1; }
+const need = Math.ceil(off / 4) * 4 * 4;
+const us = num(ts("UNIFORM_SIZE"));
+console.log(`\nUniforms: フィールド ${fields.length} 個 / 必要 ${need} バイト / UNIFORM_SIZE ${us}  ${need <= us ? "収まっている" : "★溢れている★"}`);
+if (need > us) ng++;
+const hb = num(ts("HIST_BYTES_PER_PIXEL"));
+console.log(`HIST_BYTES_PER_PIXEL ${hb} (WGSL は vec4f 4 個 = 64 バイト)  ${hb === 64 ? "一致" : "★不一致★"}`);
+if (hb !== 64) ng++;
+console.log(ng ? `\n★ ${ng} 件の不一致` : "\nすべて一致");
+process.exit(ng ? 1 : 0);
