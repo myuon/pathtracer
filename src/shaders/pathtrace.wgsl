@@ -2157,7 +2157,18 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
     nAcc = nAcc + ALPHA * m;
   }
 
-  histWrite[o] = vec4f(direct + select(vec3f(0.0), d, accumulable(d)), count + 1.0);
+  // firefly の押し下げ。PT 側と同じで、この画素のこれまでの平均から作った
+  // 閾値を超えた寄与を落とす。光子で求めている間接光は密度推定なので
+  // 元から滑らかで、跳ねるのは NEE と 1 本伸ばした BSDF サンプリングの側
+  var dc = select(vec3f(0.0), d, accumulable(d));
+  if (FIREFLY_K > 0.0 && count > 0.0) {
+    let thr = (luminanceOf(direct) / count) * FIREFLY_K * sqrt(count);
+    let l = luminanceOf(dc);
+    if (thr > 0.0 && l > thr) {
+      dc = dc * (thr / l);
+    }
+  }
+  histWrite[o] = vec4f(direct + dc, count + 1.0);
   histWrite[o + 2u] = vec4f(select(vec3f(0.0), flux, accumulable(flux)), nAcc);
 
   // デノイザの手がかり (法線・距離) は画素中心のレイで取り直す。
