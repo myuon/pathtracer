@@ -116,14 +116,16 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
   let frames = 0;
   const t0 = performance.now();
   for (;;) {
-    renderer.render({
+    const taken = renderer.render({
       ...base,
       frameIndex: frames,
       sppPerFrame,
       samplesBefore: samples,
     });
     await gpu.device.queue.onSubmittedWorkDone();
-    samples += sppPerFrame;
+    // SPPM は spp/frame に関係なく 1 フレーム 1 サンプルなので、
+    // 実際に積んだ数で数える
+    samples += taken;
     frames += 1;
     const elapsed = performance.now() - t0;
     if (targetSpp > 0 && samples >= targetSpp) break;

@@ -524,7 +524,15 @@ export class Renderer {
     return out;
   }
 
-  render(p: FrameParams) {
+  /**
+   * このフレームで実際に積んだカメラサンプル数を返す。
+   *
+   * SPPM のときは sppmMain が 1 フレームに 1 サンプルしか撃たないので、
+   * spp/frame をいくつにしても 1。呼び出し側がここを取り違えると、
+   * 表示する spp が水増しされるうえ、低食い違い列の添字が飛び飛びになって
+   * (0, 2, 4, ... と 1 つおきに引くことになり) 層化が崩れる
+   */
+  render(p: FrameParams): number {
     this.ensureAccum(p.width * p.height);
     // 光子は面光源と環境マップから撒く。環境マップは NEE が直接光を
     // 受け持っている前提なので、env importance sampling が要る。
@@ -606,5 +614,9 @@ export class Renderer {
       this.prevCam = p;
       this.parity = sppm ? 0 : 1 - write;
     }
+    if (p.paused) {
+      return 0;
+    }
+    return sppm ? 1 : p.sppPerFrame;
   }
 }
