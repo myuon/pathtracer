@@ -2066,10 +2066,12 @@ fn trace(primary: Ray, pixelTarget: f32, firstHit: ptr<function, vec4f>, aov: pt
         dVMc = (cosOut / pF) * (dVMc * pR + dVCMc / eta + 1.0);
         dVCMc = 1.0 / pF;
       } else {
-        // デルタ的な散乱。方向を選ぶ確率が定義できないので接続も同一視もできない
-        dVCc = 0.0;
+        // デルタ的な散乱。光源側とまったく同じ扱いにする。
+        // 全部 0 にすると MIS の重みが 1 に張り付いて過剰計上になる
+        let cosOut = abs(dot(hit.normal, scattered.dir));
+        dVCc = dVCc * cosOut;
+        dVMc = dVMc * cosOut;
         dVCMc = 0.0;
-        dVMc = 0.0;
       }
     }
 
@@ -2465,6 +2467,23 @@ fn lightVertexAlive(base: u32) -> bool {
 ///   cornell  PT 比 +0.72%   (修正前 +2.30%)
 ///   ajar     SPPM 比 +2.80% (約 300 spp 時点。収束不足の可能性あり)
 const VCM_MERGE: bool = false;
+
+/// VCM の接続は既定 off。効きは大きいが、まだ過剰計上が残っている。
+///
+/// 効き (4096 spp、上位 1% 除外の relMSE、素のパストレース比):
+///   indirect 5.4x / cornell 2.2x / enclosed と ajar は横ばい
+///
+/// 残っている偏り (8192 spp での全体平均、PT 比):
+///   cornell +0.36% / enclosed +0.67% / maze +2.90% / veach -0.32% / indirect -0.04%
+///
+/// cornell はガラス球の集光が落ちる赤い壁 (x = 0, y 2.2〜3.3, z 0.2〜1.3) に
+/// 局所的に +3.4% 出る。そこは PT が 1024 / 4096 / 16384 spp で
+/// 0.04052 / 0.04055 / 0.04058 と完全に安定しているので、PT の未収束では
+/// なく VCM 側の過剰計上で間違いない。一方 maze の +2.90% は PT 自体が
+/// まだ収束していないので、どちらが正しいか判断できない。
+///
+/// 切り分け済み: RIS の候補数を 1 / 4 / 8 と変えても偏りは動かない
+/// (0.04190 / 0.04185 / 0.04188) ので、接続先の選び方の正規化は無罪
 
 /// 半径の縮み方。0 と 1 の間なら、反復とともに半径は 0 に、累積光子数は
 /// 無限に増える。SPPM と VCM で同じ値を使う
@@ -2967,6 +2986,18 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       dVC = (cosOut / pF) * (dVC * pR + dVCM + eta);
       dVM = (cosOut / pF) * (dVM * pR + dVCM / eta + 1.0);
       dVCM = 1.0 / pF;
+    } else {
+      // デルタ的な散乱。方向を選ぶ確率が定義できないので dVCM は 0 にするが、
+      // dVC / dVM は「順方向と逆方向の pdf の比が 1」なので cos を掛けて
+      // そのまま持ち越す (Georgiev らの VCM / SmallVCM と同じ扱い)。
+      //
+      // ここには else が無く、屈折前の値をそのまま持ち越していた。
+      // 誘電体の透過は dielectricPdf が 0 を返すので、ガラスを抜けた光子は
+      // 壊れた MIS 量を持ったまま堆積していた
+      let cosOut = abs(dot(hit.normal, scattered.dir));
+      dVC = dVC * cosOut;
+      dVM = dVM * cosOut;
+      dVCM = 0.0;
     }
 
     power = power * attenuation;
