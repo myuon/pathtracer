@@ -186,7 +186,7 @@ async function main() {
     const maxBounces = fast ? ui.settings.interactiveBounces : ui.settings.maxBounces;
     const b = camera.basis();
 
-    renderer.render({
+    const taken = renderer.render({
       camPos: b.position,
       camU: b.u,
       camV: b.v,
@@ -235,8 +235,8 @@ async function main() {
       gpuBusy = false;
     });
 
+    samples += taken;
     if (!ui.settings.paused) {
-      samples += spp;
       frameIndex++;
     }
 
