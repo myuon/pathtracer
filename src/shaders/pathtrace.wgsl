@@ -1616,12 +1616,15 @@ fn schlick(cosine: f32, refIdx: f32) -> f32 {
 }
 
 /// 散乱方向とアルベドを返す。false なら吸収 (打ち切り)
+/// radianceTransport は「放射輝度を運んでいるか」。カメラ側の経路なら true、
+/// 光子 (仕事率) を撒く側なら false。屈折の扱いだけが変わる
 fn scatter(
   ray: Ray,
   hit: Hit,
   u: vec2f,
   attenuation: ptr<function, vec3f>,
   scattered: ptr<function, Ray>,
+  radianceTransport: bool,
 ) -> bool {
   let m = hit.mat;
 
@@ -1689,6 +1692,7 @@ fn scatter(
   let cosVH = min(dot(-ray.dir, h), 1.0);
   let sin2 = eta * eta * max(0.0, 1.0 - cosVH * cosVH);
   var dir: vec3f;
+  var refracted = false;
   if (sin2 > 1.0 || schlick(cosVH, eta) > rand()) {
     dir = reflect(ray.dir, h);
     if (dot(dir, hit.normal) <= 0.0) {
@@ -1700,6 +1704,7 @@ fn scatter(
     if (dot(dir, hit.normal) >= 0.0) {
       return false;
     }
+    refracted = true;
   }
   dir = normalize(dir);
 
@@ -1710,6 +1715,18 @@ fn scatter(
     let cI = abs(dot(hit.normal, dir));
     weight = vec3f(ggxG2(cO, cI, a) / max(ggxG1(cO, a), 1e-6));
   }
+  // 屈折は放射輝度を保存しない。媒質が変わると立体角が圧縮され、
+  // 保存量は L ではなく L / eta^2 になる (Veach 5.2 の非対称性)。
+  // 放射輝度を運ぶ側ではこの分を掛ける必要があり、仕事率を運ぶ光子側では
+  // 掛けてはいけない。
+  //
+  // パストレースだけなら、入るときの eta^2 と出るときの 1/eta^2 が
+  // 経路の中で必ず対になって打ち消し合うので、抜けていても絵は合う。
+  // SPPM のようにカメラ側と光源側で経路を分ける方式で初めて露呈する
+  if (refracted && radianceTransport) {
+    weight = weight * (eta * eta);
+  }
+
   // 内側から当たったなら、その区間ぶんだけ媒質を通ってきている (Beer-Lambert)
   if (!hit.frontFace) {
     weight = weight * pow(max(m.albedo, vec3f(1e-4)), vec3f(hit.t));
@@ -2008,7 +2025,7 @@ fn trace(primary: Ray, pixelTarget: f32, firstHit: ptr<function, vec4f>, aov: pt
       guidedPdf = pd;
     }
     if (!guideHere) {
-      if (!scatter(ray, hit, sample2d(3u + depth * 2u, depth < QMC_DEPTH), &attenuation, &scattered)) {
+      if (!scatter(ray, hit, sample2d(3u + depth * 2u, depth < QMC_DEPTH), &attenuation, &scattered, true)) {
         break;
       }
     }
@@ -2330,7 +2347,7 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
         // 場合だけ加算する
         var att: vec3f;
         var sc: Ray;
-        if (scatter(ray, hit, vec2f(rand(), rand()), &att, &sc)) {
+        if (scatter(ray, hit, vec2f(rand(), rand()), &att, &sc, true)) {
           let pv = bsdfPdfFor(hit, ray.dir, sc.dir);
           if (pv > 0.0) {
             var h2: Hit;
@@ -2369,7 +2386,7 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
 
     var attenuation: vec3f;
     var scattered: Ray;
-    if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered)) {
+    if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered, true)) {
       return radiance;
     }
     if (neeHere) {
@@ -2907,7 +2924,8 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
 
     var attenuation: vec3f;
     var scattered: Ray;
-    if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered)) {
+    // 光子は仕事率を運ぶので、屈折での eta^2 は掛けない
+    if (!scatter(ray, hit, vec2f(rand(), rand()), &attenuation, &scattered, false)) {
       return;
     }
 
