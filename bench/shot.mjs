@@ -9,6 +9,8 @@ const { values } = parseArgs({ options: {
   root: { type: "string" }, out: { type: "string" },
   scenes: { type: "string" }, ms: { type: "string", default: "10000" },
   w: { type: "string", default: "700" }, h: { type: "string", default: "480" },
+  // ラベルの一部が一致するトグルを指定の状態にする ("SPPM=0,wavefront=1" など)
+  toggles: { type: "string", default: "" },
 }});
 const W = Number(values.w), H = Number(values.h), MS = Number(values.ms);
 
@@ -24,6 +26,23 @@ page.on("pageerror", (e) => console.error("[pageerror]", e.message));
 await page.goto(origin, { waitUntil: "load" });
 await page.waitForTimeout(1500);
 
+for (const kv of values.toggles.split(",").filter(Boolean)) {
+  const [needle, want] = kv.split("=");
+  const ok = await page.evaluate(([n, w]) => {
+    for (const lab of document.querySelectorAll("label.pt-toggle-row")) {
+      if (!lab.textContent.toLowerCase().includes(n.toLowerCase())) continue;
+      const c = lab.querySelector("input[type=checkbox]");
+      if (!c) continue;
+      if (c.checked !== (w === "1")) { c.click(); }
+      return true;
+    }
+    return false;
+  }, [needle, want]);
+  console.log(`  トグル ${kv}: ${ok ? "適用" : "★ 見つからない ★"}`);
+}
+await page.waitForTimeout(400);
+
+const spp = {};
 for (const scene of values.scenes.split(",")) {
   // シーンを選ぶ (options に scene id を持つ select を探す)
   await page.evaluate((s) => {
@@ -47,8 +66,10 @@ for (const scene of values.scenes.split(",")) {
   await page.evaluate(() => {
     for (const el of document.querySelectorAll("body > div")) el.style.visibility = "";
   });
-  const status = await page.evaluate(() => document.body.innerText.match(/\d+ spp/)?.[0] ?? "");
+  const status = await page.evaluate(() => document.body.innerText.match(/\d+x\d+[^\n]*/)?.[0] ?? "");
+  spp[scene] = status;
   console.log(`  ${scene.padEnd(10)} ${status}`);
 }
+writeFileSync(`${values.out}/spp.json`, JSON.stringify(spp));
 await browser.close();
 await server.close();

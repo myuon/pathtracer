@@ -8,6 +8,7 @@
 // 1 回の計測につきページを 1 枚使い切る。学習した分布 (ガイド格子や
 // 光子の放出ヒストグラム) が前の計測から漏れないようにするため
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { deflateSync } from "node:zlib";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -153,6 +154,34 @@ async function measure(browser, origin, scene, params, budget) {
   } finally {
     await page.close();
   }
+}
+
+/** RGBA の生画素を PNG にする。比較画像を作るためだけの最小実装 */
+function toPng(rgba, w, h) {
+  const raw = Buffer.alloc((w * 4 + 1) * h);
+  for (let y = 0; y < h; y++) {
+    raw[y * (w * 4 + 1)] = 0; // フィルタなし
+    rgba.copy(raw, y * (w * 4 + 1) + 1, y * w * 4, (y + 1) * w * 4);
+  }
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const crcT = [];
+    for (let n = 0; n < 256; n++) { let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcT[n] = c >>> 0; }
+    let c = 0xffffffff;
+    for (const b of body) c = crcT[(c ^ b) & 0xff] ^ (c >>> 8);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE((c ^ 0xffffffff) >>> 0);
+    return Buffer.concat([len, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; ihdr[9] = 6; // 8bit RGBA
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0)),
+  ]);
 }
 
 function toF32(buf) {
@@ -320,6 +349,10 @@ async function cmdRun() {
         if (values.dump) {
           mkdirSync(join(ROOT, "bench", "out"), { recursive: true });
           writeFileSync(join(ROOT, "bench", "out", `${scene}_${c.name}.f32`), r.hdr);
+          if (r.ldr) {
+            writeFileSync(join(ROOT, "bench", "out", `${scene}_${c.name}.png`),
+              toPng(r.ldr, r.width, r.height));
+          }
         }
         const last = rows[rows.length - 1];
         console.log(
