@@ -33,7 +33,6 @@ export interface RenderSettings {
   sppm: boolean;
   vcm: boolean;
   guide: boolean;
-  adaptivePixels: boolean;
   /// ロシアンルーレットの生存確率を、この先期待される放射輝度から決める
   ears: boolean;
   /** アルベド/法線ガイド付き a-trous デノイザをかける */
@@ -384,7 +383,6 @@ export function createUi(options: UiOptions): UiHandle {
     // 「狭い隙間の向こうに光源がある」を表現しきれていない。
     // なお SPPM が有効なときは sppmMain が走るので、この設定は効かない
     guide: false,
-    adaptivePixels: false,
     // 既定は off。差し引きはほぼ互角 (12 シーンの効率の幾何平均 0.98x、
     // relMSE は 1.18x) だが、間接光が奥にあるシーンにだけ大きく効く。
     // bench/run.mjs の 1024 spp で relMSE / 効率が
@@ -629,15 +627,6 @@ export function createUi(options: UiOptions): UiHandle {
     },
   });
 
-  const adaptivePixelsRow = createToggleRow({
-    label: "adaptive sampling (SPPM off 時のみ)",
-    value: settings.adaptivePixels,
-    onChange: (v) => {
-      settings.adaptivePixels = v;
-      notifyChange();
-    },
-  });
-
   const vcmRow = createToggleRow({
     label: "VCM (vertex connection)",
     value: settings.vcm,
@@ -700,7 +689,6 @@ export function createUi(options: UiOptions): UiHandle {
   body.appendChild(vcmRow);
   body.appendChild(guideRow);
   body.appendChild(earsRow);
-  body.appendChild(adaptivePixelsRow);
   body.appendChild(pauseRow);
   body.appendChild(adaptiveRow);
   body.appendChild(fixedSeedRow);
