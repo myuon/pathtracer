@@ -2170,7 +2170,19 @@ fn sppmMain(@builtin(global_invocation_id) gid: vec3u) {
 
   var newFlux = vec3f(0.0);
   var m = 0.0;
-  let d = traceSppm(makeRay(px, py, sample2d(1u, true)), radius, &newFlux, &m);
+  var aov = Aov(vec3f(0.0), vec3f(0.0), 0.0, 0.0, 0.0, 0.0, vec3f(0.0));
+  let d = traceSppm(makeRay(px, py, sample2d(1u, true)), radius, &newFlux, &m, &aov);
+
+  // デバッグ表示。main しか描いていなかったので、SPPM を有効にすると
+  // どの表示も普通の絵のままだった。光子の統計 (debug 8) に至っては
+  // 「SPPM のときしか値が埋まらないのに SPPM では見られない」状態だった。
+  // pdf と MIS 重み (4, 5) と VCM の接続 (7) はこの経路にない概念なので 0 になる
+  if (U.debugMode != 0u) {
+    histWrite[o] = vec4f(aovColor(aov), 1.0);
+    histWrite[o + 2u] = vec4f(0.0, 0.0, 0.0, 0.0);
+    histWrite[o + 3u] = vec4f(radius, 0.0, 0.0, 0.0);
+    return;
+  }
 
   // SPPM の半径・フラックス更新 (Hachisuka & Jensen)
   if (nAcc + m > 0.0) {
@@ -2313,7 +2325,8 @@ fn gatherPhotons(hit: Hit, rayDir: vec3f, r: f32, found: ptr<function, f32>) -> 
 
 /// SPPM のカメラ側。最初にギャザーできる面まで辿り、直接光は NEE、
 /// 間接光はそこで光子を集めて求める
-fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<function, f32>) -> vec3f {
+fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<function, f32>,
+  aov: ptr<function, Aov>) -> vec3f {
   var ray = primary;
   var throughput = vec3f(1.0);
   var radiance = vec3f(0.0);
@@ -2334,6 +2347,13 @@ fn traceSppm(primary: Ray, radius: f32, flux: ptr<function, vec3f>, found: ptr<f
       }
       return radiance + throughput * envColor(ray.dir) * w;
     }
+
+    if (depth == 0u) {
+      (*aov).normal = hit.normal;
+      (*aov).albedo = hit.mat.albedo;
+      (*aov).dist = hit.t;
+    }
+    (*aov).bounces = f32(depth + 1u);
 
     var we = 1.0;
     if (useNee && bsdfPdf > 0.0 && isEmissive(hit.mat)) {
