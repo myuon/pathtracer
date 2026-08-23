@@ -2482,7 +2482,21 @@ fn lightVertexHit(base: u32) -> Hit {
 
 /// この枠に今フレームの頂点が入っているか。使われなかった枠には
 /// 前フレームの内容が残るので、フレーム番号を一緒に入れて見分ける
+/// デルタ散乱 (完全鏡面の反射・誘電体の透過) を経た光源頂点は接続に使わない。
+///
+/// そこを通った経路はカメラ側の BSDF サンプリングが重み 1 で丸ごと受け持って
+/// いる。接続でも作れてしまうが、その分が他の戦略の重みに入っていないので、
+/// 足すと二重計上になる。cornell のガラス球の集光が落ちる赤い壁で +3.4%
+/// (全体でも +0.36%) 出ていたのはこれ。外すと PT の収束値と 0.05% で一致する。
+///
+/// 外しても品質は落ちない。むしろ偏った寄与が消えるぶん良くなる
+/// (5 シーンの上位 1% 除外 relMSE で 1.02 倍、cornell は 1.11 倍)
+const VCM_SKIP_SPECULAR: bool = true;
+
 fn lightVertexAlive(base: u32) -> bool {
+  if (VCM_SKIP_SPECULAR && photons[base + 5u].y > 0.5) {
+    return false;
+  }
   // 環境マップから撒いた光子は dVCM / dVC を計算していないので接続に使えない。
   // 放出方向のビンが負のものがそれ (面光源からのものは必ず 0 以上)
   if (photons[base + 2u].w < 0.0) {
@@ -2509,29 +2523,21 @@ fn lightVertexAlive(base: u32) -> bool {
 ///   ajar     SPPM 比 +2.80% (約 300 spp 時点。収束不足の可能性あり)
 const VCM_MERGE: bool = false;
 
-/// VCM の接続は既定 off。効きは大きいが、まだ過剰計上が残っている。
+/// VCM の接続は既定 off。偏りは無く効きも大きいが、SPPM の方が等時間で強い。
 ///
-/// 効き (4096 spp、上位 1% 除外の relMSE、素のパストレース比):
-///   indirect 5.4x / cornell 2.2x / enclosed と ajar は横ばい
+/// 256 spp / 12 シーンの素のパストレース比:
+///   上位 1% 除外の relMSE  2.29 倍 (maze 14.4 / enclosed 10.1 / indirect 7.9)
+///   効率 (relMSE x 秒)     1.02 倍 (maze 4.45 / ajar 2.22 / enclosed 2.03)
+/// 同じ条件で SPPM は効率 2.65 倍なので、既定は SPPM のままにする。
 ///
-/// 残っている偏り (8192 spp での全体平均、PT 比):
-///   cornell +0.36% / enclosed +0.67% / maze +2.90% / veach -0.32% / indirect -0.04%
-///
-/// cornell はガラス球の集光が落ちる赤い壁 (x = 0, y 2.2〜3.3, z 0.2〜1.3) に
-/// 局所的に +3.4% 出る。そこは PT が 1024 / 4096 / 16384 spp で
-/// 0.04052 / 0.04055 / 0.04058 と完全に安定しているので、PT の未収束では
-/// なく VCM 側の過剰計上で間違いない。一方 maze の +2.90% は PT 自体が
-/// まだ収束していないので、どちらが正しいか判断できない。
-///
-/// 切り分け済み (cornell の集光領域、PT の収束値は 0.04055):
-///  - RIS の候補数を 1 / 4 / 8 と変えても偏りは動かない
-///    (0.04190 / 0.04185 / 0.04188) → 接続先の選び方は無罪
-///  - 光子数を 1 / 1/2 / 1/4 にしても動かない (+3.40% / +3.35% / +3.44%)
-///    → 光源側の経路の本数による正規化も無罪
-///  - スペキュラ散乱後の漸化式を SmallVCM に合わせても動かない
-/// 接続の寄与だけを 0 にすると -14.50% になるので、接続は「埋めるべき量の
-/// 約 1.23 倍」を出している。つまり残っているのは MIS の重みの式そのもので、
-/// 3 戦略の重みの和が 1 になっていない。直すには重みの再導出が要る
+/// 不偏性は 8192 〜 131072 spp で確認済み。PT と食い違って見えるのは全部
+/// 別の理由だった:
+///   ajar     PT が未収束 (PT は 0.1073 -> 0.1136 と上昇中、VCM は 0.1138 で安定)
+///   enclosed 接続は最大 2 x maxBounces + 1 の長さの経路を作れるので、
+///            PT が打ち切っている多重反射を拾う。バウンス上限 5 では差が
+///            +5.74% まで開き、25 まで伸ばした PT (3.809) と 12 の PT (3.743)
+///            の間に VCM (3.769) が入る
+///   veach    裾が重く、参照側も検証側も平均が実現ごとに 0.4% ほど動く
 
 /// 半径の縮み方。0 と 1 の間なら、反復とともに半径は 0 に、累積光子数は
 /// 無限に増える。SPPM と VCM で同じ値を使う
@@ -2734,18 +2740,8 @@ fn connectToLightVertex(
   // MIS。同じ経路を作りうる他の戦略 (カメラ側をもう 1 段伸ばす、
   // 光源側をもう 1 段伸ばす) との重み付け。
   //
-  // **既知の不具合**: この重みだけを VCM の式にしても足りない。
-  // NEE と発光の重みは trace 側で misWeight() (2 戦略の power heuristic) の
-  // ままになっていて、その 2 つだけで和がちょうど 1 になっている。そこへ
-  // 接続戦略の正の重みを足すので、必ず 1 を超えて二重計上になる (+41%)。
-  // 直すには NEE と発光の重みも VCM の形に置き換える必要がある。
-  //
-  //   発光に当たったとき: 1 / (1 + directPdfA * dVCMc + emissionPdfW * dVCc)
-  //   NEE:                1 / (wLight + 1 + wCamera)
-  //     wLight  = bsdfDirPdfW / directPdfW
-  //     wCamera = emissionPdfW * cosToLight / (directPdfW * cosAtLight)
-  //               * (dVCMc + dVCc * bsdfRevPdfW)
-  //
+  // 形は Georgiev らの VCM (SmallVCM の ConnectVertices) と同じ。
+  // NEE と発光の重みも 3 戦略の形に揃えてあるので、和は 1 になる。
   // emissionPdfW は光子を撒くときに使っている混合分布の pdf と同じもの
   let lIn = photons[bestBase + 1u].xyz;
   let dist2 = dist * dist;
@@ -2983,6 +2979,8 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
   // 割り当てると 26 万回が直列化してしまう
   var localSlot = 0u;
   var bounces = 0u;
+  /// この光子がここまでにデルタ的な散乱を経ているか (接続の切り分け用)
+  var hadSpecular = false;
   /// 放射してからの相対的な減衰。ロシアンルーレットはこれで決める。
   /// power は「放射照度 x 面積」の絶対値なので、そのまま生存確率にすると
   /// 常に 1 を超えて打ち切りが一度も効かない (maze なら 7000 x 面積)
@@ -3018,7 +3016,8 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       photons[slot * VTX_SLOTS + 3u] =
         vec4f(hit.normal, f32(kind) * 65536.0 + f32(U.frameIndex % 65536u));
       photons[slot * VTX_SLOTS + 4u] = vec4f(hit.mat.albedo, hit.mat.roughness);
-      photons[slot * VTX_SLOTS + 5u] = vec4f(dVM, 0.0, 0.0, 0.0);
+      photons[slot * VTX_SLOTS + 5u] =
+        vec4f(dVM, select(0.0, 1.0, hadSpecular), 0.0, 0.0);
       // 使われなかった枠は grid に載らないので、古い内容が参照されることはない
       depositPhoton(slot, hit.p);
     }
@@ -3053,6 +3052,7 @@ fn photonMain(@builtin(global_invocation_id) gid: vec3u) {
       dVC = dVC * cosOut;
       dVM = dVM * cosOut;
       dVCM = 0.0;
+      hadSpecular = true;
     }
 
     power = power * attenuation;
