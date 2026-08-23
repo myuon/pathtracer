@@ -168,6 +168,13 @@ async function withBrowser(fn) {
   }
 }
 
+function meanOf(buf) {
+  const f = toF32(buf);
+  let s = 0;
+  for (let i = 0; i < f.length; i++) s += f[i];
+  return s / f.length;
+}
+
 async function cmdRef() {
   const spp = values.spp ?? "4096";
   mkdirSync(REF_DIR, { recursive: true });
@@ -176,9 +183,21 @@ async function cmdRef() {
       const t = Date.now();
       const r = await measure(browser, origin, scene, REF_CONFIG, { spp });
       writeFileSync(refPath(scene), r.hdr);
+      let note = "";
+      // 収束の確認。予算の 1/4 と比べて平均輝度がまだ動いているなら、
+      // その参照画像は収束しておらず、誤差の基準に使えない。
+      // submerged は 32768 spp でもまだ +13%/4倍 で伸びていて、
+      // 「SPPM が正しいのに参照が間違っている」状態になっていた
+      const quarter = await measure(browser, origin, scene, REF_CONFIG, {
+        spp: String(Math.max(1, Math.round(Number(spp) / 4))),
+      });
+      const drift = meanOf(r.hdr) / meanOf(quarter.hdr) - 1;
+      if (Math.abs(drift) > 0.02) {
+        note = `  <- 未収束 (1/4 予算から ${(drift * 100).toFixed(1)}% 動いている)`;
+      }
       console.log(
         `ref ${scene.padEnd(10)} ${r.spp} spp / ${(r.ms / 1000).toFixed(1)}s ` +
-          `(壁時計 ${((Date.now() - t) / 1000).toFixed(1)}s)`,
+          `(壁時計 ${((Date.now() - t) / 1000).toFixed(1)}s)${note}`,
       );
     }
   });
