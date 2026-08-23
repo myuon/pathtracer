@@ -84,6 +84,21 @@ node bench/smoke.mjs      # または pnpm bench:smoke
 先にそのシーンを描いてから本命へ切り替えるので、学習した分布や光子グリッドが
 持ち越されていれば数値がずれる。
 
+## 定数の突き合わせ
+
+WGSL と TS の両方に同じ値を手で書いている定数がいくつかある
+(`GRID_CAP` / `MAX_DEPOSITS` / `HIST_BINS` / `GUIDE_VOX` / `GUIDE_BINS` /
+`VTX_SLOTS`)。ずれても何も言わずに壊れる (バッファの大きさや索引が狂う)
+ので、触ったら必ず確かめること。
+
+```sh
+node bench/consts.mjs     # または pnpm bench:consts
+```
+
+`struct Uniforms` が `UNIFORM_SIZE` に収まっているかも同時に見る。
+今ちょうど 336 バイト = 上限いっぱいなので、フィールドを足すときは
+`UNIFORM_SIZE` も上げる必要がある。
+
 ## 落とし穴
 
 - **参照画像と検証画像で乱数の塩を変えること** (`run` は自動で `salt=1`、

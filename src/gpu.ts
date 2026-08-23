@@ -84,6 +84,8 @@ const WORKGROUP = 8;
 const PHOTON_COUNT = 1 << 16;
 /** ハッシュグリッドのセル数 */
 const GRID_CELLS = 1 << 18;
+/** 光源側の経路頂点 1 個が使う vec4f の数。WGSL 側の VTX_SLOTS と一致させること */
+const VTX_SLOTS = 6;
 /** 1 セルに入る光子の上限。WGSL 側の GRID_CAP と一致させること */
 const GRID_CAP = 96;
 /** 光子の放出方向を学習するヒストグラムのビン数。WGSL 側と一致させること */
@@ -209,11 +211,9 @@ export class Renderer {
       size: UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    // 光子 1 個あたり vec4f 3 個
     this.photonBuffer = this.device.createBuffer({
       // 1 本の光子が複数回堆積するので、その回数ぶんの枠を取る
-      // 1 頂点 5 スロット。WGSL 側の VTX_SLOTS と一致させること
-      size: PHOTON_COUNT * MAX_DEPOSITS * 6 * 16,
+      size: PHOTON_COUNT * MAX_DEPOSITS * VTX_SLOTS * 16,
       usage: GPUBufferUsage.STORAGE,
       label: "photons",
     });
