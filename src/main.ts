@@ -243,7 +243,8 @@ async function main() {
     ui.setStatus(
       (ui.settings.paused ? "[停止中] " : "") +
         `${width}x${height} / ${samples} spp / ${fpsEma.toFixed(0)} fps` +
-        (fast ? " / interactive" : ` / ${spp} spp per frame`) +
+        // 実際に積んだ数を出す。SPPM は spp/frame の設定に関係なく 1
+        (fast ? " / interactive" : ` / ${taken} spp per frame`) +
         ` / ${(fast ? gpuMsFast : gpuMsSlow).toFixed(0)} ms` +
         (photonScale < 1 ? ` / photons 1/${Math.round(1 / photonScale)}` : ""),
     );
