@@ -124,6 +124,26 @@ const GUIDE_BINS = 16 * 16;
 /** 光子 1 本が堆積できる回数。WGSL 側の MAX_DEPOSITS と一致させること */
 const MAX_DEPOSITS = 10;
 
+/** readStats() が返す光子側の統計 */
+export interface PhotonStats {
+  /** 今フレームに堆積した光子の総数 */
+  deposits: number;
+  /** そのうちカメラが集光している場所へ入った数 */
+  useful: number;
+  /** 統計を取った集光の回数 (1/64 に間引いてある) */
+  gathers: number;
+  /** 1 回の集光で見つかった光子数の平均 */
+  meanFound: number;
+  /** その分散 */
+  varFound: number;
+  /** 1 回の集光の中での、光子ごとの寄与の変動係数の平均 */
+  cv: number;
+  /** そのフレームに撒いた光子数 */
+  photons: number;
+  /** 光子側の相対分散 (CV^2 + 1) / m */
+  relVar: number;
+}
+
 export interface FrameParams {
   camPos: [number, number, number];
   camU: [number, number, number];
@@ -175,6 +195,8 @@ export interface FrameParams {
   paused: boolean;
   /** 表示された絵を読み戻せるように写す (計測用) */
   capture?: boolean;
+  /** 光子数を解像度から決めず直に指定する (計測用) */
+  photons?: number;
 }
 
 export class Renderer {
@@ -528,6 +550,46 @@ export class Renderer {
   }
 
   /**
+   * grid バッファの末尾に貯めている光子の統計を読み戻す。計測専用。
+   *
+   * clearGrid はフレームの頭で消すので、最後のフレームを描き終えた時点の
+   * 値がそのまま残っている。返すのは [0] 堆積総数 / [1] うち集光位置に
+   * 入った数 / [2] 集光回数 / [3] 見つかった光子数の和 / [4] その 2 乗和 /
+   * [5] 変動係数を取れた集光の回数 / [6] 変動係数の和 (100 倍の固定小数)
+   */
+  async readStats(): Promise<PhotonStats> {
+    const off = (GRID_CELLS * (2 + GRID_CAP) + 2 + HIST_BINS * 2) * 4;
+    const staging = this.device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      label: "stat readback",
+    });
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.gridBuffer, off, staging, 0, 32);
+    this.device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const u = new Uint32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    const gathers = Math.max(u[2], 1);
+    const cvN = Math.max(u[5], 1);
+    // 平均 m と平均 CV から、光子側の相対分散 (CV^2 + 1) / m を出す。
+    // これに光子数を掛けた値は光子数に依らないシーンの定数になる
+    const meanFound = u[3] / gathers;
+    const cv = u[6] / (100 * cvN);
+    return {
+      deposits: u[0],
+      useful: u[1],
+      gathers: u[2],
+      meanFound,
+      varFound: Math.max(u[4] / gathers - meanFound * meanFound, 0),
+      cv,
+      photons: this.photonsThisFrame,
+      relVar: meanFound > 0 ? (cv * cv + 1) / meanFound : 0,
+    };
+  }
+
+  /**
    * 累積バッファを読み戻し、present と同じ式で HDR 値 (画素あたり RGB) を返す。
    * 計測 (bench) 専用。描画のホットパスからは呼ばない
    */
@@ -637,7 +699,10 @@ export class Renderer {
     if ((sppm || vcm) && p.samplesBefore === 0) this.photonsEmitted = 0;
     // 解像度に見合った本数を基準にし、弱いマシンではそこから落として
     // 1 フレームの固定費を下げる
-    const base = photonsForPixels(p.width * p.height);
+    const base =
+      p.photons !== undefined
+        ? Math.max(1024, Math.min(PHOTON_COUNT, Math.round(p.photons)))
+        : photonsForPixels(p.width * p.height);
     this.photonsThisFrame = Math.max(
       1024,
       Math.round(base * Math.min(1, Math.max(1 / 16, p.photonScale))),
