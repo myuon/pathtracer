@@ -594,7 +594,13 @@ export class Renderer {
     // SPPM は画素ごとの状態を持ち越す必要があるので ping-pong を止める
     const write = sppm ? 0 : this.parity;
     if ((sppm || vcm) && p.samplesBefore === 0) this.photonsEmitted = 0;
-    // 弱いマシンでは光子数を落として 1 フレームの固定費を下げる
+    // 弱いマシンでは光子数を落として 1 フレームの固定費を下げる。
+    //
+    // 倍率は 1 で頭打ちにしてあるので、下には振れても上には振れない。
+    // 最適な光子数は解像度で変わり (320x240 では 2^14 が効率最適で
+    // 2^16 の 1.37 倍、160x120 では同じ 2^14 が 1.51 倍と、低解像度ほど
+    // 光子が相対的に高い)、画素数の多い実解像度では逆に 2^16 より上が
+    // 最適になりうる。そこへは今の構造では到達できない
     this.photonsThisFrame = Math.max(
       4096,
       Math.round(PHOTON_COUNT * Math.min(1, Math.max(1 / 16, p.photonScale))),
