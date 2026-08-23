@@ -93,7 +93,7 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
     qmc: flag(q, "qmc", true),
     envIs: flag(q, "envIs", true),
     reproject: false,
-    debugMode: 0,
+    debugMode: Math.round(num(q, "debug", 0)),
     // 種を累積サンプル数から作る。同条件なら毎回同じ絵になる。
     // seed=0 にすると種の作り方が変わり、同じ推定量の別の実現が得られる。
     // 「その差が本物か、乱数のばらつきか」を切り分けるのに使う

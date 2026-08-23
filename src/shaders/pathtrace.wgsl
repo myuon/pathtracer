@@ -637,10 +637,6 @@ fn cosineHemisphere(u: vec2f) -> vec3f {
 }
 
 // ---------------------------------------------------------------- 環境光
-fn envLuminance(c: vec3f) -> f32 {
-  return dot(c, vec3f(0.2126, 0.7152, 0.0722));
-}
-
 fn envMarginalOffset() -> u32 {
   return U.envWidth * U.envHeight * 4u;
 }
