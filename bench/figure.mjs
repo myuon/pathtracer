@@ -9,7 +9,7 @@
 // bench/run.mjs の PNG 出力は参照画像がある解像度でしか使えないので、
 // 図を撮るためだけの経路を分けてある。?bench=1&present=1 で表示と同じ
 // トーンマップを通した絵を読み戻し、そのまま並べる
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -39,6 +39,8 @@ const { values } = parseArgs({
     // パネルの表示幅 (px)。原寸より小さくすると縮小して貼る
     cw: { type: "string", default: "860" },
     // 2 段目に拡大を並べる "x,y,w,h" (元画像の画素座標)
+    // パネルの絵を <dumpDir>/<シーン>.png にも書き出す (別ビルドとの比較用)
+    dumpDir: { type: "string" },
     zoom: { type: "string" },
     zoomLabel: { type: "string", default: "拡大" },
   },
@@ -140,6 +142,11 @@ try {
       const r = await shoot(browser, origin, scene, p.config);
       const cell = { png: join(dir, `s${si}p${pi}.png`) };
       writeFileSync(cell.png, toPng(r.ldr, W, H));
+      if (values.dumpDir) {
+        mkdirSync(resolve(ROOT, values.dumpDir), { recursive: true });
+        const name = pi === 0 ? scene : `${scene}-p${pi}`;
+        writeFileSync(join(resolve(ROOT, values.dumpDir), `${name}.png`), toPng(r.ldr, W, H));
+      }
       cell.stat = noiseOf(r.ldr, W, H);
       if (zoom) {
         const c = crop(r.ldr, W, zoom);
