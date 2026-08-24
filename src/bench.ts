@@ -1,5 +1,5 @@
 import { OrbitCamera } from "./camera";
-import { initGpu, Renderer } from "./gpu";
+import { initGpu, PhotonStats, Renderer } from "./gpu";
 import { buildSceneById } from "./scene";
 
 /**
@@ -25,6 +25,8 @@ export interface BenchResult {
   hdr: string;
   /** present を通した sRGB 8bit (RGBA)。present=1 のときだけ入る */
   ldr?: string;
+  /** 最後のフレームの光子統計。SPPM / VCM のときだけ意味がある */
+  stats?: PhotonStats;
 }
 
 function flag(q: URLSearchParams, key: string, dflt: boolean): boolean {
@@ -111,6 +113,7 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
     salt: Math.round(num(q, "salt", 0)),
     denoise: flag(q, "denoise", false),
     photonScale: num(q, "photonScale", 1),
+    photons: q.has("photons") ? num(q, "photons", 0) : undefined,
     paused: false,
   };
 
@@ -159,6 +162,7 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
   }
   const ms = performance.now() - t0;
 
+  const stats = await renderer.readStats();
   const hdr = await renderer.readHdr(width, height);
   const ldr = wantLdr ? await renderer.readPresented(width, height) : undefined;
   const result: BenchResult = {
@@ -170,6 +174,7 @@ export async function runBench(canvas: HTMLCanvasElement): Promise<void> {
     ms,
     hdr: toBase64(hdr.buffer),
     ldr: ldr ? toBase64(ldr.buffer) : undefined,
+    stats,
   };
   (window as unknown as { __bench?: BenchResult }).__bench = result;
 }

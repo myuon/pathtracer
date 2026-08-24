@@ -125,7 +125,10 @@ async function measure(browser, origin, scene, params, budget) {
   page.on("pageerror", (e) => logs.push(`[pageerror] ${e.message}`));
   try {
     await page.goto(url, { waitUntil: "load" });
-    const timeout = (q.ms ? Number(q.ms) : 0) * 4 + 15 * 60 * 1000;
+    // 予算が spp のときは実時間が読めないので、解像度に比例させて余裕を持たせる。
+    // 640x480 の mesh は 320x240 の 6 倍かかり、固定 15 分では足りなかった
+    const timeout = (q.ms ? Number(q.ms) : 0) * 4 +
+      15 * 60 * 1000 * Math.max(1, (W * H) / 76800);
     await page.waitForFunction(() => window.__bench !== undefined, null, { timeout });
     const r = await page.evaluate(() => window.__bench);
     // シェーダのコンパイルに失敗しても WebGPU は非同期にエラーを出すだけで
@@ -344,7 +347,10 @@ async function cmdRun() {
         // 「10 秒でどこまで行くか」を直接測るより、フレーム数の刻みに
         // 影響されないぶん再現性が高い
         const eff = m.relmse * (r.ms / 1000);
-        rows.push({ scene, config: c.name, spp: r.spp, ms: r.ms, eff, ...m });
+        // K_p = 光子数 x 光子側の相対分散。光子数に依らないシーンの定数で、
+        // 最適な光子数はこの平方根に比例する (M* = sqrt(c/p x K_p / sigma_c^2))
+        const kp = r.stats ? r.stats.photons * r.stats.relVar : undefined;
+        rows.push({ scene, config: c.name, spp: r.spp, ms: r.ms, eff, kp, stats: r.stats, ...m });
         // 調査用に HDR をそのまま落とす。どの画素が壊れているかを見るため
         if (values.dump) {
           mkdirSync(join(ROOT, "bench", "out"), { recursive: true });
@@ -362,6 +368,8 @@ async function cmdRun() {
             `med ${last.medRel.toExponential(3)}  aces ${last.acesRmse.toExponential(3)}  ` +
             `eff ${last.eff.toExponential(3)}` +
             (last.ldrRmse !== undefined ? `  ldr ${last.ldrRmse.toFixed(3)}` : "") +
+            (last.kp ? `  m ${last.stats.meanFound.toFixed(2)} cv ${last.stats.cv.toFixed(2)} ` +
+              `M ${last.stats.photons} Kp ${last.kp.toExponential(3)}` : "") +
             (last.bad ? `  (壊れた成分 ${last.bad})` : ""),
         );
       }
