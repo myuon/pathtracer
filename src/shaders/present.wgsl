@@ -110,6 +110,51 @@ const SIGMA_Z: f32 = 0.015;
 /// 出る。直接光の明るさが桁違いに違えば別物として弾く
 const SIGMA_L: f32 = 0.3;
 
+/// 推定したばらつきの何倍まで、輝度の違うタップを混ぜてよいか。
+///
+/// これが無いと、低 spp では「輝度が違う = 別の物体」と
+/// 「輝度が違う = まだノイズ」を区別できない。区別できないので安全側に
+/// 倒すしかなく、結果としてフィルタがほとんど効かなくなっていた。
+/// 画素ごとのばらつきが分かれば、その範囲内の違いはノイズとして
+/// 混ぜてよい (Schied 2017 の SVGF が輝度シグマを分散で割るのと同じ狙い)
+const SIGMA_L_NOISE: f32 = 8.0;
+/// 相対ばらつきがこれを下回ったらフィルタを止める。収束した画素を
+/// ぼかしても偏りが乗るだけで、実際 128 spp の veach では
+/// 表示画像の RMSE が 0.67 倍に悪化していた
+const NOISE_OFF: f32 = 0.02;
+/// ここを超えたら全力で掛ける
+const NOISE_FULL: f32 = 0.10;
+/// ばらつきの推定値の下限を、サンプル数から決めるときの係数。
+///
+/// 8 サンプルから出した標本分散はそれ自体が当てにならず、たまたま
+/// 小さく出ればノイズだらけの画素でもフィルタが止まってしまう。
+/// 「サンプルが少ないうちは収束を主張できない」ぶんを下限にする
+const NOISE_FLOOR_K: f32 = 0.5;
+/// 粗いスケールを使い始めるばらつきの下限が、1 段ごとに何倍になるか。
+///
+/// フィルタの広がりはノイズの量に見合っているべきで、収束した画素まで
+/// 遠くのタップと混ぜる理由はない。とくに veach の平らなプレートは
+/// 法線も距離も一定なので、粗いタップが反射のグラデーションをそのまま
+/// 舐めてしまう (128 spp で表示画像の RMSE が 0.72 倍に悪化していた)
+const NOISE_SCALE_GROWTH: f32 = 3.0;
+
+/// 画素ごとの相対的なばらつき (平均値の標準誤差 / 平均値) の見積もり。
+///
+/// SPPM の間接光は密度推定なので、集めた光子数から 1/sqrt(n) で見る。
+/// パストレース側は輝度の 2 乗和を積んであるので、1 サンプルの分散から
+/// 平均値の標準誤差を出せる
+fn relNoise(o: u32) -> f32 {
+  if (U.sppm != 0u) {
+    let n = max(hist[o + 2u].w, 1.0);
+    return 1.0 / sqrt(n);
+  }
+  let c = hist[o];
+  let n = max(c.w, 1.0);
+  let mu = luminance(c.rgb) / n;
+  let varS = max(hist[o + 2u].x / n - mu * mu, 0.0);
+  return max(sqrt(varS / n) / max(mu, 1e-4), NOISE_FLOOR_K / sqrt(n));
+}
+
 /// 輪郭らしさ。上下左右の隣とガイドを比べ、食い違う方向が多いほど 1 に近づく。
 /// ガイド用のレイは画素の中心を通す一方、蓄積された色は画素内をばらけた
 /// サンプルの平均なので、輪郭の画素ではこの 2 つが食い違う。そこで無理に
@@ -137,8 +182,18 @@ fn edgeness(x: u32, y: u32, g0: vec4f) -> f32 {
 /// サンプルの平均) が食い違う。中心が暗い箱なのにガイドが明るい壁を指す、
 /// といったことが起きて、結果が桁違いに明るくなる。元の値から大きく
 /// 外れた結果は信用しない。斑点を均す用途には 4 倍あれば十分足りる
-fn clampToCenter(v: vec3f, center: vec3f) -> vec3f {
-  return clamp(v, center * 0.25, center * 4.0 + vec3f(0.02));
+/// フィルタ結果を中心画素の値の近くへ引き戻す。
+///
+/// ばらつきが小さい画素ではきつく締める (ぼかしすぎを防ぐ) が、大きい
+/// 画素ではほぼ素通しにする。低 spp では中心画素の値こそが当てにならず、
+/// そこへ締め付けるとフィルタの意味が無くなる。とくに「まだ明るい経路を
+/// 1 本も引けていない」画素は中心値が 0 なので、掛け算の下限では
+/// [0, 0.02] に固定されてしまっていた
+fn clampToCenter(v: vec3f, center: vec3f, rn: f32) -> vec3f {
+  let slack = clamp(rn / NOISE_FULL, 0.0, 1.0);
+  let lo = mix(center * 0.25, vec3f(0.0), slack);
+  let hi = mix(center * 4.0 + vec3f(0.02), v, slack);
+  return clamp(v, lo, hi);
 }
 
 fn luminance(c: vec3f) -> f32 {
@@ -181,13 +236,15 @@ fn localIndirectLuma(x: u32, y: u32, g0: vec4f) -> f32 {
 
 /// タップ (i, j) の空間・法線・距離・輝度の重みの積。
 /// g0/gt は hist[.+3] (半径, 法線oct, 距離)、l0/lt は中心・タップの直接光輝度
-fn atrousTapWeight(i: u32, j: u32, g0: vec4f, gt: vec4f, l0: f32, lt: f32) -> f32 {
+fn atrousTapWeight(i: u32, j: u32, g0: vec4f, gt: vec4f, l0: f32, lt: f32, sigL: f32) -> f32 {
   let dn = g0.yz - gt.yz;
   let dz = g0.w - gt.w;
   let z0 = max(g0.w, 1.0);
   let wn = exp(-dot(dn, dn) / SIGMA_N);
   let wz = exp(-abs(dz) / (SIGMA_Z * z0));
-  let wl = exp(-abs(l0 - lt) / (SIGMA_L * max(max(l0, lt), 0.1)));
+  // 許容差にばらつきのぶんを足す。ノイズで生じている差では弾かない
+  let tol = SIGMA_L * max(max(l0, lt), 0.1) + SIGMA_L_NOISE * sigL;
+  let wl = exp(-abs(l0 - lt) / max(tol, 1e-6));
   return KERNEL5[i] * KERNEL5[j] * wn * wz * wl;
 }
 
@@ -199,12 +256,18 @@ fn denoiseIndirect(x: u32, y: u32) -> vec3f {
   let g0 = hist[o + 3u];
   let c0 = hist[o];
   let l0 = luminance(c0.rgb / max(c0.w, 1.0));
+  let rn = relNoise(o);
+  let sigL = rn * max(l0, 0.1);
   let localRef = localIndirectLuma(x, y, g0);
   var sum = vec3f(0.0);
   var wsum = 0.0;
   let steps = array<u32, 5>(1u, 2u, 4u, 8u, 16u);
   for (var s = 0u; s < 5u; s = s + 1u) {
     let step = steps[s];
+    // このスケールを使ってよいだけのばらつきがあるか
+    let g = pow(NOISE_SCALE_GROWTH, f32(s));
+    let lw = smoothstep(NOISE_OFF * g, NOISE_FULL * g, rn);
+    if (lw <= 0.0) { continue; }
     for (var j = 0u; j < 5u; j = j + 1u) {
       let ty = i32(y) + (i32(j) - 2) * i32(step);
       if (ty < 0 || ty >= i32(U.height)) { continue; }
@@ -215,7 +278,7 @@ fn denoiseIndirect(x: u32, y: u32) -> vec3f {
         let gt = hist[to + 3u];
         let ct = hist[to];
         let lt = luminance(ct.rgb / max(ct.w, 1.0));
-        let w = atrousTapWeight(i, j, g0, gt, l0, lt);
+        let w = atrousTapWeight(i, j, g0, gt, l0, lt, sigL) * lw;
         let rt = max(gt.x, 1e-5);
         var indirect = hist[to + 2u].rgb / (3.14159265 * rt * rt * max(U.photonsEmitted, 1.0));
         // fire fly クランプ。局所平均の何倍までしか許さない
@@ -238,8 +301,10 @@ fn denoiseIndirect(x: u32, y: u32) -> vec3f {
   if (wsum < 1e-6) {
     return center;
   }
-  let t = clamp(wsum / 0.75, 0.0, 1.0) * (1.0 - edgeness(x, y, g0));
-  return clampToCenter(mix(center, sum / wsum, t), center);
+  // ばらつきが小さい画素 = もう収束しているので触らない
+  let t = clamp(wsum / 0.75, 0.0, 1.0) * (1.0 - edgeness(x, y, g0))
+    * smoothstep(NOISE_OFF, NOISE_FULL, rn);
+  return clampToCenter(mix(center, sum / wsum, t), center, rn);
 }
 
 /// SPPM off のとき用。蓄積色 (v そのもの) を同じ重みでぼかす汎用版
@@ -248,11 +313,17 @@ fn denoiseColor(x: u32, y: u32) -> vec3f {
   let g0 = hist[o + 3u];
   let c0 = hist[o];
   let l0 = luminance(c0.rgb / max(c0.w, 1.0));
+  let rn = relNoise(o);
+  let sigL = rn * max(l0, 0.1);
   var sum = vec3f(0.0);
   var wsum = 0.0;
   let steps = array<u32, 5>(1u, 2u, 4u, 8u, 16u);
   for (var s = 0u; s < 5u; s = s + 1u) {
     let step = steps[s];
+    // このスケールを使ってよいだけのばらつきがあるか
+    let g = pow(NOISE_SCALE_GROWTH, f32(s));
+    let lw = smoothstep(NOISE_OFF * g, NOISE_FULL * g, rn);
+    if (lw <= 0.0) { continue; }
     for (var j = 0u; j < 5u; j = j + 1u) {
       let ty = i32(y) + (i32(j) - 2) * i32(step);
       if (ty < 0 || ty >= i32(U.height)) { continue; }
@@ -264,7 +335,7 @@ fn denoiseColor(x: u32, y: u32) -> vec3f {
         let ct = hist[to];
         let ctv = ct.rgb / max(ct.w, 1.0);
         let lt = luminance(ctv);
-        let w = atrousTapWeight(i, j, g0, gt, l0, lt);
+        let w = atrousTapWeight(i, j, g0, gt, l0, lt, sigL) * lw;
         sum = sum + ctv * w;
         wsum = wsum + w;
       }
@@ -275,8 +346,9 @@ fn denoiseColor(x: u32, y: u32) -> vec3f {
   if (wsum < 1e-6) {
     return center;
   }
-  let t = clamp(wsum / 0.75, 0.0, 1.0) * (1.0 - edgeness(x, y, g0));
-  return clampToCenter(mix(center, sum / wsum, t), center);
+  let t = clamp(wsum / 0.75, 0.0, 1.0) * (1.0 - edgeness(x, y, g0))
+    * smoothstep(NOISE_OFF, NOISE_FULL, rn);
+  return clampToCenter(mix(center, sum / wsum, t), center, rn);
 }
 
 @fragment
