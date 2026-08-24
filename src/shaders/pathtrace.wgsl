@@ -3204,8 +3204,23 @@ fn wfResolve(@builtin(global_invocation_id) gid: vec3u) {
     r = vec3f(0.0);
   }
   histWrite[o] = vec4f(prevSum + r, prevCount + 1.0);
-  histWrite[o + 2u] = vec4f(0.0, 0.0, 0.0, 0.0);
-  histWrite[o + 3u] = vec4f(0.0, 0.0, 0.0, 0.0);
+  // 輝度の 2 乗和。デノイザが画素ごとのばらつきを見積もるのに使う。
+  // メガカーネル側と同じ枠に同じものを積む
+  let lc = luminanceOf(r);
+  let prevSq = select(0.0, histRead[o + 2u].x, U.samplesBefore > 0u);
+  histWrite[o + 2u] = vec4f(prevSq + lc * lc, 0.0, 0.0, 0.0);
+  // デノイザの手がかり (法線・距離)。ここを 0 で潰すと a-trous が
+  // 法線も距離も見ないただのぼかしになり、cornell で 6.82 -> 8.26、
+  // veach で 9.55 -> 12.37 と悪化していた。メガカーネル側と同じく
+  // 画素中心のレイで取り直す
+  if (U.denoise != 0u) {
+    let pxC = (f32(pixel % U.width) + 0.5) / f32(U.width) * 2.0 - 1.0;
+    let pyC = 1.0 - (f32(pixel / U.width) + 0.5) / f32(U.height) * 2.0;
+    let g = guideFor(pxC, pyC);
+    histWrite[o + 3u] = vec4f(0.0, g.x, g.y, g.z);
+  } else {
+    histWrite[o + 3u] = vec4f(0.0, 0.0, 0.0, 0.0);
+  }
 }
 
 @compute @workgroup_size(8, 8, 1)
