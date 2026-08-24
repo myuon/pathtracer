@@ -24,6 +24,7 @@ const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 const { values } = parseArgs({
   options: {
+    // 複数指定すると 1 行 1 シーンで縦に積む
     scene: { type: "string" },
     w: { type: "string", default: "860" },
     h: { type: "string", default: "540" },
@@ -83,10 +84,10 @@ function crop(rgba, w, [x, y, cw, ch]) {
   return out;
 }
 
-async function shoot(browser, origin, config) {
+async function shoot(browser, origin, scene, config) {
   const q = new URLSearchParams({
     bench: "1", present: "1", salt: "0",
-    scene: values.scene, w: String(W), h: String(H),
+    scene, w: String(W), h: String(H),
     sppf: "1", bounces: values.bounces,
   });
   if (values.ms) q.set("ms", values.ms); else q.set("spp", values.spp ?? "128");
@@ -128,52 +129,69 @@ const browser = await chromium.launch({
   executablePath: CHROME, headless: true, args: ["--enable-unsafe-webgpu"],
 });
 const zoom = values.zoom ? values.zoom.split(",").map(Number) : null;
+const scenes = (values.scene ?? "cornell").split(",");
 const dir = mkdtempSync(join(tmpdir(), "fig-"));
 try {
-  for (const [i, p] of panels.entries()) {
-    const r = await shoot(browser, origin, p.config);
-    p.png = join(dir, `panel${i}.png`);
-    writeFileSync(p.png, toPng(r.ldr, W, H));
-    p.stat = noiseOf(r.ldr, W, H);
-    if (zoom) {
-      const c = crop(r.ldr, W, zoom);
-      p.zoomPng = join(dir, `panel${i}-zoom.png`);
-      writeFileSync(p.zoomPng, toPng(c, zoom[2], zoom[3]));
-      p.zoomStat = noiseOf(c, zoom[2], zoom[3]);
+  // [シーン][パネル] の格子。1 シーンなら今までどおり横に並ぶだけ
+  const grid = [];
+  for (const [si, scene] of scenes.entries()) {
+    const row = [];
+    for (const [pi, p] of panels.entries()) {
+      const r = await shoot(browser, origin, scene, p.config);
+      const cell = { png: join(dir, `s${si}p${pi}.png`) };
+      writeFileSync(cell.png, toPng(r.ldr, W, H));
+      cell.stat = noiseOf(r.ldr, W, H);
+      if (zoom) {
+        const c = crop(r.ldr, W, zoom);
+        cell.zoomPng = join(dir, `s${si}p${pi}-zoom.png`);
+        writeFileSync(cell.zoomPng, toPng(c, zoom[2], zoom[3]));
+        cell.zoomStat = noiseOf(c, zoom[2], zoom[3]);
+      }
+      console.log(
+        `${scene.padEnd(10)} ${p.label.padEnd(16)} ${String(r.spp).padStart(6)} spp ` +
+          `${(r.ms / 1000).toFixed(1).padStart(6)}s  ノイズ ${cell.stat.sigma.toFixed(2)}  ` +
+          `firefly ${cell.stat.fly}  平均輝度 ${cell.stat.mean.toFixed(2)}` +
+          (cell.zoomStat ? `  [拡大部 ノイズ ${cell.zoomStat.sigma.toFixed(2)} ` +
+            `firefly ${cell.zoomStat.fly}]` : ""),
+      );
+      row.push(cell);
     }
-    console.log(
-      `${p.label.padEnd(16)} ${String(r.spp).padStart(6)} spp ` +
-        `${(r.ms / 1000).toFixed(1).padStart(6)}s  ノイズ ${p.stat.sigma.toFixed(2)}  ` +
-        `firefly ${p.stat.fly}  平均輝度 ${p.stat.mean.toFixed(2)}` +
-        (p.zoomStat ? `  [拡大部 ノイズ ${p.zoomStat.sigma.toFixed(2)} ` +
-          `firefly ${p.zoomStat.fly}]` : ""),
-    );
+    grid.push(row);
   }
 
   const CW = Number(values.cw);
   const b64 = (p) => "data:image/png;base64," + readFileSync(p).toString("base64");
-  const cells = panels.map((p) => `
-    <div class="cell">
-      <div class="head"><b>${p.label}</b><span>${p.sub}</span></div>
-      <img src="${b64(p.png)}">
-    </div>`).join("");
-  const zooms = zoom ? panels.map((p) => `
-    <div class="cell"><img src="${b64(p.zoomPng)}"></div>`).join("") : "";
+  const heads = panels.map((p) => `
+    <div class="cell"><div class="head"><b>${p.label}</b><span>${p.sub}</span></div></div>`)
+    .join("");
+  const rows = grid.map((row, si) => `
+    <div class="cols">${row.map((c, pi) => `
+      <div class="cell">${pi === 0 && scenes.length > 1
+        ? `<div class="name">${scenes[si]}</div>` : ""}
+        <img src="${b64(c.png)}"></div>`).join("")}</div>`).join("");
+  const zooms = zoom ? grid.map((row) => `
+    <div class="cols">${row.map((c) => `
+      <div class="cell"><img src="${b64(c.zoomPng)}"></div>`).join("")}</div>`).join("") : "";
   const html = `<!doctype html><meta charset="utf-8"><style>
   body{margin:0;background:#14161a;color:#e8e8e8;
     font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
   .wrap{display:inline-block;padding:12px}
   .cols{display:flex;gap:10px}
   .cell{width:${CW}px}
-  .head{display:flex;justify-content:space-between;align-items:baseline;padding:2px 2px 8px}
+  .head{display:flex;justify-content:space-between;align-items:baseline;padding:2px 2px 6px}
   .head b{font-size:19px}
   .head span{opacity:.55;font-size:13px}
   .cell img{width:${CW}px;display:block;border-radius:3px}
+  .cell{position:relative}
+  .name{position:absolute;left:8px;top:7px;z-index:2;background:rgba(0,0,0,.62);
+    padding:2px 8px;border-radius:3px;font-size:13px}
+  .cols + .cols{margin-top:8px}
   .note{opacity:.7;font-size:13px;padding:10px 2px 2px;white-space:pre-line}
   .zlab{opacity:.55;font-size:13px;padding:8px 2px 4px}
 </style><div class="wrap">
-  <div class="cols">${cells}</div>
-  ${zoom ? `<div class="zlab">${values.zoomLabel}</div><div class="cols">${zooms}</div>` : ""}
+  <div class="cols">${heads}</div>
+  ${rows}
+  ${zoom ? `<div class="zlab">${values.zoomLabel}</div>${zooms}` : ""}
   ${values.caption ? `<div class="note">${values.caption}</div>` : ""}
 </div>`;
 
